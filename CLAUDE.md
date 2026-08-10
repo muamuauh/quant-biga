@@ -106,10 +106,12 @@ log_event(log, "ingest.fetch.ok", code="600519.SH", rows=1234)
 
 ## 五、当前进度
 
+**详细进度、实测发现和 P3 开工须知见 `PROGRESS.md`。**
+
 - [x] **P0** 项目骨架
-- [ ] **P1** 数据层（BaoStock 主源 + 增量 parquet 缓存 + 沪深300 universe）
-- [ ] **P2** A股规则层 + 回测引擎
-- [ ] **P3** 模型与选股
+- [x] **P1** 数据层（BaoStock 主源 + 增量 parquet 缓存 + 沪深300 universe）
+- [x] **P2** A股规则层 + 回测引擎
+- [ ] **P3** 模型与选股  ← 下一步
 - [ ] **P4** 风控闸链 + 下单清单
 - [ ] **P5** 持仓 OCR 工具
 - [ ] **P6** 编排 + 日报 + store
