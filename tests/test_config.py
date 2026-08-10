@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from qbg.config import PROJECT_ROOT, load_universe, settings
+from qbg.config import PROJECT_ROOT, Settings, load_universe, settings
 
 
 def test_project_root_is_repo_root():
@@ -68,10 +68,11 @@ def test_small_account_defaults():
 
 
 def test_agents_default_off():
-    """LLM 层默认关闭，P7/P8 完成后才打开。"""
-    assert settings.qbg_agents_enabled == 0
-    assert settings.qbg_agent_enabled == 0
-    assert settings.qbg_agent_autoapply == 0
+    """新安装默认关闭；本机 .env 可在在线验收后显式打开复核闸。"""
+    defaults = Settings(_env_file=None)
+    assert defaults.qbg_agents_enabled == 0
+    assert defaults.qbg_agent_enabled == 0
+    assert defaults.qbg_agent_autoapply == 0
 
 
 def test_load_universe_missing_file_returns_empty(tmp_path, monkeypatch):

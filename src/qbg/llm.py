@@ -1,32 +1,14 @@
-"""LLM 配置的唯一入口。三个消费者，两种 API 表面。
+"""LLM 配置的唯一入口：一个中转三元组，三个受控消费者。
 
-本项目从三个地方调 LLM，它们说的**不是同一套协议**：
+本项目统一使用第三方中转站常见的 OpenAI-compatible
+``/v1/chat/completions`` surface：
 
-  1. `qbg.portfolio` / `tools/ocr_positions.py` —— 多模态读图，OpenAI SDK 的
-     `/v1/chat/completions`（带 image_url）。
-  2. `qbg.agents.review`（P7，TradingAgents）—— 走 TradingAgents 自己的
-     provider 注册表，最终也是 chat completions。
-  3. `qbg.agent.client`（P8，Claude Agent SDK）—— `claude` CLI，说的是
-     **Anthropic Messages API**（`/v1/messages`）。
+1. P5 OCR：图片 + 文本，默认使用 quick 模型，可由 ``QBG_VISION_*`` 覆盖；
+2. P7 TradingAgents：映射为其 ``openai_compatible`` provider；
+3. P8 每日复盘：本地事实层先准备数据，LLM 只返回严格 JSON，不获得文件或 shell 工具。
 
-要点：**一个只实现 `/v1/chat/completions` 的中转站驱动不了消费者 3。**
-所以 Anthropic 那一侧有独立的配置项，不复用 OpenAI 侧的 base_url。
-
-关于 TradingAgents 的 provider 选择（这是个容易踩的坑）：
-  · TradingAgents **原生支持 deepseek**，内置 base_url `https://api.deepseek.com`
-    并从 `DEEPSEEK_API_KEY` 读 key
-    （见 TradingAgents/tradingagents/llm_clients/openai_client.py 的
-    `_PROVIDER_BASE_URL` 和 api_key_env.py 的 `PROVIDER_API_KEY_ENV`）。
-    所以本项目直接用 `TRADINGAGENTS_LLM_PROVIDER=deepseek`，不要绕道。
-  · **不要用 `provider="openai"` 去接中转站**：那条路会设 `use_responses_api=True`
-    即 POST `/v1/responses`，几乎没有中转站实现这个端点。
-  · 如果将来真要接中转站，用 `provider="openrouter"`——它走普通 chat
-    completions，且 `validators.py` 对它跳过模型名校验（中转站的模型 id 形如
-    `qwen/qwen3-max`，不在任何 catalogue 里）。
-
-优先级规则（和参数 overlay 一致）：**环境里已显式设置的 provider 专用变量
-胜过本模块推导出来的值。** 已经手动 pin 了 `TRADINGAGENTS_*` 的配置不会被
-悄悄覆盖——静默覆盖 pin 正是最难排查的一类故障。
+这样复盘 agent 不再依赖 Anthropic/Claude CLI，也不会因为中转站只实现 Chat
+Completions 而在夜间任务中 404。显式的消费者专用变量始终优先于统一配置。
 """
 
 from __future__ import annotations
@@ -37,8 +19,8 @@ from dataclasses import dataclass
 from qbg.config import PROJECT_ROOT, settings
 
 ENV_FILE = PROJECT_ROOT / ".env"
-
-# 会盖过推导值的 pin，按关注度排序。
+RELAY_TA_PROVIDER = "openai_compatible"
+RELAY_TA_KEY_ENV = "OPENAI_COMPATIBLE_API_KEY"
 TA_PIN_KEYS = (
     "TRADINGAGENTS_LLM_PROVIDER",
     "TRADINGAGENTS_LLM_BACKEND_URL",
@@ -48,39 +30,61 @@ TA_PIN_KEYS = (
 
 
 def redact(secret: str) -> str:
-    """`sk-abc123...ef01` —— 够区分两把 key，不够拿去用。
-
-    每条日志、每个 CLI 输出都走这里。key 已经躺在 .env 里了，
-    这一层至少不要再把暴露面扩大。
-    """
+    """返回只适合排障、不能拿去使用的 key 摘要。"""
     if not secret:
         return "<unset>"
     return f"{secret[:10]}...{secret[-4:]}" if len(secret) > 18 else "<set>"
 
 
 def load_env_file() -> None:
-    """把 .env 灌进 os.environ，**不覆盖**已有值。
-
-    必要性：TradingAgents 直接从 `os.environ` 读 `TRADINGAGENTS_*` 和各
-    provider 的 key，而 pydantic-settings 只填充 settings 对象、不碰进程环境。
-    quant-trading 踩过这个坑——.env 里的 `DEEPSEEK_API_KEY` 从没到达 LLM
-    client，graph 构造时报 "API key is not set"，复核层 fail-open 放行，
-    那一天看起来"全部通过"实际上根本没复核过。
-
-    `override=False` 保证优先级正确：shell 里 export 的值仍然赢过文件，
-    这符合"临时用另一把 key 跑一次"的直觉。
-    """
+    """把项目 ``.env`` 注入进程环境，不覆盖 shell 中的显式设置。"""
     try:
         from dotenv import load_dotenv
 
         load_dotenv(ENV_FILE, override=False)
-    except Exception:  # noqa: BLE001 —— 坏掉的 .env 不该中断整个流程
+    except Exception:  # noqa: BLE001 -- 坏掉的 .env 不应中断交易主流程
         pass
 
 
-# ----------------------------------------------------------------------
-# 消费者 1：多模态读图（P5）
-# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class RelayConfig:
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    quick_model: str = ""
+    timeout: float = 90.0
+
+    @property
+    def effective_quick_model(self) -> str:
+        return self.quick_model or self.model
+
+    @property
+    def ready(self) -> bool:
+        # P7/P8 明确要求走第三方中转，所以 base_url 也是就绪条件。
+        return bool(self.base_url and self.api_key and self.model)
+
+
+def resolve_relay() -> RelayConfig:
+    return RelayConfig(
+        base_url=str(settings.qbg_llm_base_url or "").strip().rstrip("/"),
+        api_key=str(settings.qbg_llm_api_key or "").strip(),
+        model=str(settings.qbg_llm_model or "").strip(),
+        quick_model=str(settings.qbg_llm_model_quick or "").strip(),
+        timeout=float(settings.qbg_llm_timeout_seconds),
+    )
+
+
+def relay_client(cfg: RelayConfig | None = None):
+    """构造面向第三方中转站的 OpenAI SDK 客户端。"""
+    from openai import OpenAI
+
+    cfg = cfg or resolve_relay()
+    if not cfg.ready:
+        raise RuntimeError(
+            "第三方中转站未配置完整：请设置 QBG_LLM_BASE_URL、"
+            "QBG_LLM_API_KEY 和 QBG_LLM_MODEL"
+        )
+    return OpenAI(api_key=cfg.api_key, base_url=cfg.base_url, timeout=cfg.timeout)
 
 
 @dataclass(frozen=True)
@@ -88,75 +92,93 @@ class VisionConfig:
     base_url: str = ""
     api_key: str = ""
     model: str = ""
+    timeout: float = 90.0
 
     @property
     def ready(self) -> bool:
-        # base_url 可空（用官方端点），但 key 和 model 必须有。
+        # 允许专用 Vision 配置省略 base_url，从而使用 OpenAI SDK 官方默认端点。
         return bool(self.api_key and self.model)
 
 
 def resolve_vision() -> VisionConfig:
+    relay = resolve_relay()
     return VisionConfig(
-        base_url=str(settings.qbg_vision_base_url or "").strip(),
-        api_key=str(settings.qbg_vision_api_key or "").strip(),
-        model=str(settings.qbg_vision_model or "").strip(),
+        base_url=str(settings.qbg_vision_base_url or relay.base_url).strip().rstrip("/"),
+        api_key=str(settings.qbg_vision_api_key or relay.api_key).strip(),
+        model=str(settings.qbg_vision_model or relay.effective_quick_model).strip(),
+        timeout=relay.timeout,
     )
 
 
 def vision_client(cfg: VisionConfig | None = None):
-    """一个指向多模态模型的 `openai.OpenAI`。
-
-    ⚠ 隐私提醒：调用方会把**账户持仓截图**发给这个端点。不接受的话，
-    改用 `QBG_PORTFOLIO_SOURCE=manual` 手工维护 CSV。
-    """
+    """构造多模态客户端；调用方会把账户截图上传到该端点。"""
     from openai import OpenAI
 
     cfg = cfg or resolve_vision()
     if not cfg.ready:
         raise RuntimeError(
-            "多模态读图未配置：请在 .env 里设 QBG_VISION_API_KEY 和 QBG_VISION_MODEL"
-            "（可选 QBG_VISION_BASE_URL）。或改用 QBG_PORTFOLIO_SOURCE=manual。"
+            "多模态读图未配置：请设置 QBG_VISION_API_KEY/QBG_VISION_MODEL，"
+            "或配置统一的 QBG_LLM_* 三元组"
         )
-    kwargs: dict = {"api_key": cfg.api_key}
+    kwargs: dict = {"api_key": cfg.api_key, "timeout": cfg.timeout}
     if cfg.base_url:
         kwargs["base_url"] = cfg.base_url
     return OpenAI(**kwargs)
 
 
-# ----------------------------------------------------------------------
-# 消费者 2：TradingAgents 逐票复核（P7）
-# ----------------------------------------------------------------------
-
-# DeepSeek 在 TradingAgents 的 model catalogue 里的合法 id。provider 非
-# ollama/openrouter 时 validators.py 会校验模型名，写错会在 graph 构造时炸。
-DEEPSEEK_MODELS = frozenset(
-    {"deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"}
-)
-
-
-def tradingagents_conflicts() -> list[str]:
-    """当前正盖过推导值的 pin。没有就返回空。
-
-    存在的意义是**把静默变成可见**：复核层 fail-open，一个 pin 把模型指错
-    地方的症状不是报错，而是"这一天看起来复核过了，其实没有"。
-    由 P7 的 graph 构造处记录，也由日报呈现。
-    """
+def tradingagents_env(cfg: RelayConfig | None = None) -> dict[str, str]:
+    """推导 TradingAgents 的中转站环境变量，不覆盖人工 pin。"""
+    cfg = cfg or resolve_relay()
     load_env_file()
-    return [f"{k}={os.environ[k]}" for k in TA_PIN_KEYS if os.environ.get(k)]
+    if not cfg.ready:
+        return {}
+    wanted = {
+        "TRADINGAGENTS_LLM_PROVIDER": RELAY_TA_PROVIDER,
+        "TRADINGAGENTS_LLM_BACKEND_URL": cfg.base_url,
+        "TRADINGAGENTS_DEEP_THINK_LLM": cfg.model,
+        "TRADINGAGENTS_QUICK_THINK_LLM": cfg.effective_quick_model,
+        RELAY_TA_KEY_ENV: cfg.api_key,
+    }
+    return {key: value for key, value in wanted.items() if not os.environ.get(key)}
+
+
+def apply_tradingagents_env(cfg: RelayConfig | None = None) -> dict[str, str]:
+    """在导入 TradingAgents 默认配置前应用推导值。"""
+    applied = tradingagents_env(cfg)
+    os.environ.update(applied)
+    return applied
+
+
+def tradingagents_conflicts(cfg: RelayConfig | None = None) -> list[str]:
+    """返回会覆盖统一三元组的显式 TradingAgents pin。"""
+    cfg = cfg or resolve_relay()
+    if not cfg.ready:
+        return []
+    load_env_file()
+    expected = {
+        "TRADINGAGENTS_LLM_PROVIDER": RELAY_TA_PROVIDER,
+        "TRADINGAGENTS_LLM_BACKEND_URL": cfg.base_url,
+        "TRADINGAGENTS_DEEP_THINK_LLM": cfg.model,
+        "TRADINGAGENTS_QUICK_THINK_LLM": cfg.effective_quick_model,
+    }
+    return [f"{key}={os.environ[key]}" for key in TA_PIN_KEYS
+            if os.environ.get(key) and os.environ[key] != expected[key]]
 
 
 def describe() -> dict:
-    """脱敏后的配置摘要，给日志和排查脚本用。"""
-    v = resolve_vision()
-    load_env_file()
+    """脱敏配置摘要，供自检脚本与日志使用。"""
+    relay = resolve_relay()
+    vision = resolve_vision()
     return {
-        "vision_base_url": v.base_url or "<provider default>",
-        "vision_model": v.model or "<unset>",
-        "vision_api_key": redact(v.api_key),
-        "vision_ready": v.ready,
-        "ta_provider": os.environ.get("TRADINGAGENTS_LLM_PROVIDER", "<unset>"),
-        "ta_deep_model": os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM", "<unset>"),
-        "ta_quick_model": os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM", "<unset>"),
-        "deepseek_api_key": redact(os.environ.get("DEEPSEEK_API_KEY", "")),
-        "anthropic_api_key": redact(os.environ.get("ANTHROPIC_API_KEY", "")),
+        "relay_base_url": relay.base_url or "<unset>",
+        "relay_model": relay.model or "<unset>",
+        "relay_quick_model": relay.effective_quick_model or "<unset>",
+        "relay_api_key": redact(relay.api_key),
+        "relay_ready": relay.ready,
+        "vision_base_url": vision.base_url or "<provider default>",
+        "vision_model": vision.model or "<unset>",
+        "vision_api_key": redact(vision.api_key),
+        "vision_ready": vision.ready,
+        "tradingagents_provider": RELAY_TA_PROVIDER if relay.ready else "<not configured>",
+        "tradingagents_pins": tradingagents_conflicts(relay) or "<none>",
     }

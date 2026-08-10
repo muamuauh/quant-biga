@@ -113,11 +113,14 @@ log_event(log, "ingest.fetch.ok", code="600519.SH", rows=1234)
 - [x] **P2** A股规则层 + 回测引擎
 - [x] **P3** 模型与选股（三 seed Rank IC 全正，见 `docs/p3-model-validation.md`）
 - [x] **P4** 风控闸链 + 下单清单
-- [x] **P5** 持仓 OCR 工具（离线对抗测试完成；真实截图待用户提供）
+- [x] **P5** 持仓 OCR 工具（真实南京证券截图 5 只持仓验收通过）
 - [x] **P6** 编排 + 日报 + store
-- [x] **P7** TradingAgents 逐票复核（vendor/离线测试完成；真实调用待 API key）
-- [ ] **P8** 自动复盘调参 agent（事实层/白名单/八闸/回滚已完成；SDK 在线层待补）
+- [x] **P7** TradingAgents 逐票复核闸（真实调用通过；当前部署已启用，异常 fail-open）
+- [x] **P8** 自动复盘 agent（第三方 OpenAI-compatible 中转；严格 JSON、白名单、八闸、回滚、熔断；真实复盘通过）
 - [ ] **P9** easytrader（可选）
+
+出站邮件通知已接入日流程；SMTP 未配置时静默跳过，任何邮件失败不得影响清单和风控。
+当前没有入站邮件命令通道，邮件回复不得进入交易路径。
 
 阶段目标、任务清单和验收标准见 `plan.md` §7。
 
@@ -125,8 +128,7 @@ log_event(log, "ingest.fetch.ok", code="600519.SH", rows=1234)
 
 ## 六、待补充的外部输入
 
-1. **一张手机 APP 持仓截图** —— P5 需要，用来确定读图 prompt 和字段映射，
-   特别是确认持仓页**显不显示股票代码**
-2. **南京证券实际佣金费率** —— P2 需要，填进 `configs/fee_profile.yaml`
+1. **南京证券实际佣金费率** —— P2 需要，填进 `configs/fee_profile.yaml`
    （当前是行业常见值万2.5，非实测）
+2. **邮件 SMTP 凭据与收件地址** —— 只写本机 `.env`，用于出站日报和失败告警
 3. （可选）打电话确认南京证券 NXT/QMT 开通门槛 —— 决定是否实现 `QmtAdapter`

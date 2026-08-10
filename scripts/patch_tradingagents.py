@@ -12,7 +12,8 @@ MARKER = "# [qbg ashare vendor]"
 def main() -> int:
     interface = ROOT / "dataflows" / "interface.py"
     config = ROOT / "default_config.py"
-    if not interface.exists() or not config.exists():
+    validation = ROOT / "agents" / "utils" / "market_data_validation_tools.py"
+    if not interface.exists() or not config.exists() or not validation.exists():
         print("TradingAgents 未 clone")
         return 1
     text = interface.read_text(encoding="utf-8")
@@ -50,6 +51,19 @@ def main() -> int:
     for category in ("core_stock_apis", "technical_indicators", "fundamental_data", "news_data"):
         cfg = cfg.replace(f'"{category}": "yfinance"', f'"{category}": "ashare"')
     config.write_text(cfg, encoding="utf-8")
+    validation_text = validation.read_text(encoding="utf-8")
+    validation_marker = "# [qbg ashare verified snapshot]"
+    if validation_marker not in validation_text:
+        anchor = ("from tradingagents.dataflows.market_data_validator import "
+                  "build_verified_market_snapshot")
+        if anchor not in validation_text:
+            raise RuntimeError("TradingAgents 验证工具已变化，找不到快照 import 锚点")
+        replacement = (f"{validation_marker}\nfrom qbg.agents.ashare_vendor import "
+                       "get_verified_market_snapshot as build_verified_market_snapshot")
+        validation.write_text(validation_text.replace(anchor, replacement, 1), encoding="utf-8")
+        print("已将 verified market snapshot 切换到 A 股本地缓存")
+    else:
+        print("A 股 verified market snapshot 已注册，跳过")
     return 0
 
 

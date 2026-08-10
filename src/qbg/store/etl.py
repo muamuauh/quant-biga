@@ -58,7 +58,7 @@ def _ingest_cycle(db: sqlite3.Connection, result: dict, run_date: str, mode: str
                (run_date, mode, account.get("total_equity"), account.get("available_cash")))
     db.execute("DELETE FROM positions WHERE date=? AND mode=?", (run_date, mode))
     for position in result.get("positions", []):
-        db.execute("INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+        db.execute("INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?,?)", (
             run_date, mode, position.get("code"), position.get("name"), position.get("qty"),
             position.get("sellable_qty"), position.get("cost_price"), position.get("last_price"),
             position.get("market_value"), position.get("pnl")))
@@ -77,7 +77,7 @@ def backfill(log_path: Path | None = None, db_path: Path | None = None) -> dict:
                 invalid += 1
     db.commit()
     counts = {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
-              for table in ("runs", "scores", "plans", "executions", "gates", "events")}
+              for table in ("runs", "scores", "plans", "executions", "gates", "equity",
+                            "positions", "events")}
     db.close()
     return {"read": read, "invalid": invalid, "counts": counts}
-

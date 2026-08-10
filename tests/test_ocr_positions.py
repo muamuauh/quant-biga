@@ -5,7 +5,12 @@ import copy
 import pandas as pd
 import pytest
 
-from qbg.portfolio.ocr_source import PortfolioValidationError, require_valid, save_snapshot
+from qbg.portfolio.ocr_source import (
+    PortfolioValidationError,
+    _normalize_ocr_code,
+    require_valid,
+    save_snapshot,
+)
 from qbg.portfolio.reconcile import reconcile_orders
 
 NAMES = {"600519.SH": "贵州茅台", "000858.SZ": "五粮液"}
@@ -70,6 +75,19 @@ def test_conflicting_duplicate_rows_are_rejected():
     data["positions"].append(duplicate)
     with pytest.raises(PortfolioValidationError, match="重复"):
         require_valid(data, name_map=NAMES, price_history=HISTORY)
+
+
+@pytest.mark.parametrize(("raw", "expected"), [(791, "000791.SZ"), ("876", "000876.SZ"),
+                                                 (600586, "600586.SH")])
+def test_ocr_numeric_code_restores_leading_zero(raw, expected):
+    assert _normalize_ocr_code(raw) == expected
+
+
+def test_zero_code_falls_back_to_exact_name_mapping():
+    data = copy.deepcopy(PAYLOAD)
+    data["positions"][0]["代码"] = 0
+    snapshot, _ = require_valid(data, name_map=NAMES, price_history=HISTORY)
+    assert snapshot.positions[0].code == "600519.SH"
 
 
 def test_reconcile_filled_partial_and_missing():

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,7 +82,8 @@ def validate_payload(payload: dict, *, name_map: dict[str, str] | None = None,
         name = str(raw.get("名称") or "").strip()
         raw_code = raw.get("代码")
         try:
-            code = codes.normalize(raw_code) if raw_code else meta.code_of(name, mapping=name_map)
+            code = (meta.code_of(name, mapping=name_map) if _ocr_code_missing(raw_code)
+                    else _normalize_ocr_code(raw_code))
             expected_name = name_map.get(code, "")
             if expected_name and meta.norm_name(expected_name) != meta.norm_name(name):
                 raise meta.UnknownNameError(f"代码 {code} 对应 {expected_name!r}，不是 {name!r}")
@@ -123,6 +125,22 @@ def validate_payload(payload: dict, *, name_map: dict[str, str] | None = None,
     return snapshot, issues
 
 
+def _normalize_ocr_code(value) -> str:
+    """恢复 JSON 数字丢掉的深市前导零，再走严格的市场代码校验。"""
+    text = str(value).strip()
+    if re.fullmatch(r"\d{1,6}(?:\.0+)?", text):
+        text = f"{int(float(text)):06d}"
+    return codes.normalize(text)
+
+
+def _ocr_code_missing(value) -> bool:
+    """模型偶尔用 0/000000 代替 prompt 要求的 null；二者都不是有效股票代码。"""
+    if value is None:
+        return True
+    text = str(value).strip()
+    return not text or bool(re.fullmatch(r"0+(?:\.0+)?", text))
+
+
 def _latest_limit_context(code: str) -> tuple[float, bool] | None:
     frame = cache.read(code)
     if len(frame) < 2:
@@ -149,4 +167,3 @@ def save_snapshot(snapshot: PortfolioSnapshot, root: Path | None = None) -> tupl
     frame.to_csv(current, index=False, encoding="utf-8-sig")
     frame.to_csv(history, index=False, encoding="utf-8-sig")
     return current, history
-

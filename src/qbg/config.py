@@ -103,9 +103,26 @@ class Settings(BaseSettings):
     qbg_portfolio_source: str = "ocr"
 
     # ------------------------------------------------------------------
+    # 第三方 OpenAI-compatible 中转站
+    # ------------------------------------------------------------------
+    # 统一三元组供 P7 逐票复核、P8 每日复盘和（未单独覆盖时）P5 OCR 共用。
+    # base_url 必须包含服务商要求的 API 前缀，通常以 /v1 结尾；不在代码里
+    # 写死供应商，避免换站时同时改三套调用链。
+    qbg_llm_base_url: str = ""
+    qbg_llm_api_key: str = ""
+    # deep 用于最终判断/复盘，quick 用于高频分析与 OCR；模型 id 必须按中转站
+    # 实际暴露的名称填写，不能假定它与官方 id 完全相同。
+    qbg_llm_model: str = ""
+    qbg_llm_model_quick: str = ""
+    # 中转站偶发排队，90 秒比 SDK 默认值宽松，但仍能避免夜间任务无限挂起。
+    qbg_llm_timeout_seconds: float = 90.0
+
+    # ------------------------------------------------------------------
     # TradingAgents 逐票复核（P7）
     # ------------------------------------------------------------------
-    qbg_agents_enabled: int = 0  # P7 完成前保持 0
+    # 当前部署已由用户决定启用；代码默认仍为 0，避免新克隆在未配置中转站时
+    # 意外产生高额调用。实际部署通过 gitignored 的 .env 显式设为 1。
+    qbg_agents_enabled: int = 0
     # 五档评级里保留的下限。10 万账户 k=3 时，如果卡在 Overweight 会经常只剩
     # 1 只票通过，renormalize 后撞上单票上限，导致大量现金闲置。Hold 是
     # quant-trading 实盘用的值，同样的理由在这里更强。
@@ -136,6 +153,30 @@ class Settings(BaseSettings):
     # 自动应用参数改动。默认 0 = agent 只能提议，人来批。改成 1 前请先确认
     # tuning 的回测把关确实能拦住坏改动（见 P8 的负向测试）。
     qbg_agent_autoapply: int = 0
+    # 单次复盘最多输出约 3k token，足够一份中文日报；继续放大只会增加成本，
+    # 不会增加事实，因为事实由本地确定性层先行提供。
+    qbg_agent_max_tokens: int = 3072
+    # 复盘需要稳定而非创意。部分推理模型会忽略 temperature，这是兼容性参数。
+    qbg_agent_temperature: float = 0.1
+    # 大多数 OpenAI-compatible 中转支持 json_object；若某站明确不支持可关闭，
+    # 本地仍会严格解析和校验 JSON，解析失败则不写报告。
+    qbg_agent_json_mode: int = 1
+
+    # ------------------------------------------------------------------
+    # 邮件通知（只出站）
+    # ------------------------------------------------------------------
+    # 邮件是运行结果的旁路通知，不属于交易路径。默认关闭；即使 SMTP 认证失败或
+    # 网络不可用，也只记日志而不改变 hard_ok、订单清单或进程退出状态。
+    notify_email_enabled: int = 0
+    # 留空比写死某家邮箱更安全：不同服务商的 SMTP 域名不同，填错会让每晚任务
+    # 固定等待网络超时。465/8465 使用隐式 TLS，其余端口使用 STARTTLS。
+    smtp_host: str = ""
+    smtp_port: int = 587
+    # 发件人与应用专用密码只放 gitignored 的 .env。多数服务商不接受账户登录密码。
+    smtp_user: str = ""
+    smtp_password: str = ""
+    # 可与发件人不同；留空时回退到 smtp_user，方便发给自己且减少必填项。
+    notify_email_to: str = ""
 
     # ------------------------------------------------------------------
     # 路径

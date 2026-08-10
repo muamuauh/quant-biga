@@ -133,6 +133,20 @@ def _finish(result: dict, dry_run: bool) -> dict:
     log_event(log, "cycle.completed", **result)
     if not dry_run:
         backfill()
+        if settings.qbg_agent_enabled:
+            # 复盘位于交易链路下游：先写 cycle 日志并回填事实库，再调用中转站。
+            # 它失败只记录结果，绝不改变当日订单或 hard_ok。
+            from qbg.agent.review import daily_review
+
+            result["daily_review"] = daily_review(
+                result.get("date"), mode=result.get("mode", "ADVISORY")
+            ).as_dict()
+            generate(result)  # 把复盘状态/链接补回已经生成的中文日报。
+        # 邮件位于所有交易、日志、store 和复盘之后，只读取最终日报。通知模块保证
+        # SMTP/HTML 异常不抛出，因此它永远不能改变订单或 hard_ok。
+        from qbg.notify import notify_daily_report
+
+        result["email_notification"] = notify_daily_report(result)
     return result
 
 
@@ -144,8 +158,15 @@ def main(argv=None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="忽略交易日和当日幂等检查")
     args = parser.parse_args(argv)
-    result = run_daily(today=args.date, skip_ingest=args.skip_ingest, retrain=args.retrain,
-                       dry_run=args.dry_run, force=args.force)
+    try:
+        result = run_daily(today=args.date, skip_ingest=args.skip_ingest, retrain=args.retrain,
+                           dry_run=args.dry_run, force=args.force)
+    except Exception as exc:
+        # Windows 计划任务常吞掉控制台输出；尽力发崩溃告警后仍保留原异常和退出码。
+        from qbg.notify import notify_failure
+
+        notify_failure(exc, when=args.date, context="qbg.orchestrator.daily_cycle")
+        raise
     print({key: result.get(key) for key in
            ("date", "mode", "run_kind", "skipped_reason", "market_risk_on", "hard_ok",
             "submitted", "report_path")})

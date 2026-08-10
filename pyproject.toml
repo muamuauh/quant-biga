@@ -17,6 +17,7 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
     "pyarrow>=14.0",   # parquet 增量缓存
+    "markdown-it-py>=3.0",  # 邮件把 Markdown 日报渲染为移动端友好的 HTML
 ]
 # 核心依赖刻意保持很薄：P0–P2（骨架/数据层/回测）只需要上面这些。
 # mlflow 放进 model extra 而不是核心——它会拖进 scipy/alembic/sqlalchemy/flask

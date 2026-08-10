@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 from qbg.config import settings
-from qbg.data import cache
+from qbg.data import cache, meta
 from qbg.market import codes
 
 _NO_DATA = "无数据：数据源未返回可核验内容，禁止推测或编造。"
@@ -23,6 +23,19 @@ _NO_DATA = "无数据：数据源未返回可核验内容，禁止推测或编�
 def _code(symbol: str) -> str:
     raw = re.sub(r"\D", "", str(symbol))
     return codes.normalize(raw)
+
+
+def resolve_instrument_identity(symbol: str) -> dict[str, str]:
+    """用本地代码名称表解析 A 股身份，避免上游直接查询 Yahoo。"""
+    code = _code(symbol)
+    name = meta.load_cached().get(code, "")
+    identity = {
+        "exchange": "SSE" if code.endswith(".SH") else "SZSE",
+        "quote_type": "EQUITY",
+    }
+    if name:
+        identity["company_name"] = name
+    return identity
 
 
 def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
@@ -57,6 +70,53 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
     lines = [f"{pd.Timestamp(day).date()}: {value:.6g}" for day, value in
              zip(prepared["Date"], values, strict=False) if pd.notna(value)]
     return f"## {code} {indicator}（本地后复权行情）\n" + "\n".join(lines[-look_back_days:])
+
+
+def get_verified_market_snapshot(symbol: str, curr_date: str,
+                                 look_back_days: int = 30) -> str:
+    """TradingAgents 新版要求的确定性行情快照，完全基于本地缓存。
+
+    这个工具若仍走上游默认实现，会绕过 vendor registry 直接调用 yfinance；
+    六位 A 股代码因此被当成美股 ticker 并让整条 graph 失败。
+    """
+    code = _code(symbol)
+    frame = cache.hfq(cache.read(code))
+    frame = frame[frame["date"] <= pd.Timestamp(curr_date)].tail(max(look_back_days, 30)).copy()
+    if frame.empty:
+        return f"{code} {curr_date} {_NO_DATA}"
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rsi = 100 - (100 / (1 + gain / loss.replace(0, pd.NA)))
+    ema12, ema26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
+    middle = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    latest = frame.iloc[-1]
+    snapshot = {
+        "code": code,
+        "date": pd.Timestamp(latest["date"]).strftime("%Y-%m-%d"),
+        "open": float(latest["open"]),
+        "high": float(latest["high"]),
+        "low": float(latest["low"]),
+        "close_hfq": float(latest["close"]),
+        "volume": float(latest["volume"]),
+        "sma20": _finite(middle.iloc[-1]),
+        "rsi14": _finite(rsi.iloc[-1]),
+        "macd": _finite((ema12 - ema26).iloc[-1]),
+        "bollinger_upper": _finite((middle + 2 * std).iloc[-1]),
+        "bollinger_lower": _finite((middle - 2 * std).iloc[-1]),
+        "recent_closes_hfq": [float(value) for value in close.tail(10) if pd.notna(value)],
+    }
+    import json
+
+    return "本地后复权确定性快照（禁止用其它源覆盖）：\n" + json.dumps(
+        snapshot, ensure_ascii=False, indent=2
+    )
+
+
+def _finite(value) -> float | None:
+    return float(value) if pd.notna(value) else None
 
 
 def _cache_dir() -> Path:

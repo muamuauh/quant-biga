@@ -28,6 +28,7 @@ dependencies:
       # 仍保留，但如需启用请放到独立环境，不要装进主 qbg 环境。
       # --- LLM ---
       - openai>=1.40         # 读图走 OpenAI 兼容接口
+      - markdown-it-py>=3.0  # 日报邮件 HTML 渲染；失败时仍可退回纯文本
       # --- 开发 ---
       - pytest>=8.0
       - ruff>=0.5
