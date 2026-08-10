@@ -56,7 +56,14 @@ BaoStock/AKShare ─► parquet 增量缓存 ─► qlib bin
 # 1. 环境
 conda env create -f environment.yml      # 或 conda create -n qbg python=3.11
 conda activate qbg
-pip install -e .[data,model,llm,dev]
+pip install -e ".[data,model,llm,dev]"
+
+# P3 / P7 的 vendored 依赖
+git clone https://github.com/microsoft/qlib qlib
+pip install -e qlib
+git clone https://github.com/TauricResearch/TradingAgents TradingAgents
+pip install -e TradingAgents
+python scripts/patch_tradingagents.py
 
 # 2. 配置
 cp .env.example .env                     # 然后填 API key
@@ -64,11 +71,21 @@ cp .env.example .env                     # 然后填 API key
 # 3. 拉数据（P1 完成后可用）
 python scripts/01_ingest.py
 
-# 4. 回测（P2 完成后可用）
-python scripts/06_backtest.py
+# 4. 训练与模型回测
+python scripts/02_train.py --seeds 3
+python scripts/06_backtest.py --scores model
 
 # 5. 出下单清单（P4 完成后可用）
 python scripts/04_plan_orders.py --dry-run
+
+# 6. 一键日循环（增量拉数 → 选股 → 风控 → 清单 → 日报 → store）
+run_daily.bat
+
+# 7. 持仓截图（默认人工确认；截图会发送到配置的 Vision 端点）
+python tools/ocr_positions.py screenshot.png --dry-run
+
+# 8. 验证派生库可重建
+python scripts/14_backfill_store.py --rebuild
 ```
 
 ---
@@ -95,6 +112,8 @@ python scripts/04_plan_orders.py --dry-run
 | `CLAUDE.md` | 纪律与操作细节（跨仓库禁令、代码约定、当前进度） |
 | `src/qbg/config.py` | 每个策略参数及其"为什么是这个值" |
 | `configs/*.yaml` | 风控参数、费率，同样带理由注释 |
+| `docs/p3-model-validation.md` | 三 seed IC、行业中性化对照和 SMA 压测实测记录 |
+| `PROGRESS.md` | 当前阶段完成度、在线验收缺口和最近一次验证结果 |
 
 ---
 

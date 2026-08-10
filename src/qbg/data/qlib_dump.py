@@ -156,7 +156,10 @@ def run_dump_bin(csv_dir: Path | None = None,
     provider_uri.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable, str(script), "dump_all",
-        "--csv_path", str(csv_dir),
+        # qlib 0.9.x used ``--csv_path``；当前主线改名为 ``--data_path``。
+        # 本项目 vendored clone 跟随主线，因此使用新参数名。若未来固定回旧版，
+        # 这里会明确返回 CLI 错误，而不会静默生成空数据。
+        "--data_path", str(csv_dir),
         "--qlib_dir", str(provider_uri),
         "--include_fields", "open,high,low,close,volume,factor",
         "--date_field_name", "date",

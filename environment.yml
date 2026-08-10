@@ -24,9 +24,10 @@ dependencies:
       # --- 数据源 ---
       - baostock>=0.8.8      # 主源
       - akshare>=1.16        # 元数据 + 新闻/财务
-      - mootdx>=0.11         # 第三备胎
+      # mootdx 0.11 锁 httpx<0.26，与 TradingAgents 0.3 冲突。第三备源代码
+      # 仍保留，但如需启用请放到独立环境，不要装进主 qbg 环境。
       # --- LLM ---
-      - openai>=1.40         # 读图 + 复核层都走 OpenAI 兼容接口
+      - openai>=1.40         # 读图走 OpenAI 兼容接口
       # --- 开发 ---
       - pytest>=8.0
       - ruff>=0.5

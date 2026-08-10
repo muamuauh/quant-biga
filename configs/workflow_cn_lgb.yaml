@@ -1,0 +1,46 @@
+qlib_init:
+  provider_uri: "./data/qlib_bin/cn_data"
+  region: cn
+
+market: &market all
+data_handler_config: &data_handler_config
+  start_time: 2020-01-01
+  end_time: 2026-08-10
+  fit_start_time: 2020-01-01
+  fit_end_time: 2023-12-31
+  instruments: *market
+  # 盘后产生信号、次日开盘执行，因此标签必须是未来两个开盘之间的收益。
+  # qlib CN 默认的 close-to-close 标签会与真实执行错位一个隔夜跳空。
+  label:
+    - "Ref($open,-2)/Ref($open,-1)-1"
+
+task:
+  model:
+    class: LGBModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+      loss: mse
+      colsample_bytree: 0.8879
+      learning_rate: 0.02
+      subsample: 0.8789
+      lambda_l1: 80.0
+      lambda_l2: 200.0
+      seed: 42
+      # 浅树 + 强正则来自 quant-trading 的防过拟合实测；A股最终值需在
+      # 积累足够历史成分股快照后复验，当前先避免高容量树记住截面噪声。
+      max_depth: 5
+      num_leaves: 31
+      num_threads: 4
+  dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: Alpha158
+        module_path: qlib.contrib.data.handler
+        kwargs: *data_handler_config
+      segments:
+        train: [2020-01-01, 2023-12-31]
+        valid: [2024-01-01, 2024-12-31]
+        test:  [2025-01-01, 2026-08-10]
+

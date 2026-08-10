@@ -42,8 +42,10 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="A股 top-K 日频回测")
     p.add_argument("--k", type=int, default=settings.qbg_top_k, help="持仓只数")
     p.add_argument("--scores", default="reversal",
-                   choices=["momentum", "reversal", "random"],
-                   help="占位打分方式（P3 接 qlib 后改用模型预测）")
+                   choices=["model", "momentum", "reversal", "random"],
+                   help="打分方式；model 读取最近一次 cn_lgb 预测")
+    p.add_argument("--no-neutralize", action="store_true",
+                   help="model 模式下关闭申万一级行业中性化，用于对照")
     p.add_argument("--start", default=None)
     p.add_argument("--end", default=None)
     p.add_argument("--total-weight", type=float, default=0.95,
@@ -56,6 +58,11 @@ def parse_args(argv=None):
 def build_scores(kind: str, panel: engine.Panel, seed: int) -> pd.DataFrame:
     """占位打分。全部只用**截至当日收盘**的信息，不含未来数据。"""
     close = panel.close_px
+    if kind == "model":
+        from qbg.strategy.predict import load_latest_predictions, predictions_to_frame
+
+        frame = predictions_to_frame(load_latest_predictions())
+        return frame
     if kind == "momentum":
         return close.pct_change(20)
     if kind == "reversal":
@@ -82,6 +89,10 @@ def main(argv=None) -> int:
         return 1
 
     scores = build_scores(args.scores, pnl, args.seed)
+    if args.scores == "model" and not args.no_neutralize and settings.qbg_industry_neutral:
+        from qbg.strategy.predict import neutralize_frame
+
+        scores = neutralize_frame(scores)
     result = engine.run_backtest(
         scores, pnl, k=args.k, total_weight=args.total_weight)
 
@@ -157,8 +168,10 @@ def _print_caveats(res: engine.BacktestResult, args, profile) -> None:
 
     if args.scores == "random":
         print("  · 随机打分：Rank IC 应当在 0 附近。显著为正说明引擎有前视偏差")
-    else:
+    elif args.scores != "model":
         print(f"  · {args.scores} 是**占位打分**，不是策略。真正的信号在 P3(qlib 模型)")
+    else:
+        print("  · 模型测试段仍使用当前沪深300成分，存在显著生存者偏差")
 
     print("  · 生存者偏差：股票池是**当前**沪深300 成分，回测过去等于只测了")
     print("    活到今天的那批公司。收益被系统性高估，幅度无法估计")

@@ -27,6 +27,10 @@ dependencies = [
 data = [
     "baostock>=0.8.8",
     "akshare>=1.16",
+]
+# mootdx 0.11 锁死 httpx<0.26，而 TradingAgents 0.3 的 google-genai 需要
+# httpx>=0.28。它只是第三备源，拆成独立环境/extra，避免污染主交易环境。
+data-tdx = [
     "mootdx>=0.11",
 ]
 # 模型层（qlib 自身从 vendored clone 以 editable 装，不在这里声明）

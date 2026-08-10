@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import yaml
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -78,11 +80,12 @@ class Settings(BaseSettings):
     # 高现金触发：闲置现金超过这个比例就当天当作调仓日，避免风控清仓后大量现金
     # 一直躺到下个调仓日。自限：钱投出去后自动回到正常节奏。
     qbg_rebalance_cash_trigger: float = 0.50
-    # 市场择时：沪深300 跌破 N 日均线则全部转现金。
-    # ⚠ 100 是从 quant-trading 的美股参数抄来的**占位值**，A股必须用
-    # scripts/07_regime_stress.py 在 {20,50,100,200} 上跑 5 年 model-free 压测
-    # 重新确定后再改这里，并把压测结论写进本注释。0 = 关闭择时。
-    qbg_market_sma: int = 100
+    # 市场择时：沪深300 跌破 N 日均线则全部转现金。2026-08-10 用当前本地
+    # 沪深300缓存做 2020–2026 model-free 压测：20/50/100/200 日 Sharpe 分别
+    # 0.849/0.803/0.815/0.810，最大回撤 -14.32%/-14.32%/-16.36%/-15.01%。
+    # 因此取 20；它同时给出最高 Sharpe 和并列最低回撤。结果有当前成分股的
+    # 生存者偏差，积累历史成分股快照后必须复验。0 = 关闭择时。
+    qbg_market_sma: int = 20
     # 多 seed 集成：单个 LightGBM 的 Rank IC 光靠 seed 就能摆动 ±0.007，平均掉
     # 这部分噪声（信号在 seed 间一致，噪声不一致）。quant-trading 实测 N=3 是
     # 甜点，N=5 会把本就集中的 top-K 过度平滑。
@@ -171,7 +174,33 @@ class Settings(BaseSettings):
         return self.qbg_mode.upper() == "LIVE" and self.i_confirm_real == 1
 
 
-settings = Settings()
+def _env_pins() -> set[str]:
+    pins = {key.lower() for key in os.environ}
+    env_file = PROJECT_ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                pins.add(stripped.split("=", 1)[0].strip().lower())
+    return pins
+
+
+def _with_tuned_overlay(base: Settings) -> Settings:
+    """应用受限 settings overlay；人工环境变量和安全锁永远优先/冻结。"""
+    path = PROJECT_ROOT / "configs" / "tuned_params.yaml"
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError, TypeError):
+        return base
+    frozen = {"qbg_mode", "i_confirm_real", "qbg_agent_enabled", "qbg_agent_autoapply",
+              "qbg_portfolio_source"}
+    pins = _env_pins()
+    updates = {key: value for key, value in dict(raw.get("settings") or {}).items()
+               if key not in frozen and key.lower() not in pins and hasattr(base, key)}
+    return base.model_copy(update=updates)
+
+
+settings = _with_tuned_overlay(Settings())
 
 
 def load_universe() -> list[str]:

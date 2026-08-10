@@ -1,0 +1,4 @@
+# 由 qbg.tuning 管理；.env 人工 pin 始终优先。三把实盘锁永不允许出现在这里。
+settings: {}
+risk_limits: {}
+

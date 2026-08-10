@@ -111,12 +111,12 @@ log_event(log, "ingest.fetch.ok", code="600519.SH", rows=1234)
 - [x] **P0** 项目骨架
 - [x] **P1** 数据层（BaoStock 主源 + 增量 parquet 缓存 + 沪深300 universe）
 - [x] **P2** A股规则层 + 回测引擎
-- [ ] **P3** 模型与选股  ← 下一步
-- [ ] **P4** 风控闸链 + 下单清单
-- [ ] **P5** 持仓 OCR 工具
-- [ ] **P6** 编排 + 日报 + store
-- [ ] **P7** TradingAgents 逐票复核
-- [ ] **P8** 自动复盘调参 agent
+- [x] **P3** 模型与选股（三 seed Rank IC 全正，见 `docs/p3-model-validation.md`）
+- [x] **P4** 风控闸链 + 下单清单
+- [x] **P5** 持仓 OCR 工具（离线对抗测试完成；真实截图待用户提供）
+- [x] **P6** 编排 + 日报 + store
+- [x] **P7** TradingAgents 逐票复核（vendor/离线测试完成；真实调用待 API key）
+- [ ] **P8** 自动复盘调参 agent（事实层/白名单/八闸/回滚已完成；SDK 在线层待补）
 - [ ] **P9** easytrader（可选）
 
 阶段目标、任务清单和验收标准见 `plan.md` §7。
