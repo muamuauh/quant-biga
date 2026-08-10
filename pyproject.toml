@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qbg"
+version = "0.1.0"
+description = "quant-biga — A股半自动量化系统（数据 → 选股 → 风控 → 下单清单 → 复盘）"
+readme = "README.md"
+license = { text = "MIT" }
+# 3.11 对齐机器上已有的 qtf / qtagent 环境；qlib + lightgbm 生态在 3.13+ 上还不稳。
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "pyarrow>=14.0",   # parquet 增量缓存
+]
+# 核心依赖刻意保持很薄：P0–P2（骨架/数据层/回测）只需要上面这些。
+# mlflow 放进 model extra 而不是核心——它会拖进 scipy/alembic/sqlalchemy/flask
+# 一整棵树，装一次好几分钟，而只有 P3 的模型层用得到。
+
+[project.optional-dependencies]
+# 数据源。baostock 是主源，akshare 只拉低频元数据，mootdx 是第三备胎。
+data = [
+    "baostock>=0.8.8",
+    "akshare>=1.16",
+    "mootdx>=0.11",
+]
+# 模型层（qlib 自身从 vendored clone 以 editable 装，不在这里声明）
+model = [
+    "lightgbm>=4.0",
+    "scikit-learn>=1.3",
+    "mlflow>=2.10",   # 训练产物与预测集的存放；只有 P3+ 需要
+]
+# LLM：复核层（P7）与 OCR 读图（P5）都走 OpenAI 兼容接口
+llm = [
+    "openai>=1.40",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"

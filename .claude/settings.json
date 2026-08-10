@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:/ProgramData/miniconda3/Scripts/conda.exe run -n qbg python:*)",
+      "Bash(C:/ProgramData/miniconda3/Scripts/conda.exe run -n qbg pytest:*)",
+      "Bash(C:/ProgramData/miniconda3/Scripts/conda.exe run -n qbg ruff:*)",
+      "Bash(C:/ProgramData/miniconda3/Scripts/conda.exe list:*)",
+      "Bash(C:/ProgramData/miniconda3/Scripts/conda.exe env list)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git show:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./data/portfolio/**)",
+      "Read(./tools/screenshots/**)",
+      "Edit(E:/codes/quant-trading/**)",
+      "Edit(E:/codes/quant-agent/**)",
+      "Write(E:/codes/quant-trading/**)",
+      "Write(E:/codes/quant-agent/**)"
+    ]
+  }
+}

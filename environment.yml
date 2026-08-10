@@ -1,0 +1,37 @@
+# conda env create -f environment.yml
+# 已存在则：conda env update -f environment.yml --prune
+#
+# 环境名刻意叫 qbg，和机器上已有的 qtf / qtagent 区分开——那两个环境里已经
+# 各装了一份名为 qtf 的 editable 包，不能混用。
+name: qbg
+channels:
+  - conda-forge
+dependencies:
+  # 3.11 对齐 qtf / qtagent；qlib + lightgbm 生态在 3.13+ 上还不稳。
+  - python=3.11
+  - numpy
+  - pandas
+  - pyarrow
+  - cython          # qlib 编译需要
+  - scikit-learn
+  - lightgbm
+  - pyyaml
+  - pip
+  - pip:
+      - pydantic-settings>=2.0
+      - python-dotenv>=1.0
+      - mlflow>=2.10
+      # --- 数据源 ---
+      - baostock>=0.8.8      # 主源
+      - akshare>=1.16        # 元数据 + 新闻/财务
+      - mootdx>=0.11         # 第三备胎
+      # --- LLM ---
+      - openai>=1.40         # 读图 + 复核层都走 OpenAI 兼容接口
+      # --- 开发 ---
+      - pytest>=8.0
+      - ruff>=0.5
+#
+# 不在这里声明、需要手动以 editable 装的 vendored clone：
+#   git clone https://github.com/microsoft/qlib          qlib/          && pip install -e qlib
+#   git clone https://github.com/TauricResearch/TradingAgents TradingAgents/ && pip install -e TradingAgents
+#   （TradingAgents 只在 P7 需要；装完必须跑 scripts/patch_tradingagents.py）

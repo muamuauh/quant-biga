@@ -1,0 +1,51 @@
+# --- 机密：绝不提交 ---
+.env
+.env.bak*
+*.key
+
+# --- 账户信息：持仓、截图、报告、日志都含金额 ---
+data/portfolio/
+tools/screenshots/
+reports/
+logs/
+
+# --- 数据与产物：可重新生成 ---
+# 写 data/* 而不是 data/：git 不会进入被排除的目录，
+# 那样下面的 !data/.gitkeep 反选会失效，空目录就无法入库。
+data/*
+mlruns/
+*.parquet
+*.db
+*.db-wal
+*.db-shm
+
+# --- vendored clone：各自有自己的 git ---
+qlib/
+TradingAgents/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Claude 本地设置（个人权限，不入库）---
+.claude/settings.local.json
+
+# --- 例外：这些必须入库 ---
+!.gitignore
+!.env.example
+!data/.gitkeep
