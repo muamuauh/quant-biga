@@ -16,6 +16,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 from qbg.config import settings
+from qbg.notify.digest import build_digest
 from qbg.utils.logging import get_logger, log_event
 
 log = get_logger(__name__)
@@ -223,22 +224,52 @@ def build_daily_message(result: dict) -> tuple[str, str]:
         return f"[量化-{mode}] 每日报告 {when} — ⚠ 报告读取失败", body
 
 
-def notify_daily_report(result: dict) -> dict:
-    """发送当天日报；无运行的安静跳过日不发信。"""
+def notify_daily_report(result: dict | None = None, *, when: str | None = None,
+                        mode: str | None = None, db_path: Path | None = None) -> dict:
+    """发送当天日报。
+
+    正文由 `digest.build_digest` 从 **store** 组装（每项独立降级），而不是拼
+    当次运行的内存 `result`——邮件最需要看的那一晚，恰恰是流程半路挂掉、
+    `result` 残缺不全的那一晚。`result` 现在只用来取日期/模式和判断安静跳过；
+    不传它也能为任意历史日期补发。
+    """
+    result = result or {}
     cfg = load_config()
     if not cfg.configured:
         return {"sent": False, "skipped": f"未配置邮件通知（缺 {', '.join(cfg.missing())}）"}
+
+    day = str(when or result.get("date") or date.today().isoformat())
+    env = str(mode or result.get("mode") or settings.qbg_mode).upper()
+
+    # 安静跳过必须在**查 store 之前**。周末 run_daily.bat 在市场检查处就退出、
+    # 根本没写 runs 行，先查 store 的话会把周六报成「无运行记录」——一周两次
+    # 假警报，更糟的是它让真正的漏跑和周末长得一模一样。
     if result.get("skipped_reason") in QUIET_SKIPS:
         reason = str(result["skipped_reason"])
-        log_event(log, "notify.email.quiet_skip", skipped=reason)
+        log_event(log, "notify.email.quiet_skip", date=day, skipped=reason)
         return {"sent": False, "skipped": reason}
+    if not result and not _is_trading_day(day):
+        log_event(log, "notify.email.quiet_skip", date=day, reason="not_trading_day")
+        return {"sent": False, "skipped": f"{day} 不是交易日，不发"}
+
     try:
-        subject, body = build_daily_message(result)
-    except Exception as exc:  # noqa: BLE001 — 摘要失败也要尽力发出告警
-        mode = str(result.get("mode") or settings.qbg_mode).upper()
-        subject = f"[量化-{mode}] 每日报告 — ⚠ 摘要生成失败"
-        body = f"# 摘要生成失败\n\n`{type(exc).__name__}: {exc}`"
+        subject, body = build_digest(day, env, db_path=db_path,
+                                     fallback_run=result or None)
+    except Exception as exc:  # noqa: BLE001 — 摘要失败本身就是需要人看的事
+        subject = f"[量化-{env}] 每日报告 {day} — ⚠ 摘要生成失败"
+        body = (f"# 摘要生成失败\n\n`build_digest` 抛出 "
+                f"`{type(exc).__name__}: {exc}`\n\n这本身就是需要人看的事。")
     return send(subject, body, html=markdown_to_html(body), cfg=cfg)
+
+
+def _is_trading_day(day: str) -> bool:
+    """交易日历不可用时返回 True——宁可多发一封，也不要静默漏掉真实的运行。"""
+    try:
+        from qbg.market import calendar
+
+        return bool(calendar.is_trading_day(day))
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def notify_failure(exc: BaseException, *, when: str | None = None,

@@ -131,6 +131,12 @@ def test_quiet_skip_is_not_sent(monkeypatch, mail_config):
 
 
 def test_monitoring_day_is_mailed(monkeypatch, mail_config, tmp_path):
+    """监控日要发信，且主题说人话（不是 `not_rebalance_day`）。
+
+    传一个空的 `db_path` 把测试和真实 store 隔开：正文现在由 store 驱动，
+    不隔离的话读到的是本机真实运行记录，测的就不是这个用例了。store 查不到
+    运行行时会回退到调用方传入的 result。
+    """
     report = tmp_path / "daily.md"
     report.write_text("# 监控日报", encoding="utf-8")
     monkeypatch.setattr(mailer, "load_config", lambda: mail_config)
@@ -144,6 +150,6 @@ def test_monitoring_day_is_mailed(monkeypatch, mail_config, tmp_path):
         "mode": "ADVISORY",
         "skipped_reason": "not_rebalance_day",
         "report_path": str(report),
-    })
+    }, db_path=tmp_path / "empty.db")
     assert result["sent"] is True
     assert "监控日" in result["subject"]
