@@ -26,38 +26,51 @@ IMPLICIT_TLS_PORTS = (465, 8465)
 QUIET_SKIPS = frozenset({"not_trading_day", "already_completed_today"})
 
 EMAIL_CSS = """
-body { background:#eef0f3; margin:0; padding:12px;
+body { background:#f4f6f8; margin:0; padding:24px 12px;
        font-family:-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,
        'PingFang SC','Microsoft YaHei',sans-serif; color:#1f2328;
        line-height:1.5; overflow-wrap:anywhere; word-break:break-word; }
-.wrap { max-width:760px; margin:0 auto; background:#ffffff; border-radius:10px;
-        padding:0 0 18px; border:1px solid #e3e6ea; overflow:hidden; }
-.wrap > :not(.bar) { margin-left:18px; margin-right:18px; }
-.bar { background:linear-gradient(135deg,#1f6feb,#3b82f6); color:#fff;
-       padding:16px 18px; margin:0 0 6px; }
-h1 { font-size:19px; margin:0; color:#fff; }
-h1 + p, .bar em, em { color:#dce8ff; }
-h2 { font-size:15px; margin:20px 0 8px; padding-bottom:5px; color:#1f6feb;
-     border-bottom:2px solid #eaecef; }
+.wrap { max-width:760px; margin:0 auto; background:#ffffff; border-radius:12px;
+        padding:0 0 20px; border:1px solid #dfe3e8; overflow:hidden;
+        box-shadow:0 5px 20px rgba(31,35,40,.06); }
+.wrap > :not(.bar):not(.foot) { margin-left:24px; margin-right:24px; }
+.bar { background:#ffffff; padding:21px 24px 17px; margin:0 0 4px;
+       border-top:5px solid #1677ff; border-bottom:1px solid #edf0f2; }
+h1 { font-size:22px; line-height:1.3; margin:0; color:#20252b; letter-spacing:-.2px; }
+h1 + p { margin-top:5px; }
+.bar em { color:#69717a; font-style:normal; font-size:12.5px; }
+em { color:#69717a; }
+h2 { font-size:15.5px; margin:23px 0 9px; padding-bottom:6px; color:#1677ff;
+     border-bottom:1px solid #dbe8f8; }
 h3 { font-size:13.5px; margin:14px 0 6px; }
 p { margin:6px 0; }
 table { display:block; max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch;
-        border-collapse:collapse; margin:10px 0; font-size:12.5px; white-space:nowrap; }
-th,td { border:1px solid #e4e7eb; padding:6px 10px; text-align:right;
+        border-collapse:collapse; margin:10px 0 13px; font-size:12.5px; white-space:nowrap; }
+th,td { border:1px solid #e1e5e9; padding:7px 10px; text-align:right;
         font-variant-numeric:tabular-nums; }
 th:first-child, td:first-child { text-align:left; }
-th { background:#f4f6f8; font-weight:600; color:#3a4149; }
+th { background:#f3f5f7; font-weight:600; color:#3a4149; }
 tr:nth-child(even) td { background:#fafbfc; }
 ul { margin:6px 0; padding-left:20px; }
 li { margin:3px 0; }
-blockquote { margin:10px 0; padding:9px 13px; background:#fff8e6;
-             border-left:4px solid #f0b429; border-radius:4px; }
+blockquote { margin:10px 0 14px; padding:10px 13px; background:#f2f7ff;
+             border-left:4px solid #1677ff; border-radius:5px; color:#28384d; }
+blockquote p { margin:0; }
 pre { background:#f6f8fa; border:1px solid #e3e6ea; border-radius:6px;
       padding:10px; overflow-x:auto; font-size:12px; white-space:pre-wrap;
       word-break:break-word; line-height:1.45; }
 code { font-family:'SFMono-Regular',Consolas,monospace; }
 hr { border:0; border-top:1px solid #eaecef; margin:16px 0; }
 sub, .foot { color:#8a9199; font-size:11px; }
+.foot { margin:22px 24px 0; padding-top:12px; border-top:1px solid #edf0f2; }
+@media only screen and (max-width:600px) {
+  body { padding:0; background:#fff; }
+  .wrap { border:0; border-radius:0; box-shadow:none; }
+  .wrap > :not(.bar):not(.foot) { margin-left:15px; margin-right:15px; }
+  .bar { padding:17px 15px 14px; }
+  h1 { font-size:20px; }
+  .foot { margin-left:15px; margin-right:15px; }
+}
 """
 
 
@@ -119,8 +132,11 @@ def markdown_to_html(md_text: str) -> str | None:
         )
         return (
             '<!doctype html><html><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
             f"<style>{EMAIL_CSS}</style></head>"
-            f'<body><div class="wrap">{body}</div></body></html>'
+            f'<body><div class="wrap">{body}'
+            '<div class="foot">quant-biga 自动通知 · 数据与订单意见仅供决策参考</div>'
+            '</div></body></html>'
         )
     except Exception as exc:  # noqa: BLE001 — 纯文本仍是一封完整通知
         log_event(log, "notify.email.render_error", error=f"{type(exc).__name__}: {exc}")

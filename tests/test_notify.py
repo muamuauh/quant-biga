@@ -87,6 +87,8 @@ def test_markdown_html_contains_responsive_table():
     html = mailer.markdown_to_html("# 日报\n\n|代码|评级|\n|---|---|\n|600519.SH|Hold|\n")
     assert html is not None
     assert "<table>" in html and "<style>" in html and 'class="bar"' in html
+    assert "@media only screen" in html
+    assert "quant-biga 自动通知" in html
 
 
 def test_build_message_reads_exact_report(tmp_path):

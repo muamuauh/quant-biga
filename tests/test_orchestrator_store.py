@@ -22,7 +22,36 @@ def test_daily_report_contains_orders_and_risk():
                    "orders": [{"code": "a", "side": "BUY", "quantity": 100,
                                "price": 10.0, "reason": "test"}],
                    "gates": [{"name": "mode_guard", "passed": True, "reason": "ok"}]})
-    assert "订单摘要" in text and "mode_guard" in text and "生存者偏差" in text
+    assert "订单意见" in text and "mode_guard" in text and "生存者偏差" in text
+    assert "没有向券商提交订单" in text
+
+
+def test_daily_report_follows_mail_summary_order():
+    text = render({
+        "date": "2026-08-10",
+        "mode": "ADVISORY",
+        "market_risk_on": True,
+        "account": {"total_equity": 100_000, "available_cash": 80_000},
+        "positions": [],
+        "targets": {"600519.SH": .3},
+        "orders": [],
+        "allowed_orders": [],
+        "gates": [{"name": "mode_guard", "passed": True, "reason": "ok"}],
+    })
+    headings = [
+        "## 概览",
+        "## 一句话结论",
+        "## 账户与持仓",
+        "## 量化选择与 TradingAgents 复核",
+        "## 订单意见",
+        "## 运行健康",
+        "## 建议与限制",
+    ]
+    assert text.startswith("# 复盘 · 2026-08-10")
+    assert [text.index(heading) for heading in headings] == sorted(
+        text.index(heading) for heading in headings
+    )
+    assert "1/1 项通过" in text
 
 
 def test_daily_report_contains_agent_review_status():
