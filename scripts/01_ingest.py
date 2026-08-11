@@ -107,7 +107,9 @@ def ingest_bars(members: list[str], chain: SourceChain, args) -> dict:
         stats["added_rows"] += max(summary["added"], 0)
 
         # 自洽校验：抓那些不抛异常但会毁掉下游的静默错误。
-        problems = cache.verify(cache.read(code))
+        # repair=False：要看源的原样，否则因子递减这条永远检不出来
+        # （read() 默认已经把它修掉了，见 cache.repair_factor）。
+        problems = cache.verify(cache.read(code, repair=False))
         if problems:
             stats["problems"][code] = problems
             log_event(log, "ingest.verify_problems", code=code, problems=problems)

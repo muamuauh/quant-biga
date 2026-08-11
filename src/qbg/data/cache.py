@@ -54,8 +54,16 @@ def path_for(code: str, root: Path | None = None) -> Path:
     return root / f"{codes.normalize(code)}.parquet"
 
 
-def read(code: str, root: Path | None = None) -> pd.DataFrame:
-    """读缓存。没有文件就返回空 DataFrame（不是异常——首次运行本来就没有）。"""
+def read(code: str, root: Path | None = None, repair: bool = True) -> pd.DataFrame:
+    """读缓存。没有文件就返回空 DataFrame（不是异常——首次运行本来就没有）。
+
+    `repair=True`（默认）会修掉数据源里的伪造因子下降（见 `repair_factor`）。
+    默认开是因为**没有任何下游想要一个错的因子**；`repair=False` 保留源的
+    原样，供对账和 `verify()` 用。
+
+    落盘的永远是源的原样，修复只发生在读出来之后——这样源的问题始终可见、
+    可审计，不会被我们的修复悄悄掩盖掉。
+    """
     p = path_for(code, root)
     if not p.exists():
         return _empty_stored()
@@ -64,7 +72,15 @@ def read(code: str, root: Path | None = None) -> pd.DataFrame:
     except Exception as e:  # noqa: BLE001 — 坏文件不该让整批 ingest 崩
         log_event(log, "cache.read_error", code=code, path=str(p), error=str(e)[:200])
         return _empty_stored()
-    return _conform(df)
+    out = _conform(df)
+    if repair and not out.empty:
+        fixed, repairs = repair_factor(out["factor"])
+        if repairs:
+            out = out.copy()
+            out["factor"] = fixed
+            log_event(log, "cache.factor_repaired", code=code,
+                      n_repairs=len(repairs), repairs=repairs[:5])
+    return out
 
 
 def last_date(code: str, root: Path | None = None) -> pd.Timestamp | None:
@@ -142,6 +158,72 @@ def update(
     return summary
 
 
+def repair_factor(factor: pd.Series) -> tuple[pd.Series, list[dict]]:
+    """修掉后复权因子里的伪造下降。返回 `(修好的因子, 修复记录)`。
+
+    ## 为什么需要它
+
+    后复权因子只会在除权除息日**向上**跳（分红送股不断累积），它的存在
+    本身就是为了抵消原始价的除权缺口。所以**因子在原始价正常波动的日子
+    发生变化，这个变化必定是假的**。
+
+    实测（2026-08-10，沪深300 全量 304 只）有 4 只中招，而且
+    **BaoStock 自己的 `query_adjust_factor` 权威表里就带着这个下降**——
+    换那个接口拿不到更好的数据，只能修。
+
+        000001.SZ  平安银行  2020-12-31  119.96 → 99.79   伪造单日收益 +16.94%
+        000002.SZ  万科A     2020-11-19  115.09 → 112.15  伪造 +2.57%（次日原样恢复）
+        600372.SH            2020-11-19                    伪造 +0.41%
+        601607.SH            2020-11-27                    伪造 +0.78%
+
+    平安银行那一天原始价是 19.20 → 19.34（+0.73%），复权后却变成 −16.2%——
+    一根凭空造出来的假阴线。不修的话它会直接进模型训练集。
+
+    ## 两种故障，两种修法
+
+    **一日凹陷**（次日恢复到原值）——例如万科：因子掉一天又原样弹回来，
+    没有任何公司行为是这个形状。修法：把那一天的异常值换成前一天的值。
+
+    **持久平移**（掉下去就不回来）——例如平安银行：多半是数据源在某个
+    时点换了复权基准，把两段不同锚点的序列拼在了一起。修法：把**断点之后
+    的整段**按比例放大回断点之前的水平。这样段内的相对变化完全不变
+    （因子对某只票是常数倍，收益率序列不受影响），而断点当天的比值变成
+    1.0，伪造收益随之消失。
+
+    两种修法都只改因子、不碰价格，且都保证修完的序列单调不减。
+    """
+    f = pd.to_numeric(factor, errors="coerce").astype(float)
+    if len(f) < 2:
+        return f, []
+
+    vals = f.to_numpy(copy=True)
+    repairs: list[dict] = []
+
+    for i in range(1, len(vals)):
+        prev = vals[i - 1]
+        if not (prev > 0) or not (vals[i] > 0):
+            continue
+        # 相对容差：因子量级从 1 到 130 都有，绝对容差没法统一。
+        if vals[i] >= prev * (1 - 1e-9):
+            continue
+
+        recovers = i + 1 < len(vals) and vals[i + 1] >= prev * (1 - 1e-9)
+        if recovers:
+            # 一日凹陷：只有这一天是坏的。
+            repairs.append({"kind": "outlier", "pos": i,
+                            "from": round(vals[i], 6), "to": round(prev, 6)})
+            vals[i] = prev
+        else:
+            # 持久平移：整条尾巴按比例抬回去。
+            scale = prev / vals[i]
+            repairs.append({"kind": "rescale", "pos": i,
+                            "from": round(vals[i], 6), "to": round(prev, 6),
+                            "scale": round(scale, 6)})
+            vals[i:] *= scale
+
+    return pd.Series(vals, index=f.index, name=f.name), repairs
+
+
 def verify(df: pd.DataFrame) -> list[str]:
     """对一只票的缓存做自洽检查，返回问题列表（空 = 没问题）。
 
@@ -151,6 +233,10 @@ def verify(df: pd.DataFrame) -> list[str]:
       · 复权因子非正 / 递减 → 后复权因子应当单调不减（除权只会累积）
       · 价格非正 → 停牌日的 0 价没被清理掉
       · high < low → 源的数据本身有问题
+
+    ⚠ 要检出因子递减，必须传**未修复**的数据：`cache.read(code, repair=False)`。
+    `read()` 默认已经把伪造下降修掉了，直接把它的结果喂进来，这条检查
+    永远不会触发——那就等于把源的数据质量问题藏起来了。
     """
     problems: list[str] = []
     if df.empty:
