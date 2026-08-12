@@ -1,0 +1,12 @@
+# 本仓库在 Windows 上开发、在 Linux 服务器上部署，换行符必须显式钉死。
+#
+# 开发机的 core.autocrlf=true 会在**检出时**把 LF 换成 CRLF。Linux 上 git 默认
+# 不做这个转换，所以现状能跑——但那是在依赖目标机器的 git 配置。一旦哪台机器
+# 的配置不同，shell 脚本就会带着 \r 落地，然后报一个很难看懂的错：
+#
+#     ./run_daily.sh: /usr/bin/env: 'bash\r': No such file or directory
+#
+# 只钉这两类文件，不写 `* text=auto`——那会触发全仓重新规范化，把一次部署
+# 修复变成一个大 diff。
+*.sh text eol=lf
+*.bat text eol=crlf
