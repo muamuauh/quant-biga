@@ -90,7 +90,7 @@
 
 | 层 | 职责 |
 |---|---|
-| `store/` | **SQLite 派生索引**：19 张表 + 2 个视图。**永远是派生的、不是真相源**，可从 JSONL 日志 + CSV + mlruns 全量重建；交易路径不读它，删掉也不影响下单 |
+| `store/` | **SQLite 派生索引**：18 张表 + 2 个视图。**永远是派生的、不是真相源**，可从 JSONL 日志 + CSV + mlruns 全量重建；交易路径不读它，删掉也不影响下单 |
 | `analysis/` | **零 LLM 事实计算**：归因、运行健康诊断、记分卡、持仓、假设、触发器、评级稳定性、新闻 |
 | `tuning/` | 参数白名单（分层 `A/A_risk/A_slow/A_replay/B/B_paper_blind/frozen`）、**8 项回测把关**（含子区间稳定性、参数高原、+75% 成本鲁棒性）、overlay 应用、审计、回滚 |
 | `agent/` | Claude Agent SDK：20 个 MCP 工具、3 级权限（allow/confirm/deny，无人值守时 confirm ⇒ Deny）、PreToolUse 熔断、转录脱敏 |
@@ -99,7 +99,7 @@
 
 **store schema 的关键设计**：`trd_env` 在**每张账户级表的主键里**。继承来的 REAL 历史和本仓库自己的 SIMULATE 历史并排存放，**绝不能被加总成一条净值曲线**。`queries.py` 默认按它过滤。本项目要把这个语义换成 `mode`（`ADVISORY`/`PAPER`/`LIVE`）但保留同样的隔离。
 
-**19 张表**：`runs` `scores` `targets` `verdicts` `orders` `fills` `gates` `equity` `positions` `prices` `llm_usage` `stops` `events` `proposals` `param_changes` `reviews` `findings` `hypotheses`
+**18 张表**：`runs` `scores` `targets` `verdicts` `orders` `fills` `gates` `equity` `positions` `prices` `llm_usage` `stops` `events` `proposals` `param_changes` `reviews` `findings` `hypotheses`
 **2 个视图**：`v_fwd_returns`（次日收益）、`v_decisions`（"我们当时怎么想的 / 做了什么 / 结果如何"的那个 join）
 
 `hypotheses` 表的 `discriminator` 字段是 `NOT NULL` —— **一个没有任何观测能证伪它的信念不是假设**，这张表拒绝存这种东西。这个设计值得照搬。
