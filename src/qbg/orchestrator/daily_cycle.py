@@ -21,7 +21,7 @@ from qbg.orchestrator.run_marker import (
     save_marker,
     save_rebalance_date,
 )
-from qbg.portfolio.manual import ManualSource
+from qbg.portfolio.source import load_portfolio
 from qbg.report.daily_report import generate
 from qbg.risk.gates import load_limits, run_all_gates
 from qbg.store.etl import backfill
@@ -57,14 +57,24 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     if retrain:
         train(live=True)
 
+    portfolio_source, degraded = settings.qbg_portfolio_source, None
     try:
-        snapshot = ManualSource().load()
+        loaded = load_portfolio()
+        snapshot = loaded.snapshot
+        portfolio_source = loaded.source
+        if loaded.degraded:
+            degraded = {"from": loaded.degraded_from, "reason": loaded.degraded_reason}
         equity, cash = snapshot.total_equity, snapshot.available_cash
         positions = [p.as_dict() for p in snapshot.positions]
+        asof = snapshot.asof
     except (FileNotFoundError, pd.errors.EmptyDataError):
-        equity, cash, positions = default_equity, default_equity, []
+        equity, cash, positions, asof = default_equity, default_equity, [], ""
+        portfolio_source = "default"
     result["account"] = {"total_equity": equity, "available_cash": cash}
     result["positions"] = positions
+    # 来源与 asof 必须进日报：降级后用的是**过期持仓**，而那样出的清单
+    # 和正常清单长得一模一样，不标出来没人会发现。
+    result["portfolio"] = {"source": portfolio_source, "asof": asof, "degraded": degraded}
     if not is_rebalance_day(settings.qbg_rebalance_every_days, today,
                             cash_fraction=cash / equity if equity else 0,
                             cash_trigger=settings.qbg_rebalance_cash_trigger):

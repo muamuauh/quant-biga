@@ -64,6 +64,43 @@ def _headline(result: dict) -> str:
     return f"量化模型给出 {targets} 个目标，风控允许 {allowed} 笔订单；{execution}。"
 
 
+_SOURCE_LABELS = {
+    "easytrader": "同花顺客户端直读",
+    "ocr": "持仓截图 OCR 产出的 CSV",
+    "manual": "手工维护的 CSV",
+    "default": "无持仓记录，按默认初始资金假设",
+}
+
+
+def _portfolio_provenance(portfolio: dict) -> list[str]:
+    """持仓从哪来、截止到哪天、有没有降级。
+
+    这段必须显眼：easytrader 读失败会退回 CSV，而**用过期持仓出的清单
+    和正常清单长得一模一样**。不写出来，没人会发现自己在照着几天前的持仓下单。
+    """
+    if not portfolio:
+        return []
+    source = str(portfolio.get("source") or "")
+    label = _SOURCE_LABELS.get(source, source or "未知")
+    asof = str(portfolio.get("asof") or "").strip()
+    line = f"**持仓来源**：{label}"
+    if asof:
+        line += f"（截止 {asof}）"
+    lines = [line, ""]
+    degraded = portfolio.get("degraded")
+    if degraded:
+        lines = [
+            f"> ⚠️ **持仓来源已降级**：`{degraded.get('from')}` 读取失败，"
+            f"改用{label}"
+            + (f"（截止 {asof}）" if asof else "")
+            + "。",
+            f"> 失败原因：`{_cell(str(degraded.get('reason') or ''))}`",
+            "> **下面的持仓可能是过期的，据此产生的订单请人工复核后再执行。**",
+            "",
+        ]
+    return lines
+
+
 def render(result: dict) -> str:
     mode = result.get("mode", settings.qbg_mode)
     account = result.get("account") or {}
@@ -85,6 +122,8 @@ def render(result: dict) -> str:
              f"| 风控闸门 | {passed_gates}/{len(gates)} 项通过 |", "",
              "## 一句话结论", "", f"> {_headline(result)}", "",
              "## 账户与持仓", ""]
+
+    lines += _portfolio_provenance(result.get("portfolio") or {})
 
     unrealized = sum(float(position.get("pnl", 0) or 0) for position in positions)
     if positions:

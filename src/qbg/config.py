@@ -97,10 +97,41 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # 持仓来源
     # ------------------------------------------------------------------
-    # ocr    = 读 tools/ocr_positions.py 产出的 CSV（默认）
-    # manual = 同一份 CSV，手工编辑
-    # easytrader = P9 可选，只读
+    # ocr        = 读 tools/ocr_positions.py 产出的 CSV（默认）
+    # manual     = 同一份 CSV，手工编辑
+    # easytrader = P9a，直接读同花顺客户端，**只读**
     qbg_portfolio_source: str = "ocr"
+
+    # ------------------------------------------------------------------
+    # 同花顺客户端只读持仓（P9a）
+    # ------------------------------------------------------------------
+    # 只在 qbg_portfolio_source=easytrader 时生效，且**只读**：这条链路上
+    # 没有任何下单代码。下单是 P9b，届时走 execution 层并需要三把锁。
+    #
+    # 本机实测（同花顺 9.60.61）路径；换机器改这里，别改代码。
+    qbg_ths_exe: str = r"D:\tonghuashun\同花顺\xiadan.exe"
+    # universal_client = 同花顺官网通用客户端（xiadan.exe 在同花顺安装目录下）
+    # ths              = 券商自己发的同花顺改版包
+    qbg_ths_client: str = "universal_client"
+    # 取表策略。auto = 本项目自实现，做三件 easytrader 没做的事：
+    # 按可见性消歧 grid、用 ddddocr 认反爬验证码、用哨兵值确认剪贴板真被更新。
+    # easytrader 原生的 xls/copy/wmcopy 在同花顺 9.60.61 上**全部不可用**，
+    # 而且 copy/wmcopy 是**静默**返回空列表（不抛异常），细节见 plan.md §2.2.5。
+    qbg_ths_grid_strategy: str = "auto"
+    # 单张表的重试次数。复制这一步在实测中不稳定（同一张表连跑有时成功有时
+    # 纹丝不动）。有哨兵校验兜底，重试不会把陈旧剪贴板当成新数据。
+    qbg_ths_retries: int = 3
+    # 单次运行最多提交几笔订单（P9b）。
+    # 这是兜住**上游逻辑错误**的闸，不是策略参数：k=3 的账户一次调仓正常在
+    # 6 笔以内（最多 3 卖 3 买），一次要下十几笔多半是选股或规划出了问题。
+    # 超过就整批拒绝，而不是"下前 N 笔"——半批执行比不执行更难收拾。
+    qbg_ths_max_orders: int = 8
+
+    # 读失败时是否退回 ocr/manual 的 CSV。
+    # 默认 1：持仓读不到不该让整条日流程停摆，CSV 是人可控的降级路径。
+    # 但降级意味着**可能用过期持仓出清单**，所以日报必须显式标注来源和 asof
+    # ——静默降级比读失败更危险。
+    qbg_ths_fallback_to_csv: int = 1
 
     # ------------------------------------------------------------------
     # 第三方 OpenAI-compatible 中转站
