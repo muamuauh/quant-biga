@@ -2,6 +2,62 @@
 
 > 接手前先读 `plan.md` 和 `CLAUDE.md`。最后更新：2026-08-21。
 
+## 下次开工：先做这个
+
+**唯一阻塞项：账户里没有持仓。** P9a 的取值映射只验证了**表头**，
+P9b 的**卖出路径**从没真正跑过。两者都要账户有仓才能验。
+
+**在交易日 09:30–11:30 / 13:00–15:00 跑：**
+
+```powershell
+conda activate qbg
+cd E:\codes\quant-biga
+python toolsalidate_ths_p9.py
+```
+
+跑之前确认：同花顺的**独立下单程序**已登录、在**专业模式**（不是那条小横条）、
+**普通权限**运行（不是管理员）。三样有一样不对，脚本会明确告诉你哪里不对。
+
+它会：建仓（买 100 股 601398）→ 验证 P9a 的 7 个字段取值 →
+试卖 100 股（当天买入当天不可卖，**预期被拒**，借此验证卖出链路和致命提示识别）
+→ 撤掉遗留委托。**持仓保留不卖。**
+
+**再下一个交易日**，`可用余额` 会变成 100，那时跑：
+
+```powershell
+python toolsalidate_ths_p9.py --skip-build
+```
+
+这次卖单会被接受，验证**真正的卖出成交路径** —— 那是最后一块没验证的拼图。
+
+两次都通过之后才做 **P9c**（`daily_cycle` 按 mode 选 adapter + 日报加
+「计划 vs 实际委托」对账）。现在 `daily_cycle` 写死 `AdvisoryAdapter()`，
+和 P9a 之前写死 `ManualSource()` 是同一类问题。
+
+### 其他随时能跑的检查
+
+```powershell
+python tools\probe_ths.py --preflight-only   # 只做环境预检，不碰客户端
+python tools\probe_ths.py                    # 只读四表 + 字段对照
+python tools\probe_ths_order.py              # 下单表单输入路径（只填不交）
+pytest -q                                     # 426 个离线测试，不需要同花顺
+```
+
+**同花顺升级后先跑前两条**：control_id 是硬编码的，重排控件会失效，
+而且失效往往是静默的。
+
+### 还欠着的两件事（与 P9 无关）
+
+1. **行业中性化的结论翻了**，但有三个混淆因素（因子修复、universe 290→299、
+   重训噪声），需要用 `tuning/` 的八项回测闸做受控评估。`QBG_INDUSTRY_NEUTRAL=1`
+   保持未动。
+2. **旧账户数据的残留**：`data/portfolio/` 和 `data/runs.db` 已按用户要求永久删除，
+   但 `reports/`（2026-08-10 的日报/清单/复盘）和 `logs/qbg.jsonl`（3 行
+   `cycle.completed` 带 account 字段）**没动**，`14_backfill_store.py --rebuild`
+   能把旧数据重建回来。要彻底清需要一并处理。
+
+---
+
 ## 一句话现状
 
 P3–P6 已完成并用本机真实行情跑通：290 只股票训练的三 seed Rank IC 均为正，

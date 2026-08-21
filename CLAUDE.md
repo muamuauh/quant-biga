@@ -154,8 +154,16 @@ python tools/probe_ths.py --preflight-only   # 不碰客户端
 python tools/probe_ths.py                    # 只读四表 + 字段对照
 ```
 
+**三个工具脚本，注意哪个会下单**：
+
+| 脚本 | 会不会下单 |
+|---|---|
+| `tools/probe_ths.py` | ❌ 只读四表 |
+| `tools/probe_ths_order.py` | ❌ 只填表单，不点提交 |
+| `tools/validate_ths_p9.py` | 🔴 **会真的下单**（三道闸：PAPER + 模拟账户 + 交易时段） |
+
 `tools/probe_ths.py` 和 `src/qbg/portfolio/ths_client.py` **都没有下单代码路径**，
-不要往里加。下单是 P9b，走 execution 层，需要三把锁。
+不要往里加。下单走 `src/qbg/execution/`，需要三把锁。
 
 **取表的真实实现在 `ths_client.py`，探针只是它的调用方。** easytrader 自带的
 三个 grid 策略在同花顺 9.60.61 上一个都不能用，其中 `Copy`/`WMCopy` 是**静默**
