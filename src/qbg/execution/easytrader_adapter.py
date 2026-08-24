@@ -240,10 +240,15 @@ class EasytraderAdapter:
                  if str(row.get(ENTRUST_ID) or "").strip() not in known_ids]
         row = find_entrust(fresh, order)
         if row is None:
+            # 2026-08-24 实测：同花顺对「T+1 不可卖的卖单」是**静默拒绝** ——
+            # 让你走完委托确认、点了「是」，然后什么都不做：不建委托、不报错、
+            # 不弹任何拒绝提示（只弹了个无关的营销框）。
+            # 所以这里既不能报「成功」，也没法说出拒绝理由，只能如实描述。
             return OrderOutcome(
                 order, False,
-                "提交后在当日委托里找不到**新增**的匹配记录（代码/方向/数量/价格四项全对）—— "
-                "这笔单可能根本没下出去，已停止后续订单",
+                "提交后当日委托里没有出现这一笔（代码/方向/数量/价格四项全对的新记录）。"
+                "客户端也没有给出拒绝理由 —— 同花顺对这类拒绝是静默的（实测 T+1 不可卖时如此）。"
+                "已停止后续订单。常见原因：可用股份/资金不足、超出涨跌停、非交易时段",
                 dialogs=result.dialogs)
         entrust_no = str(row.get(ENTRUST_ID) or "")
         log_event(log, "ths.order.verified", code=order.code, side=order.side,

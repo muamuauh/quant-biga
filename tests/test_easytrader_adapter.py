@@ -148,7 +148,7 @@ def test_missing_entrust_halts_remaining_orders(monkeypatch):
     assert not result.ok
     assert result.submitted == 0
     assert len(calls) == 1, "第一笔就该停，不该继续下第二笔"
-    assert "找不到" in result.message and "新增" in result.message
+    assert "没有出现这一笔" in result.message
 
 
 def test_form_error_halts_remaining_orders(monkeypatch):
@@ -245,7 +245,7 @@ def test_no_new_entrust_is_failure_even_if_stale_matches(monkeypatch):
     adapter = EasytraderAdapter(connect=lambda: object(), reader=lambda _u: [stale])
     result = adapter.submit([_order()], "2026-08-21")
     assert not result.ok
-    assert "新增" in result.message
+    assert "没有出现这一笔" in result.message
 
 
 def test_baseline_read_failure_refuses_to_trade(monkeypatch):

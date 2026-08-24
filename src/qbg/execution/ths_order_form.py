@@ -104,10 +104,16 @@ def _one_visible(user, control_id: int, class_name: str):
 
     只有当前页那套是可见的，所以用可见性消歧。**恰好一个才返回**，
     多于一个就抛错而不是随便挑 —— 挑错了就是往另一张单子里填数字。
+
+    ⚠️ **`descendants()` 不接受 `control_id` 过滤，传了会被静默忽略。**
+    2026-08-24 实测：`descendants(control_id=1032, class_name="Edit")` 和
+    `descendants(control_id=1033, ...)` 返回**完全相同**的 9 个元素 ——
+    它只按 class_name 过滤。所以必须自己比对 `ctrl.control_id()`。
+    （`child_window(control_id=...)` 是另一套 API，那个会按 id 过滤，
+    但它把不可见的也算进来，于是在两页都加载后 ElementAmbiguousError。）
     """
-    found = [ctrl for ctrl in user.main.descendants(control_id=control_id,
-                                                    class_name=class_name)
-             if ctrl.is_visible()]
+    found = [ctrl for ctrl in user.main.descendants(class_name=class_name)
+             if ctrl.control_id() == control_id and ctrl.is_visible()]
     if len(found) != 1:
         raise OrderFormError(
             f"control_id={control_id} 可见的有 {len(found)} 个，无法确定是哪一个")

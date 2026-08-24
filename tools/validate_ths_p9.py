@@ -181,13 +181,20 @@ def phase_c_sell_path(user, code: str, qty: int) -> bool:
     result = EasytraderAdapter(connect=lambda: user).submit([order], "validation")
     print(f"  提交结果：ok={result.ok}")
     print(f"  message: {result.message}")
+
+    # 三种结果含义完全不同，必须分开报 —— 早先这里无条件打印「✅ 卖单被拒绝」，
+    # 把「我们不知道发生了什么」说成了「我们正确识别了拒绝」。
     if result.ok:
         print("  ⚠ 卖单**被接受**了 —— 说明这批持仓当天可卖（不是今天买的）。")
-        print("     卖出链路打通，但 T+1 的负向场景没测到。记得去 D 段撤掉它。")
+        print("     卖出链路打通，但 T+1 的负向场景没测到。D 段会撤掉它。")
+    elif "客户端提示" in result.message:
+        print("  ✅ 客户端给出了明确的拒绝理由，且被我们的致命词表抓住 —— 识别正确。")
+    elif "没有出现这一笔" in result.message:
+        print("  ✅ **静默拒绝**：客户端不建委托、不报错、不给理由。")
+        print("     这正是回读校验存在的意义 —— 没有它，这笔单会被当成成功。")
+        print("     卖出链路本身是通的（填单 → OCR 校验 → 委托确认框核对都过了）。")
     else:
-        print("  ✅ 卖单被拒绝。检查上面的 message：")
-        print("     · 命中「可用股份不足」等致命词 → 我们的识别正确")
-        print("     · 若是别的原因（填单/回读失败）→ 卖出链路本身有问题，要查")
+        print("  ❌ 卖出链路本身出了问题（填单或回读失败），要查上面的 message。")
     return True
 
 

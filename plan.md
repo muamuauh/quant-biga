@@ -1409,6 +1409,59 @@ ElementNotFoundError: {'control_id': 2322, 'class_name': 'ComboBox',
 
 9 个离线测试（`tests/test_ths_dialog_buttons.py`）用的就是上面三个真实弹窗结构。
 
+#### 第一次实盘化验证（2026-08-24 09:40，模拟账户，交易时段内）
+
+**P9a 取值验证全部通过**（601398 工商银行，当日买入 100 股 @7.82 成交）：
+
+| 字段 | 值 | 判定 |
+|---|---|---|
+| `qty` | 100 | ✅ 一手整数倍 |
+| `sellable_qty` | **0** | ★ **当天买入当天不可卖，T+1 语义正确** |
+| `cost_price` | 7.823 | ✅ |
+| `last_price` | 7.83 | ✅ |
+| `market_value` | 783.0 | ✅ ≈ qty × last_price |
+
+`sellable_qty=0` 是这次最想要的那个数 —— 它是 easytrader 相对截图 OCR 的
+**真正增量**，T+1 闸全靠它。截图 OCR 里经常根本没有这一列。
+
+#### 雷六：`descendants()` **不接受 `control_id` 过滤**
+
+先前为了解决买入页/卖出页两套同 id 控件的歧义，把 `child_window(control_id=...)`
+换成了 `descendants(control_id=..., class_name=...)` —— **这是个回归**。
+2026-08-24 实测：
+
+```
+descendants(control_id=1032, class_name="Edit")  → 9 个元素
+descendants(control_id=1033, class_name="Edit")  → 同样这 9 个
+```
+
+`control_id` 被**静默忽略**，只按 `class_name` 过滤。所谓「3 个可见的 1032」
+其实是代码框、价格框、数量框。修法：`descendants(class_name=...)` 之后
+**自己比对 `ctrl.control_id()`**。
+
+（`child_window(control_id=...)` 是另一套 API，那个会按 id 过滤，
+但它把不可见的也算进来，于是两页都加载后 `ElementAmbiguousError`。两边都不能直接用。）
+
+#### 雷七（最有说服力的一颗）：同花顺对不可卖的卖单是**静默拒绝**
+
+C 段试卖当天买入的 100 股，预期被 T+1 拒绝。实际发生的是：
+
+1. 填单、OCR 校验、**委托确认框核对全部通过**（框里写明「卖出价格 7.600
+   卖出数量 100 您是否确定以上卖出委托？」）
+2. 点「是」确认
+3. 客户端只弹了一个**无关的营销提示框**（`现有成交价格预警服务`）
+4. **当日委托里没有这笔单，当日成交里没有，没有任何拒绝提示**
+
+**订单凭空消失，全程零报错。** 逐个控件 dump 过拒绝路径上的每个弹窗，
+确认客户端**没有**在任何 Static 里给出理由。
+
+> 这颗雷是整套「成功判据不能是没抛异常」设计的最强论据：
+> 没有提交后回读校验，这笔单会被当成成功，而账户里根本没有它。
+> 我们的 adapter 正确地报了失败并中止了后续订单。
+
+由于客户端什么都不说，错误信息只能如实描述「委托里没有出现这一笔，
+且客户端未给出理由」，并列出常见原因供人排查。
+
 #### P9b — 下单（P9a 稳定两周后）
 
 `execution/easytrader_adapter.py` 实现 `ExecutionAdapter`。

@@ -451,9 +451,12 @@ class CaptchaAwareCopy:
         trader = self._trader
         # 本机 1047 有 6 个同 id 的 grid，只有当前查询页那个可见 —— 用可见性消歧。
         # easytrader 原生的 child_window(control_id=...) 在这里 ElementAmbiguousError。
-        grids = [e for e in trader.main.descendants(control_id=control_id,
-                                                    class_name="CVirtualGridCtrl")
-                 if e.is_visible()]
+        #
+        # ⚠️ `descendants()` **不接受 control_id 过滤**，传了会被静默忽略
+        # （2026-08-24 实测），所以必须自己比对 `control_id()`。这里恰好因为
+        # CVirtualGridCtrl 同时只有一个可见而没出事，但那是运气，不是设计。
+        grids = [e for e in trader.main.descendants(class_name="CVirtualGridCtrl")
+                 if e.control_id() == control_id and e.is_visible()]
         if len(grids) != 1:
             raise ThsReadError(f"可见的 grid 有 {len(grids)} 个，无法消歧")
 

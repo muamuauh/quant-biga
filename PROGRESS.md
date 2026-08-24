@@ -4,25 +4,10 @@
 
 ## 下次开工：先做这个
 
-**唯一阻塞项：账户里没有持仓。** P9a 的取值映射只验证了**表头**，
-P9b 的**卖出路径**从没真正跑过。两者都要账户有仓才能验。
+**第一次验证已于 2026-08-24 完成**（见下方「P9 第一次实盘化验证」）。
+账户现在持有 **601398 工商银行 100 股**，当日买入，`可用余额=0`。
 
-**在交易日 09:30–11:30 / 13:00–15:00 跑：**
-
-```powershell
-conda activate qbg
-cd E:\codes\quant-biga
-python toolsalidate_ths_p9.py
-```
-
-跑之前确认：同花顺的**独立下单程序**已登录、在**专业模式**（不是那条小横条）、
-**普通权限**运行（不是管理员）。三样有一样不对，脚本会明确告诉你哪里不对。
-
-它会：建仓（买 100 股 601398）→ 验证 P9a 的 7 个字段取值 →
-试卖 100 股（当天买入当天不可卖，**预期被拒**，借此验证卖出链路和致命提示识别）
-→ 撤掉遗留委托。**持仓保留不卖。**
-
-**再下一个交易日**，`可用余额` 会变成 100，那时跑：
+**下一个交易日**（可用余额会变成 100），跑：
 
 ```powershell
 python toolsalidate_ths_p9.py --skip-build
@@ -41,6 +26,7 @@ python tools\probe_ths.py --preflight-only   # 只做环境预检，不碰客户
 python tools\probe_ths.py                    # 只读四表 + 字段对照
 python tools\probe_ths_order.py              # 下单表单输入路径（只填不交）
 pytest -q                                     # 426 个离线测试，不需要同花顺
+powershell -File scripts\preflight.ps1        # Clash 代理/TUN + qbg 环境预检
 ```
 
 **同花顺升级后先跑前两条**：control_id 是硬编码的，重排控件会失效，
@@ -184,6 +170,37 @@ P3–P6 已完成并用本机真实行情跑通：290 只股票训练的三 seed
 仍待实际下单验证（模拟账户，`QBG_MODE=PAPER` 不动三把锁）：
 委托确认框的真实标题与结构、下单后 `today_entrusts` 的回读。
 
+### P9 第一次实盘化验证（2026-08-24 09:40，交易时段内）
+
+**P9a 取值验证全部通过。** 601398 工商银行当日买入 100 股 @7.82 成交：
+
+    qty=100  sellable_qty=0  cost_price=7.823  last_price=7.83  market_value=783.0
+
+`sellable_qty=0` 是最想拿到的那个数 —— 当天买入当天不可卖，T+1 语义正确。
+它是 easytrader 相对截图 OCR 的**真正增量**（截图里经常没有这一列）。
+
+**修了一个我自己引入的回归（雷六）**：为解决买入/卖出页两套同 id 控件的歧义，
+先前把 `child_window(control_id=...)` 换成了 `descendants(control_id=...)` ——
+而 **`descendants()` 根本不认 `control_id`，会静默忽略**。实测
+`descendants(control_id=1032)` 和 `descendants(control_id=1033)` 返回同样 9 个元素。
+修法：按 class_name 取完自己比对 `ctrl.control_id()`。
+
+**雷七 —— 本次最有说服力的发现：同花顺对不可卖的卖单是静默拒绝。**
+C 段试卖当天买入的股票，实际发生的是：填单 → OCR 校验 → **委托确认框核对全过**
+（框里写明「卖出价格 7.600 卖出数量 100 您是否确定以上卖出委托？」）→ 点「是」
+→ 客户端只弹了个**无关的营销框** → **当日委托和当日成交里都没有这笔，
+零报错、零提示**。逐控件 dump 过每个弹窗，客户端确实什么理由都没给。
+
+> 订单凭空消失。这是「成功判据不能是没抛异常」的最强论据 ——
+> 没有提交后回读校验，这笔单会被当成成功，而账户里根本没有它。
+> adapter 正确报了失败并中止后续订单。
+
+顺带修了错误信息：先前说「找不到新增记录」，读起来像「我们不知道发生了什么」；
+改成如实描述「委托里没有出现这一笔，且客户端未给出理由（同花顺对这类拒绝是静默的）」
+并列出常见原因。验证脚本的 C 段输出也改成区分三种结果（被接受 / 有理由的拒绝 /
+静默拒绝 / 链路本身故障），先前它无条件打印「✅ 卖单被拒绝」，
+把「不知道发生了什么」说成了「正确识别了拒绝」。
+
 ### 阶段一收尾：模拟账户实单验证通过（2026-08-21 21:31）
 
 用户授权，在 `模拟炒股-****` 挂跌停价买单：**下出去 → 回读到 → 撤掉了**。
@@ -303,6 +320,41 @@ P3–P6 已完成并用本机真实行情跑通：290 只股票训练的三 seed
 `last_run.json`、`last_rebalance.json`、探针输出、以及整个 `data/runs.db`。
 目录结构保留。**未动** `reports/`（含 2026-08-10 日报/清单/复盘）和
 `logs/qbg.jsonl`（其中 3 行 `cycle.completed` 带 account/positions 字段）。
+
+## 2026-08-22 定时运行落地（每天 07:30 + 开机补跑）
+
+新增 `scripts/preflight.ps1`、`run_daily.ps1`、`scripts/setup_schedule.ps1`，
+`run_daily.bat` / `setup_schedule.bat` 改成壳。完整说明在
+`docs/windows-schedule.md`，纪律在 `CLAUDE.md` §八。
+
+**时间从 17:45 挪到 07:30**：盘前出清单、开盘执行，正好对上回测口径
+（T-1 收盘出信号、T 日开盘价成交）。07:30 时 BaoStock 的 T-1 数据早已落库。
+
+### 本机实测发现（2026-08-22）
+
+| 发现 | 影响 |
+|---|---|
+| Clash Verge 在 `D:\Clash Verge\clash-verge.exe`，混合端口 7897，TUN 网卡叫 **Meta**（描述 `Meta Tunnel`，不是 Wintun） | 检测函数要认描述 `*Wintun*` **或** `*Meta Tunnel*`，只认 Wintun 会漏 |
+| `verge.yaml` 里热键已绑好：`toggle_system_proxy=CTRL+ALT+SHIFT+P`、`toggle_tun_mode=CTRL+ALT+SHIFT+T` | 和 quant-trading 的 preflight 默认值一致，直接沿用 |
+| `verge.yaml` 的 `enable_auto_launch: false` | **Clash 不会开机自启**。无桌面会话里起不了它（托盘 GUI 在 session 0 等于没起），要么开这个开关，要么走自动登录 |
+| `verge.yaml` 的 `enable_external_controller: false` | 没有非交互入口能开 TUN。Background 模式下 TUN 是**开不了**的，只能开系统代理 |
+| `pwsh.exe` 是 Store 安装，路径在 `WindowsApps` 下 | 那是应用执行别名，**session 0 解析不开**，计划任务会报「找不到文件」。宿主 shell 固定用 System32 的 `powershell.exe`，`.ps1` 因此必须带 UTF-8 BOM |
+| 本机没开 AutoAdminLogon | 「开机免解锁 + 有桌面」两者兼得只有自动登录一条路，涉及密码落盘，**留给用户自己决定**，脚本不改 |
+
+### 验证过的
+
+```
+scripts\preflight.ps1 -SkipMarketCheck   -> [READY] 全绿，代理/TUN 检测正确、未误触发热键
+scripts\preflight.ps1                    -> 2026-08-22 是周六，交易日闸正确跳过（exit 0）
+run_daily.ps1                            -> 预检 → daily_cycle → not_trading_day → exit 0
+文件独占锁                                 -> 第二次开被拒，跨会话有效
+PS 5.1 / PS 7 双版本语法解析               -> 三个 .ps1 都通过
+```
+
+**还没验证的**：交易日 07:30 的真实自动触发、Background(S4U) 模式下的实际运行。
+下一个交易日看 `Get-ScheduledTaskInfo -TaskName quant_biga_daily` 的
+`LastTaskResult` 和 `logs/run_daily.log`。
+
 
 ## 2026-08-10 实测
 
