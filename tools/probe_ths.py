@@ -259,11 +259,11 @@ HINTS = {
         "     · 「最小化」   —— 还原一下即可\n"
         "     · 「窗口不存在」—— 还没登录交易，先登录",
     "Python 与客户端位数一致":
-        "xiadan.exe 是 32 位而 qbg 是 64 位。读控件文本（如资金）能跨位数工作，但凡是\n"
-        "     需要往目标进程注入远程内存的操作 —— 读 SysTreeView32 表项、取 grid 行 ——\n"
-        "     跨位数就不可靠。pywinauto 自己也会警告。\n"
-        "     ⚠ conda 已经没有 win-32 的 python 3.11（Anaconda 砍了 32 位 Windows），\n"
-        "     `CONDA_FORCE_32BIT` 那条老办法**行不通**。要建 32 位环境只能：\n"
+        "**这是提醒，不是故障。** 64 位 Python 驱动 32 位 xiadan，pywinauto 会警告，\n"
+        "     但 2026-08-24 实测取表 / 填单 / 下单 / 回读全程正常（P9a、P9b 都跑通了）。\n"
+        "     本机也没法让它变绿：conda 已经没有 win-32 的 python 3.11，\n"
+        "     `CONDA_FORCE_32BIT` 那条老办法行不通。\n"
+        "     只有出现「读到空表 / 控件文本恒为空」这类症状时才值得去建 32 位环境：\n"
         "       1. 装 python.org 的 3.11 Windows **x86**(32-bit) 安装包\n"
         "       2. <32位python>\\python.exe -m venv .venv32\n"
         "       3. .venv32\\Scripts\\pip install easytrader",
@@ -289,17 +289,40 @@ HINTS = {
 CAPTCHA_DIALOG_HINT = "验证码"
 
 
+# 只提醒、不阻塞的检查项。
+#
+# 位数不一致是**已知且无害**的：64 位 Python 驱动 32 位 xiadan，pywinauto 会
+# 警告，但实测取表、填单、下单全程正常（2026-08-24 完整跑通过 P9a/P9b）。
+# 本机不可能让它变绿 —— conda 已经没有 win-32 的 python 3.11。
+#
+# 把它算成失败会让退出码**恒为非零**，于是 preflight.ps1 每天都打印
+# 「同花顺预检未通过 —— 持仓会降级到 CSV」。那句话是假的，而且天天喊狼来了
+# 会让人以后不再看这条告警 —— 比不告警更糟。
+ADVISORY_CHECKS = {"Python 与客户端位数一致"}
+
+
 def print_preflight(checks: list[tuple[str, bool, str]]) -> bool:
+    """打印预检结果。返回**有没有阻塞性失败**（提醒项不算）。"""
     print("\n=== 预检 ===")
     for name, ok, note in checks:
-        print(f"  [{'OK ' if ok else 'FAIL'}] {name:<24} {note}")
+        if ok:
+            tag = "OK "
+        elif name in ADVISORY_CHECKS:
+            tag = "提醒"
+        else:
+            tag = "FAIL"
+        print(f"  [{tag}] {name:<24} {note}")
+
     failed = [name for name, ok, _ in checks if not ok]
-    if not failed:
-        print("  全部通过。")
+    blocking = [name for name in failed if name not in ADVISORY_CHECKS]
+    if failed:
+        print("\n--- 怎么修 ---")
+        for name in failed:
+            print(f"  * {name}: {HINTS.get(name, '见上方说明')}")
+    if not blocking:
+        advisory = [n for n in failed if n in ADVISORY_CHECKS]
+        print("\n  没有阻塞项" + (f"（{len(advisory)} 条提醒，不影响使用）" if advisory else "，全部通过。"))
         return True
-    print("\n--- 怎么修 ---")
-    for name in failed:
-        print(f"  * {name}: {HINTS.get(name, '见上方说明')}")
     return False
 
 
