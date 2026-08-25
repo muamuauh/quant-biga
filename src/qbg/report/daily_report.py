@@ -64,6 +64,86 @@ def _headline(result: dict) -> str:
     return f"量化模型给出 {targets} 个目标，风控允许 {allowed} 笔订单；{execution}。"
 
 
+def _trading_costs(orders: list[dict]) -> dict:
+    """按 A股规则把交易成本拆开算。
+
+    **不能只报一个总数。** A股成本是**不对称**的 —— 印花税 0.05% 只在卖出时
+    收，所以同样金额的买单和卖单成本差 5bp。把它们加成一个数，就看不出
+    「今天的成本主要来自卖出」这种事实，也就没法判断调仓频率是不是太高了。
+
+    最低佣金也要单独盯：10 万账户 k=3 时单笔约 3 万，佣金 7.5 元 > 5 元不生效；
+    但 k 调大到 10（单笔 1 万）就会被拉到 5 元，**实际费率翻倍到万 5**。
+    这是"多分散一点"在小账户上的隐藏代价，报出来才看得见。
+    """
+    from qbg.execution import fees
+
+    profile = fees.FeeProfile.load()
+    totals = {"notional": 0.0, "commission": 0.0, "stamp_tax": 0.0, "transfer_fee": 0.0,
+              "buy_notional": 0.0, "sell_notional": 0.0, "min_commission_hits": 0}
+    for order in orders:
+        notional = float(order.get("notional") or 0.0)
+        side = str(order.get("side") or "").upper()
+        if notional <= 0 or side not in ("BUY", "SELL"):
+            continue
+        fee = fees.estimate(notional, side, profile)
+        totals["notional"] += notional
+        totals["buy_notional" if side == "BUY" else "sell_notional"] += notional
+        totals["commission"] += fee.commission
+        totals["stamp_tax"] += fee.stamp_tax
+        totals["transfer_fee"] += fee.transfer_fee
+        if notional * profile.commission_rate < profile.commission_min:
+            totals["min_commission_hits"] += 1
+    totals["total"] = totals["commission"] + totals["stamp_tax"] + totals["transfer_fee"]
+    totals["bp"] = (totals["total"] / totals["notional"] * 1e4) if totals["notional"] else 0.0
+    return totals
+
+
+def _cost_section(result: dict) -> list[str]:
+    """今日成本明细：交易费用 + LLM 调用。
+
+    为什么值得单开一段：`plan.md` §8.5 把「成本吃掉 alpha」列为小账户的第一
+    杀手 —— quant-trading 的实测是 3000 美元账户日频调仓被费用和滑点打到
+    年化 −30%。成本不摆在日报上，这件事就只能靠回测发现，而回测发现得太晚。
+    """
+    orders = result.get("allowed_orders") or []
+    trade = _trading_costs(orders)
+    llm = result.get("agent_usage") or {}
+    review_usage = (result.get("daily_review") or {}).get("usage") or {}
+    llm_cost = float(llm.get("cost_usd") or 0.0)
+
+    if not orders and not llm and not review_usage:
+        return []
+
+    lines = ["## 今日成本", "", "| 项目 | 金额 | 说明 |", "|---|---:|---|"]
+
+    if trade["notional"] > 0:
+        lines += [
+            f"| 佣金 | ¥{_number(trade['commission'])} | 双边，"
+            + (f"其中 {trade['min_commission_hits']} 笔触及最低佣金"
+               if trade["min_commission_hits"] else "未触及最低佣金") + " |",
+            f"| 印花税 | ¥{_number(trade['stamp_tax'])} | **仅卖出**，卖出额 "
+            f"¥{_number(trade['sell_notional'])} |",
+            f"| 过户费 | ¥{_number(trade['transfer_fee'])} | 双边 |",
+            f"| **交易成本合计** | **¥{_number(trade['total'])}** | "
+            f"成交额 ¥{_number(trade['notional'])} 的 **{trade['bp']:.1f} bp** |",
+        ]
+    if llm:
+        lines.append(
+            f"| LLM 逐票复核 | ${llm_cost:.4f} | {int(llm.get('calls', 0) or 0)} 次调用 · "
+            f"{int(llm.get('total_tokens', 0) or 0):,} tokens |")
+    if review_usage.get("total_tokens"):
+        lines.append(
+            f"| LLM 自动复盘 | — | {int(review_usage['total_tokens']):,} tokens"
+            "（该链路未计价） |")
+    lines.append("")
+
+    if trade["notional"] > 0:
+        # 把成本换算成"要涨多少才回本"，比一个绝对数更能说明问题。
+        lines += [f"> 本次调仓的交易成本相当于持仓需上涨 **{trade['bp'] / 1e4:.4%}** 才能打平。"
+                  "往返（买入再卖出）约为其两倍。", ""]
+    return lines
+
+
 def _broker_section(result: dict) -> list[str]:
     """计划 vs 实际委托对账（P9c）。
 
@@ -245,6 +325,7 @@ def render(result: dict) -> str:
         lines += ["本次没有生成订单意见。", ""]
 
     lines += _broker_section(result)
+    lines += _cost_section(result)
 
     lines += ["## 运行健康", ""]
     if gates:
