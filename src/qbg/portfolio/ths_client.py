@@ -566,9 +566,22 @@ def read_tables(*, exe: str, client: str = "universal_client",
     except Exception as exc:  # noqa: BLE001 —— easytrader 抛的异常类型不稳定
         raise ThsReadError(f"连接同花顺失败：{type(exc).__name__}: {exc}") from exc
 
+    entrusts, columns = None, []
     try:
         balance = user.balance
         positions = user.position
+        # **列头必须在这里抓，不能等到最后。** `last_columns` 记的是
+        # grid_strategy 最近一次读到的表头，下面再读委托表就会把它覆盖成
+        # 委托表的 12 列，于是持仓表的缺列检查拿 12 列去比 18 列的必需列，
+        # 报一个「同花顺改了界面」的假警报。2026-08-25 加读委托表时踩到。
+        columns = list(getattr(user.grid_strategy_instance, "last_columns", []) or [])
+        # 今日委托是**尽力而为**的第三张表：只用来推算挂单冻结了多少现金
+        # （资金表没有「冻结金额」这一列）。读不到就留 None 表示"未知"，
+        # 绝不能让它把资金和持仓这两张真正要紧的表一起拖垮。
+        try:
+            entrusts = user.today_entrusts
+        except Exception as exc:  # noqa: BLE001
+            log_event(log, "ths.read.entrusts_failed", error=f"{type(exc).__name__}: {exc}")
     except ThsReadError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -583,7 +596,8 @@ def read_tables(*, exe: str, client: str = "universal_client",
         if leftovers:
             log_event(log, "ths.dialogs_closed", count=len(leftovers), detail=leftovers[:5])
 
-    columns = list(getattr(user.grid_strategy_instance, "last_columns", []) or [])
-    log_event(log, "ths.read.ok", positions=len(positions), columns=len(columns))
+    log_event(log, "ths.read.ok", positions=len(positions), columns=len(columns),
+              entrusts=None if entrusts is None else len(entrusts))
     return {"balance": dict(balance or {}), "position": list(positions or []),
-            "columns": columns}
+            "columns": columns,
+            "entrusts": None if entrusts is None else list(entrusts)}

@@ -119,19 +119,45 @@ def validate_payload(payload: dict, *, name_map: dict[str, str] | None = None,
         else:
             seen[code] = position
     positions = list(seen.values())
-    # 总资产恒等式。
+    # 总资产恒等式：**总资产 = 可用资金 + 冻结资金 + 持仓市值**
     #
-    # 用「现金总额」而不是「可用资金」—— 两者的差额是**被挂单冻结的钱**，
-    # 它既不在可用资金里，也不在持仓市值里。截图 OCR 那条路只读得到可用资金，
-    # 所以没有「现金总额」时退回用它（截图场景下通常没有挂单）；
-    # 而 easytrader 读得到「资金余额」，必须用它，否则**任何未成交挂单都会让
-    # 这条校验失败**，进而让整个持仓读取降级（2026-08-25 全链路实测踩到）。
-    cash_total = payload.get("现金总额")
-    identity_cash = _number(cash_total, "现金总额", issues) if cash_total is not None else cash
-    label = "现金总额" if cash_total is not None else "可用资金"
+    # 「冻结资金」是 2026-08-25 全链路实测补上的一项。此前这条校验写的是
+    # `总资产 ≈ 可用资金 + 市值`，于是**任何未成交的买单都会让它失败** ——
+    # 挂单冻结的钱既不在可用资金里，也不在持仓市值里。实测那次的后果是
+    # 持仓读取整个降级到默认假设账户，系统照着虚构持仓下了单。
+    #
+    # 实测数据（模拟账户，一笔 300394 买入 200 股 @250 未成交）：
+    #     13,570.46 + 50,016.00 + 135,884.00 = 199,470.46 = 总资产 ✓
+    #
+    # 「冻结资金」这个键有**三种状态**，语义各不相同，别合并：
+    #
+    #   键不存在  = 这个数据源根本没有"挂单"的概念（截图 OCR 就是），
+    #               按两项恒等式严格校验。P5 的对抗测试（故意删掉一行持仓）
+    #               靠的正是这一条 —— 删行会让市值凭空变少，必须拦下。
+    #   值为 None = 数据源有这个概念但**这次没读到**（同花顺委托表读失败）。
+    #               缺口无从解释，只能报非致命警告：宁可让一份带警告的真实持仓
+    #               通过，也不要退回虚构的默认账户，后者危险得多。
+    #   值为数字  = 知道冻了多少，三项恒等式严格校验。
     holdings = sum(p.market_value for p in positions)
-    if total <= 0 or abs(total - (identity_cash + holdings)) / total >= tolerance:
-        issues.append(ValidationIssue("总资产", f"总资产与{label}+持仓市值合计偏差达到 1%"))
+    known_frozen = "冻结资金" in payload
+    frozen = payload.get("冻结资金")
+    implied = total - (cash + holdings)          # 账面上"说不清的那部分"
+    if total <= 0:
+        issues.append(ValidationIssue("总资产", "总资产必须 > 0"))
+    elif not known_frozen or frozen is not None:
+        expected = _number(frozen, "冻结资金", issues) if known_frozen else 0.0
+        if abs(implied - expected) / total >= tolerance:
+            label = "可用资金+冻结资金+持仓市值" if known_frozen else "可用资金+持仓市值"
+            issues.append(ValidationIssue(
+                "总资产", f"总资产与{label}合计偏差达到 1%（差额 {implied - expected:,.2f}）"))
+    elif implied < -tolerance * total:
+        # 冻结资金不可能为负 —— 可用+市值 超过总资产就是真读错了。
+        issues.append(ValidationIssue(
+            "总资产", f"可用资金+持仓市值 超出总资产 {-implied:,.2f}，账目对不上"))
+    elif implied > tolerance * total:
+        issues.append(ValidationIssue(
+            "总资产", f"有 {implied:,.2f} 说不清的资金（读不到今日委托，无法确认是挂单冻结）",
+            fatal=False))
     snapshot = PortfolioSnapshot(str(payload.get("asof") or ""), total, cash, tuple(positions))
     return snapshot, issues
 
