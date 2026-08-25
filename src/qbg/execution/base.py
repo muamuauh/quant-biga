@@ -33,6 +33,9 @@ class ExecutionResult:
     submitted: int
     artifacts: tuple[str, ...] = ()
     message: str = ""
+    # 逐笔结果。顾问模式为空；真实下单时带 entrust_no 和失败原因，
+    # 供日报做「计划 vs 实际委托」对账 —— 只有一个总数说明不了哪笔没成。
+    outcomes: tuple[dict, ...] = ()
 
 
 class ExecutionAdapter(Protocol):

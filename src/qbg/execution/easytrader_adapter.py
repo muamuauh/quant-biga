@@ -116,6 +116,40 @@ def find_entrust(entrusts: list[dict], order: Order) -> dict | None:
     return None
 
 
+def assert_account_matches_mode(account: str, mode: str, pattern: str) -> None:
+    """声明的模式必须和客户端里**真正登录的账户**对得上。
+
+    为什么必须查这个：`QBG_MODE=PAPER` 在 `assert_live_allowed` 里是**直接放行**
+    的（模拟盘不需要三把锁）。但 PAPER 本身只是 `.env` 里的一句声明 ——
+    代码无从知道同花顺客户端里登录的到底是模拟盘还是真钱账户。
+
+    于是有一个很实在的洞：客户端登着真实券商账户 + `.env` 写着 PAPER，
+    就会在真钱上下单，而且**三把锁一道都不检查**。声明和现实之间唯一的纽带
+    是「你记得切了账户」—— 这正是这个项目一路在消灭的那种「没有独立预言机」
+    的假设。
+
+    客户端的资金账号标识就是那个预言机，而且我们已经会读它了。
+
+    读不到账户名时**拒绝下单**：无法确认要在哪个账户上交易，就不该交易。
+    """
+    mode = mode.upper()
+    if mode not in {"PAPER", "LIVE"}:
+        return
+    if not account:
+        raise LiveLockError(
+            "读不到客户端的资金账号，无法确认这是模拟盘还是真钱账户，拒绝下单。"
+            "（同花顺改版可能挪了账号控件，跑 tools/probe_ths.py 看看）")
+    looks_paper = pattern in account
+    if mode == "PAPER" and not looks_paper:
+        raise LiveLockError(
+            f"QBG_MODE=PAPER 但客户端登录的是 {account!r}，不含 {pattern!r} —— "
+            "这看起来是真钱账户。要在真钱上下单请改 QBG_MODE=LIVE 并开齐三把锁。")
+    if mode == "LIVE" and looks_paper:
+        raise LiveLockError(
+            f"QBG_MODE=LIVE 但客户端登录的是 {account!r}，看起来是模拟盘。"
+            "三把锁都开了却跑在模拟盘上，多半是配错了，先确认。")
+
+
 def assert_live_allowed(limits: dict | None = None) -> None:
     """三把锁。**任何自动化流程都不得修改它们**，这里只读、只校验。"""
     limits = load_limits() if limits is None else limits
@@ -133,16 +167,25 @@ def assert_live_allowed(limits: dict | None = None) -> None:
 class EasytraderAdapter:
     """把订单提交到同花顺客户端。实现 `ExecutionAdapter` 协议。"""
 
-    mode = "LIVE"
+    @property
+    def mode(self) -> str:
+        """报告真实的运行模式，别写死。
+
+        日报和 store 都按这个字段区分 PAPER 与 LIVE 的历史 —— 写死会把
+        模拟盘的成绩混进实盘曲线里，那正是 store schema 用 mode 做主键要防的事。
+        """
+        return str(settings.qbg_mode).upper()
 
     def __init__(self, *, exe: str | None = None, client: str | None = None,
-                 max_orders: int | None = None, connect=None, reader=None):
+                 max_orders: int | None = None, connect=None, reader=None,
+                 account_reader=None):
         self.exe = exe or settings.qbg_ths_exe
         self.client = client or settings.qbg_ths_client
         self.max_orders = max_orders if max_orders is not None else settings.qbg_ths_max_orders
         # 注入点，离线测试用；生产环境不传。
         self._connect = connect or self._default_connect
         self._read_entrusts = reader
+        self._account_reader = account_reader
 
     # -- 连接 -------------------------------------------------------------
     def _default_connect(self):
@@ -164,6 +207,13 @@ class EasytraderAdapter:
         # set_edit_text 在这个客户端上不被认账（雷一），全程走 type_keys。
         user.enable_type_keys_for_editor()
         return user
+
+    def _read_account(self, user) -> str:
+        if self._account_reader is not None:
+            return self._account_reader(user)
+        from qbg.portfolio.ths_client import read_account_name
+
+        return read_account_name(user)
 
     def _entrusts(self, user) -> list[dict]:
         if self._read_entrusts is not None:
@@ -188,6 +238,10 @@ class EasytraderAdapter:
                    + [o for o in orders if o.side != "SELL"])
 
         user = self._connect()
+        # 账户守卫：声明的 mode 必须和客户端里真正登录的账户对得上。
+        # 放在连接之后、下单之前 —— 这是唯一能拿到「现实」的时点。
+        assert_account_matches_mode(self._read_account(user), settings.qbg_mode,
+                                    settings.qbg_paper_account_pattern)
         # 提交前先快照已有的合同编号。回读校验只在**新出现**的编号里找 ——
         # 光比代码/方向/数量/价格会匹配到当天早些时候的同参数委托（含已撤单的）。
         try:
@@ -217,7 +271,8 @@ class EasytraderAdapter:
         )
         log_event(log, "ths.submit.done", asof=stamp, ok=ok, submitted=submitted,
                   total=len(ordered), outcomes=[o.as_dict() for o in outcomes])
-        return ExecutionResult(ok, self.mode, submitted, (), message)
+        return ExecutionResult(ok, self.mode, submitted, (), message,
+                               tuple(o.as_dict() for o in outcomes))
 
     def _submit_one(self, user, order: Order, known_ids: set[str]) -> OrderOutcome:
         try:

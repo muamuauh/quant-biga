@@ -64,6 +64,38 @@ def _headline(result: dict) -> str:
     return f"量化模型给出 {targets} 个目标，风控允许 {allowed} 笔订单；{execution}。"
 
 
+def _broker_section(result: dict) -> list[str]:
+    """计划 vs 实际委托对账（P9c）。
+
+    只有真的走了券商才有这一段。它回答的是「清单上写的和券商那边实际收到的
+    是不是同一回事」—— 这也是 P9b 那套三道校验的最终产物：
+    每一笔都带着券商给的合同编号，或者带着失败原因。
+
+    **失败必须显眼。** 下单失败时顾问清单照样存在、日报照样生成，
+    如果这里不写清楚，看日报的人会以为清单上的单子都下出去了。
+    """
+    broker = result.get("broker")
+    if not broker:
+        return []
+    mode = result.get("execution_mode", "")
+    outcomes = broker.get("outcomes") or []
+    ok_count = sum(1 for o in outcomes if o.get("ok"))
+    lines = ["## 计划 vs 实际委托", "",
+             f"执行模式 **{mode}** · 券商回执 **{ok_count}/{len(outcomes)}** 笔通过回读校验", ""]
+    if not broker.get("ok"):
+        lines += [f"> ⚠️ **下单未全部成功**：{_cell(str(broker.get('message') or ''))}",
+                  "> 顾问清单仍然有效，请人工核对后决定是否补单。", ""]
+    if outcomes:
+        lines += ["|代码|方向|股数|委托价|结果|合同编号|说明|", "|---|---|---:|---:|---|---|---|"]
+        for item in outcomes:
+            lines.append(
+                f"|{item.get('code','')}|{item.get('side','')}|{item.get('quantity',0)}|"
+                f"{_number(item.get('price'))}|{'✅' if item.get('ok') else '❌'}|"
+                f"{item.get('entrust_no') or '—'}|{_cell(str(item.get('message') or ''), 60)}|")
+        lines.append("")
+    return lines
+
+
 _SOURCE_LABELS = {
     "easytrader": "同花顺客户端直读",
     "ocr": "持仓截图 OCR 产出的 CSV",
@@ -205,8 +237,14 @@ def render(result: dict) -> str:
         lines.append("")
         if not result.get("submitted"):
             lines += ["> 当前为顾问/演练流程：以上是订单意见，**没有向券商提交订单**。", ""]
+        elif not result.get("broker"):
+            # 提交了但没走券商 = ADVISORY 模式，只落了清单。写清楚，
+            # 否则「submitted=True」很容易被读成「单子下出去了」。
+            lines += ["> ADVISORY 模式：已生成下单清单，**未向券商提交**，请人工执行。", ""]
     else:
         lines += ["本次没有生成订单意见。", ""]
+
+    lines += _broker_section(result)
 
     lines += ["## 运行健康", ""]
     if gates:

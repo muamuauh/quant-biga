@@ -33,6 +33,9 @@ def _entrust(code="600519", side="买入", qty=100, price=1213.97, no="621697969
             "合同编号": no, "交易市场": "上海Ａ股"}
 
 
+PAPER_ACCOUNT = "模拟炒股-****"
+REAL_ACCOUNT = "南京证券-1234567890"
+
 BLANK_ROW = {"委托时间": "", "证券代码": "", "证券名称": "", "操作": "", "备注": "",
              "委托数量": 0, "成交数量": 0, "委托价格": 0.0, "成交均价": 0.0,
              "撤消数量": 0, "合同编号": "", "交易市场": ""}
@@ -127,7 +130,10 @@ def _adapter(monkeypatch, *, placed=None, entrusts=None, baseline=None, max_orde
 
     monkeypatch.setattr(mod, "place_order", fake_place)
     adapter = EasytraderAdapter(connect=lambda: object(), reader=fake_read,
-                                max_orders=max_orders)
+                                max_orders=max_orders,
+                                # 默认跑在 PAPER 下，所以要给一个模拟盘账户，
+                                # 否则会被账户守卫拦下（那是另一组测试的事）。
+                                account_reader=lambda _u: PAPER_ACCOUNT)
     return adapter, calls
 
 
@@ -205,7 +211,8 @@ def test_entrust_read_failure_is_not_success(monkeypatch):
 
     monkeypatch.setattr(mod, "place_order",
                         lambda _u, **_k: PlaceResult(True, "ok"))
-    adapter = EasytraderAdapter(connect=lambda: object(), reader=boom)
+    adapter = EasytraderAdapter(connect=lambda: object(), reader=boom,
+                                account_reader=lambda _u: PAPER_ACCOUNT)
     result = adapter.submit([_order()], "2026-08-21")
     assert not result.ok
     # 基线那一步就读不到，连单都不会下
@@ -232,7 +239,8 @@ def test_only_new_entrust_id_counts(monkeypatch):
     reads = iter([[stale], [stale, fresh]])     # 提交前基线 / 提交后
     monkeypatch.setattr(mod, "place_order", lambda _u, **_k: PlaceResult(True, "ok"))
     adapter = EasytraderAdapter(connect=lambda: object(),
-                                reader=lambda _u: next(reads))
+                                reader=lambda _u: next(reads),
+                                account_reader=lambda _u: PAPER_ACCOUNT)
     result = adapter.submit([_order()], "2026-08-21")
     assert result.ok
     assert "NEW-1" in result.message or result.submitted == 1
@@ -242,7 +250,8 @@ def test_no_new_entrust_is_failure_even_if_stale_matches(monkeypatch):
     """委托表没变化 = 这笔没下出去，哪怕表里有个长得一模一样的旧记录。"""
     stale = _entrust(no="OLD-1", note="全部撤单")
     monkeypatch.setattr(mod, "place_order", lambda _u, **_k: PlaceResult(True, "ok"))
-    adapter = EasytraderAdapter(connect=lambda: object(), reader=lambda _u: [stale])
+    adapter = EasytraderAdapter(connect=lambda: object(), reader=lambda _u: [stale],
+                                account_reader=lambda _u: PAPER_ACCOUNT)
     result = adapter.submit([_order()], "2026-08-21")
     assert not result.ok
     assert "没有出现这一笔" in result.message
@@ -254,7 +263,60 @@ def test_baseline_read_failure_refuses_to_trade(monkeypatch):
         raise RuntimeError("剪贴板未被更新")
 
     monkeypatch.setattr(mod, "place_order", lambda _u, **_k: PlaceResult(True, "ok"))
-    adapter = EasytraderAdapter(connect=lambda: object(), reader=boom)
+    adapter = EasytraderAdapter(connect=lambda: object(), reader=boom,
+                                account_reader=lambda _u: PAPER_ACCOUNT)
     result = adapter.submit([_order()], "2026-08-21")
     assert not result.ok
     assert "基线" in result.message and result.submitted == 0
+
+
+# ---------------------------------------------------------------------------
+# 账户守卫：声明的 mode 必须和客户端里真正登录的账户对得上
+#
+# QBG_MODE=PAPER 在 assert_live_allowed 里是直接放行的（模拟盘不需要三把锁），
+# 但 PAPER 只是 .env 里的一句声明。客户端登着真钱账户 + .env 写 PAPER，
+# 就会在真钱上下单且一道锁都不查。客户端的资金账号是唯一的独立信源。
+# ---------------------------------------------------------------------------
+
+def test_paper_mode_accepts_simulated_account():
+    mod.assert_account_matches_mode(PAPER_ACCOUNT, "PAPER", "模拟")
+
+
+def test_paper_mode_refuses_real_account():
+    """最要紧的一条：声明 PAPER 却登着真钱账户，必须拒绝。"""
+    with pytest.raises(LiveLockError, match="真钱"):
+        mod.assert_account_matches_mode(REAL_ACCOUNT, "PAPER", "模拟")
+
+
+def test_live_mode_refuses_simulated_account():
+    """反向也要拦：三把锁都开了却在模拟盘上跑，多半是配错了。"""
+    with pytest.raises(LiveLockError, match="模拟盘"):
+        mod.assert_account_matches_mode(PAPER_ACCOUNT, "LIVE", "模拟")
+
+
+def test_live_mode_accepts_real_account():
+    mod.assert_account_matches_mode(REAL_ACCOUNT, "LIVE", "模拟")
+
+
+@pytest.mark.parametrize("mode", ["PAPER", "LIVE"])
+def test_unreadable_account_refuses_to_trade(mode):
+    """读不到账户 = 无法确认在哪个账户上交易 = 不交易。"""
+    with pytest.raises(LiveLockError, match="读不到"):
+        mod.assert_account_matches_mode("", mode, "模拟")
+
+
+def test_advisory_mode_skips_account_check():
+    """ADVISORY 不碰券商，账户是什么都无所谓。"""
+    mod.assert_account_matches_mode("", "ADVISORY", "模拟")
+
+
+def test_submit_enforces_account_guard(monkeypatch):
+    """守卫要真的接在 submit 上，不能只是个没人调的函数。"""
+    monkeypatch.setattr(mod.settings, "qbg_mode", "PAPER")
+    monkeypatch.setattr(mod, "place_order",
+                        lambda _u, **_k: PlaceResult(True, "ok"))
+    adapter = EasytraderAdapter(connect=lambda: object(),
+                                reader=lambda _u: [],
+                                account_reader=lambda _u: REAL_ACCOUNT)
+    with pytest.raises(LiveLockError, match="真钱"):
+        adapter.submit([_order()], "2026-08-25")

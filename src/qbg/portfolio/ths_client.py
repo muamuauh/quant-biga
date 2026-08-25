@@ -230,6 +230,22 @@ def cleanup_dialogs() -> list[str]:
     return closed
 
 
+ACCOUNT_COMBO_ID = 2322
+
+
+def read_account_name(user) -> str:
+    """读客户端上当前登录的资金账号标识（如 `模拟炒股-****`）。
+
+    读不到返回空串 —— 调用方必须把「读不到」当作**不能确认**来处理，
+    而不是当作通过。判断在哪个账户上下单这件事，没有第二个信源。
+    """
+    try:
+        combo = user.main.child_window(control_id=ACCOUNT_COMBO_ID, class_name="ComboBox")
+        return str(combo.window_text() or "").strip()
+    except Exception:  # noqa: BLE001 —— 控件不在/改版都归为「读不到」
+        return ""
+
+
 def find_trade_window() -> int | None:
     """按标题找交易主窗口的 hwnd（含被隐藏的）。"""
     u32 = ctypes.windll.user32

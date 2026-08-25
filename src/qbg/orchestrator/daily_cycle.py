@@ -128,12 +128,47 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
                   orders=[o.as_dict() for o in orders], allowed_orders=[o.as_dict() for o in allowed],
                   gates=[g.__dict__ for g in gate_results])
     if hard_ok and not dry_run:
+        # 顾问清单**永远写**，即使真的下了单。理由：清单是这一天「我们打算做
+        # 什么」的书面记录，和「实际成交了什么」是两回事，出问题时要能对账。
         execution = AdvisoryAdapter().submit(allowed, today, gate_results)
         result["submitted"] = True
         result["order_artifacts"] = list(execution.artifacts)
+        result["execution_mode"] = "ADVISORY"
+
+        # P9c：非顾问模式再走券商。这里此前**写死了 AdvisoryAdapter**，
+        # 和 P9a 之前写死 ManualSource 是同一类问题 —— 配置项存在但没人读。
+        if str(settings.qbg_mode).upper() != "ADVISORY":
+            result.update(_submit_to_broker(allowed, today, gate_results))
+
         save_marker(list(execution.artifacts), today)
         save_rebalance_date(today)
     return _finish(result, dry_run)
+
+
+def _submit_to_broker(allowed, today: str, gate_results) -> dict:
+    """PAPER / LIVE 模式下把订单提交给券商。
+
+    **失败不抛给上层。** 到这一步风控已经放行、顾问清单也已经落盘，
+    下单失败应该被如实记录进日报并告警，而不是让整个日流程崩掉 ——
+    崩掉会连日报和邮件都没有，那才是真的什么都不知道。
+
+    三把锁和账户守卫都在 `EasytraderAdapter` 里，这里不重复实现。
+    """
+    from qbg.execution.easytrader_adapter import EasytraderAdapter
+
+    try:
+        broker = EasytraderAdapter()
+        outcome = broker.submit(allowed, today, gate_results)
+    except Exception as exc:  # noqa: BLE001 —— 券商链路的任何异常都不该掀翻日流程
+        log_event(log, "cycle.broker.failed", error=f"{type(exc).__name__}: {exc}")
+        return {"execution_mode": str(settings.qbg_mode).upper(),
+                "broker": {"ok": False, "submitted": 0,
+                           "message": f"{type(exc).__name__}: {exc}", "outcomes": []}}
+    log_event(log, "cycle.broker.done", ok=outcome.ok, submitted=outcome.submitted,
+              mode=outcome.mode)
+    return {"execution_mode": outcome.mode,
+            "broker": {"ok": outcome.ok, "submitted": outcome.submitted,
+                       "message": outcome.message, "outcomes": list(outcome.outcomes)}}
 
 
 def _finish(result: dict, dry_run: bool) -> dict:
