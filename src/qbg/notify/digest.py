@@ -246,8 +246,24 @@ def status_tag(run: dict | None, finds: list[dict], failure: dict | None) -> str
     n_orders = len(orders) if isinstance(orders, (list, tuple)) else None
     n_plans = run.get("n_plans")
 
+    # **主题必须反映券商那边实际发生了什么。** 2026-08-25 实测那次：
+    # 3 笔单一笔都没进券商，主题却是「已提交3笔」—— `submitted` 指的是
+    # "顾问清单已落盘"，不是"券商收到了单"。人只看主题，报喜的主题最误导。
+    portfolio = run.get("portfolio") or {}
+    if str(portfolio.get("source") or "") == "default" and portfolio.get("degraded"):
+        return "⚠ 持仓读不到·结果不可用"
+    broker = run.get("broker")
+    if broker is not None:
+        ok = sum(1 for o in (broker.get("outcomes") or []) if o.get("ok"))
+        planned = n_orders if n_orders is not None else len(broker.get("outcomes") or [])
+        if ok == 0:
+            return f"⚠ 下单失败 0/{planned}笔"
+        if ok < planned:
+            return f"⚠ 部分成交 {ok}/{planned}笔"
+        return f"券商已接单{ok}笔"
+
     if run.get("submitted"):
-        return f"已提交{n_orders if n_orders is not None else n_plans or 0}笔"
+        return f"已生成清单{n_orders if n_orders is not None else n_plans or 0}笔"
     if n_orders:
         return f"订单建议{n_orders}笔·未执行"
     if n_orders == 0 and n_plans:

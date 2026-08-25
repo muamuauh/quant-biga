@@ -111,3 +111,138 @@ def test_breakeven_line_present():
     """把成本换算成「要涨多少才回本」比一个绝对数更能说明问题。"""
     text = render({**BASE, "allowed_orders": [_o(side="SELL", notional=100_000.0)]})
     assert "才能打平" in text
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 实测那次日报的四个毛病，逐条钉住。
+#
+# 那天：持仓降级到虚构账户、3 笔单一笔都没进券商。而日报和邮件说的是
+# 「已生成下单清单」「已提交3笔」，还列了 ¥17.50 佣金和 ¥66,743 成交额。
+# 全是报喜，全是假的。
+# ---------------------------------------------------------------------------
+FAILED_RUN = {
+    "date": "2026-08-25", "mode": "PAPER", "execution_mode": "PAPER", "hard_ok": True,
+    "submitted": True,
+    "targets": {"002384.SZ": 0.3167, "300274.SZ": 0.3167, "300394.SZ": 0.3167},
+    "allowed_orders": [
+        {"code": "002384.SZ", "side": "BUY", "quantity": 100, "notional": 19399.0},
+        {"code": "300274.SZ", "side": "BUY", "quantity": 200, "notional": 22344.0},
+        {"code": "300394.SZ", "side": "BUY", "quantity": 100, "notional": 25000.0}],
+    "broker": {"ok": False, "submitted": 0, "message": "提交后当日委托里没有出现这一笔",
+               "outcomes": [{"code": "002384.SZ", "side": "BUY", "quantity": 100,
+                             "price": 193.99, "ok": False, "entrust_no": None,
+                             "message": "提交后当日委托里没有出现这一笔"}]},
+    "agent_usage": {"calls": 80, "total_tokens": 341651, "cost_usd": 0.2852},
+}
+
+
+def test_costs_are_zero_when_nothing_reached_the_broker():
+    """一笔都没进券商 → 交易成本必须是 0，不能按计划的订单收费。"""
+    text = render(FAILED_RUN)
+    assert "已委托 0/3 笔" in text
+    assert "不产生费用" in text
+    assert "66,743" not in text, "成交额是凭空的：那 3 笔单根本没成交"
+    assert "¥17.50" not in text
+
+
+def test_costs_are_labelled_as_estimate_in_advisory_mode():
+    advisory = {k: v for k, v in FAILED_RUN.items() if k not in ("broker", "execution_mode")}
+    text = render(advisory)
+    assert "预估，实际以成交为准" in text
+
+
+def test_headline_leads_with_the_failure():
+    """一句话结论必须先说失败，而不是说「已生成下单清单」。"""
+    text = render(FAILED_RUN)
+    headline = text.split("## 一句话结论", 1)[1].split("##", 1)[0]
+    assert "下单全部未成功" in headline
+    assert "0/3" in headline
+    assert "已生成下单清单" not in headline
+
+
+def test_headline_shouts_when_portfolio_is_fictional():
+    run = {**FAILED_RUN, "portfolio": {"source": "default", "asof": "",
+                                       "degraded": {"from": "easytrader", "reason": "对不上账"}}}
+    headline = render(run).split("## 一句话结论", 1)[1].split("##", 1)[0]
+    assert "持仓完全读不到" in headline
+    assert "不可照做" in headline
+
+
+def test_headline_reports_success_plainly():
+    ok_run = {**FAILED_RUN,
+              "broker": {"ok": True, "submitted": 3, "message": "",
+                         "outcomes": [{"code": c, "side": "BUY", "ok": True,
+                                       "entrust_no": "62211154"} for c in
+                                      ("002384.SZ", "300274.SZ", "300394.SZ")]}}
+    headline = render(ok_run).split("## 一句话结论", 1)[1].split("##", 1)[0]
+    assert "券商已接单 3/3 笔" in headline
+
+
+def test_broker_denominator_counts_planned_not_attempted():
+    """下单遇错即停：outcomes 只有 1 笔，但计划是 3 笔。
+
+    写成「0/1」会让人以为只计划了 1 笔，看不出还有 2 笔根本没试过。
+    """
+    text = render(FAILED_RUN)
+    assert "0/3** 笔通过回读校验" in text
+    assert "2 笔因中止未尝试" in text
+
+
+def test_limits_section_admits_it_touched_the_broker():
+    """PAPER 模式真的下了单，就不能再说「顾问模式不接触券商」。"""
+    text = render(FAILED_RUN)
+    assert "顾问模式不接触券商" not in text
+    assert "PAPER 模式已直接向券商下单" in text
+    advisory = {k: v for k, v in FAILED_RUN.items()
+                if k not in ("broker", "execution_mode", "mode")}
+    assert "顾问模式不接触券商" in render(advisory)
+
+
+# ---------------------------------------------------------------------------
+# 复核明细：LLM 的理由是 400–600 字的结构化文本，塞进表格会被砍掉三分之二
+# 并且横向溢出，邮件里根本拉不动 —— 等于那几毛钱 token 白花了。
+# ---------------------------------------------------------------------------
+RATIONALE = (
+    "**Rating**: Overweight\n\n"
+    "**Executive Summary**: 建议逐步增加对阳光电源（300274.SZ）的持仓，"
+    "初始仓位可设定为投资组合的5%-7%，并在股价回调至10日EMA附近时进一步加仓。\n\n"
+    "**Investment Thesis**: 阳光电源在光伏发电和储能市场展现了显著的增长潜力，"
+    "其2026年第二季度的营业收入同比增长133.06%，净利润增长383.55%。"
+    "然而，公司高达66.34%的资产负债率确实是一个需要关注的风险。\n\n"
+    "**Time Horizon**: 6-12个月")
+
+REVIEWED = {"date": "2026-08-25", "hard_ok": True,
+            "agent_verdicts": [{"code": "300274.SZ", "rating": "Overweight",
+                                "rationale": RATIONALE, "kept": True, "error": None}]}
+
+
+def test_full_rationale_survives_into_the_report():
+    text = render(REVIEWED)
+    assert "Investment Thesis" in text
+    assert "Time Horizon" in text
+    assert "6-12个月" in text, "理由被截断了 —— 最后一节没进日报"
+    assert "…" not in text.split("#### 300274.SZ", 1)[1]
+
+
+def test_rationale_is_not_crammed_into_a_table_cell():
+    """理由必须在表格**外面**。表格行里出现长文本就是老毛病复发。"""
+    text = render(REVIEWED)
+    detail = text.split("### 复核明细", 1)[1]
+    table_rows = [ln for ln in detail.splitlines() if ln.startswith("|")]
+    assert table_rows, "概览表还在"
+    assert all(len(row) < 60 for row in table_rows), f"表格行过长，理由又被塞回去了：{table_rows}"
+    assert "#### 300274.SZ · Overweight · 通过" in detail
+
+
+def test_duplicate_rating_line_is_dropped():
+    """评级已经在小标题里了，正文再重复一遍 **Rating** 是噪音。"""
+    detail = render(REVIEWED).split("#### 300274.SZ", 1)[1]
+    assert "**Rating**" not in detail
+
+
+def test_review_error_is_shown_instead_of_rationale():
+    text = render({"date": "2026-08-25", "hard_ok": True,
+                   "agent_verdicts": [{"code": "600519.SH", "rating": "未复核",
+                                       "rationale": "", "kept": True,
+                                       "error": "429 Too Many Requests"}]})
+    assert "复核异常" in text and "429" in text

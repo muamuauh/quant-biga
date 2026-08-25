@@ -42,26 +42,80 @@ def _status(result: dict) -> str:
     return "正常 · 无订单"
 
 
+def _outcome_facts(result: dict) -> list[str]:
+    """把「这一趟到底成没成」拆成几句人话。
+
+    2026-08-25 的教训：那天持仓读取降级到虚构账户、3 笔单一笔都没进券商，
+    而一句话结论写的是「已生成下单清单」，邮件主题写的是「已提交3笔」。
+    **两处都在报喜。** 真正出事的两件事一个字都没提。
+
+    所以结论必须由**实际发生的事**倒推，而不是由"我们打算做什么"正推。
+    """
+    facts: list[str] = []
+    portfolio = result.get("portfolio") or {}
+    if str(portfolio.get("source") or "") == "default" and portfolio.get("degraded"):
+        facts.append("⚠ 持仓完全读不到，本次用的是默认假设账户，结论不可照做")
+
+    broker = result.get("broker")
+    if broker is not None:
+        outcomes = broker.get("outcomes") or []
+        ok = sum(1 for o in outcomes if o.get("ok"))
+        planned = len(result.get("allowed_orders") or [])
+        if broker.get("ok") and ok:
+            facts.append(f"券商已接单 {ok}/{planned} 笔并通过回读校验")
+        elif ok:
+            facts.append(f"券商只接了 {ok}/{planned} 笔，其余失败或未尝试")
+        else:
+            facts.append(f"⚠ 下单全部未成功（0/{planned} 笔）")
+    return facts
+
+
 def _headline(result: dict) -> str:
+    """一句话结论：先说结果，再说过程。"""
+    facts = _outcome_facts(result)
     review = result.get("daily_review") or {}
     review_text = review.get("summary") or review.get("error")
-    if review_text:
-        if result.get("orders"):
-            allowed = len(result.get("allowed_orders") or [])
-            execution = "已生成下单清单" if result.get("submitted") else "仅供参考，未执行"
-            review_text = f"{review_text} 风控允许 {allowed} 笔订单；{execution}。"
-        return _cell(review_text, 260)
+
     skipped = result.get("skipped_reason")
     if skipped == "not_rebalance_day":
-        return "今日为监控日：已更新账户与持仓事实，不生成新的调仓订单。"
-    if skipped:
-        return f"本次流程未执行：{_status(result)}。"
-    if not result.get("hard_ok", True):
-        return "硬风控闸未通过，本次不生成可执行清单。"
-    targets = len(result.get("targets") or {})
-    allowed = len(result.get("allowed_orders") or [])
-    execution = "已生成下单清单" if result.get("submitted") else "仅供决策参考，未执行"
-    return f"量化模型给出 {targets} 个目标，风控允许 {allowed} 笔订单；{execution}。"
+        base = "今日为监控日：已更新账户与持仓事实，不生成新的调仓订单。"
+    elif skipped:
+        base = f"本次流程未执行：{_status(result)}。"
+    elif not result.get("hard_ok", True):
+        base = "硬风控闸未通过，本次不生成可执行清单。"
+    else:
+        targets = len(result.get("targets") or {})
+        allowed = len(result.get("allowed_orders") or [])
+        # 只有在**没有**券商回执时才谈"清单"；有回执时结果由 facts 说了算，
+        # 再说一遍"已生成下单清单"只会掩盖失败。
+        tail = ("" if result.get("broker") is not None else
+                ("已生成下单清单。" if result.get("submitted") else "仅供决策参考，未执行。"))
+        base = f"量化模型给出 {targets} 个目标，风控允许 {allowed} 笔订单；{tail}".rstrip("；")
+        if not base.endswith("。"):
+            base += "。"
+
+    parts = list(facts)
+    if review_text:
+        parts.append(_cell(review_text, 200))
+    parts.append(base)
+    return _cell(" ".join(parts), 400)
+
+
+def _rationale(text) -> str:
+    """把 LLM 的复核理由原样铺开，只做最低限度的规整。
+
+    **不截断。** 这段文字是 P7 每票十几次 LLM 调用换来的唯一产物，
+    截掉就等于把钱花了却看不到结论。
+
+    只做两件事：去掉重复的 `**Rating**:` 行（评级已经在标题里了），
+    以及把各小节之间补上空行，让 markdown→HTML 转换时能正确分段。
+    """
+    body = str(text or "").strip()
+    if not body:
+        return "_无复核理由_"
+    kept = [ln.strip() for ln in body.splitlines()
+            if ln.strip() and not ln.strip().startswith("**Rating**")]
+    return "\n\n".join(kept)
 
 
 def _trading_costs(orders: list[dict]) -> dict:
@@ -105,17 +159,34 @@ def _cost_section(result: dict) -> list[str]:
     杀手 —— quant-trading 的实测是 3000 美元账户日频调仓被费用和滑点打到
     年化 −30%。成本不摆在日报上，这件事就只能靠回测发现，而回测发现得太晚。
     """
-    orders = result.get("allowed_orders") or []
+    # **成本要按实际发生的算，不能按计划的算。**
+    # 2026-08-25 实测那次：3 笔单一笔都没进券商，日报却照样列出 ¥17.50 佣金和
+    # 「成交额 ¥66,743」—— 全是凭空的。走了券商就以券商接单为准；
+    # 顾问模式下如实标明这是**预估**。
+    planned = result.get("allowed_orders") or []
+    broker = result.get("broker")
+    if broker is not None:
+        done = {(str(o.get("code")), str(o.get("side")).upper())
+                for o in (broker.get("outcomes") or []) if o.get("ok")}
+        orders = [o for o in planned
+                  if (str(o.get("code")), str(o.get("side")).upper()) in done]
+        basis = f"已委托 {len(orders)}/{len(planned)} 笔"
+    else:
+        orders = planned
+        basis = f"计划 {len(orders)} 笔（预估，实际以成交为准）"
     trade = _trading_costs(orders)
     llm = result.get("agent_usage") or {}
     review_usage = (result.get("daily_review") or {}).get("usage") or {}
     llm_cost = float(llm.get("cost_usd") or 0.0)
 
-    if not orders and not llm and not review_usage:
+    if not planned and not llm and not review_usage:
         return []
 
-    lines = ["## 今日成本", "", "| 项目 | 金额 | 说明 |", "|---|---:|---|"]
+    lines = ["## 今日成本", "", f"交易成本口径：**{basis}**。", "",
+             "| 项目 | 金额 | 说明 |", "|---|---:|---|"]
 
+    if trade["notional"] <= 0 and planned:
+        lines.append("| 交易成本 | ¥0.00 | 没有订单真正进入券商，不产生费用 |")
     if trade["notional"] > 0:
         lines += [
             f"| 佣金 | ¥{_number(trade['commission'])} | 双边，"
@@ -160,8 +231,15 @@ def _broker_section(result: dict) -> list[str]:
     mode = result.get("execution_mode", "")
     outcomes = broker.get("outcomes") or []
     ok_count = sum(1 for o in outcomes if o.get("ok"))
-    lines = ["## 计划 vs 实际委托", "",
-             f"执行模式 **{mode}** · 券商回执 **{ok_count}/{len(outcomes)}** 笔通过回读校验", ""]
+    # 分母用**计划笔数**而不是 outcomes 的长度。下单是遇错即停的，失败时
+    # outcomes 里往往只有尝试过的那一两笔，写成「0/1」会让人以为只计划了 1 笔，
+    # 而实际上有 3 笔（其中 2 笔根本没试）。
+    planned = len(result.get("allowed_orders") or []) or len(outcomes)
+    untried = max(planned - len(outcomes), 0)
+    header = f"执行模式 **{mode}** · 券商回执 **{ok_count}/{planned}** 笔通过回读校验"
+    if untried:
+        header += f"（其中 {untried} 笔因中止未尝试）"
+    lines = ["## 计划 vs 实际委托", "", header, ""]
     if not broker.get("ok"):
         lines += [f"> ⚠️ **下单未全部成功**：{_cell(str(broker.get('message') or ''))}",
                   "> 顾问清单仍然有效，请人工核对后决定是否补单。", ""]
@@ -294,14 +372,27 @@ def render(result: dict) -> str:
                 )
             lines.append("")
     if verdicts:
-        lines += ["### 复核明细", "",
-                  "|代码|评级|闸门|理由/异常|", "|---|---|---:|---|"]
+        # **理由不能塞进表格单元格。** LLM 的复核理由是 400–600 字的结构化文本
+        # （Executive Summary / Investment Thesis / Time Horizon）。塞进表格会被
+        # `_cell` 砍到 180 字并把换行压平，剩下的还要横向溢出 —— 邮件里根本
+        # 拉不动，等于白花了那几毛钱的 token。
+        #
+        # 所以拆成两段：先用表格给一眼看完的结论，再每票一块展开完整理由。
+        lines += ["### 复核明细", "", "|代码|评级|闸门|", "|---|---|---:|"]
         for verdict in verdicts:
-            detail = verdict.get("error") or verdict.get("rationale") or "无"
             lines.append(
                 f"|{_cell(verdict.get('code'))}|{_cell(verdict.get('rating'))}|"
-                f"{'通过' if verdict.get('kept') else '拦截'}|{_cell(detail)}|"
+                f"{'通过' if verdict.get('kept') else '拦截'}|"
             )
+        lines.append("")
+        for verdict in verdicts:
+            code, rating = verdict.get("code"), verdict.get("rating") or "未复核"
+            gate = "通过" if verdict.get("kept") else "拦截"
+            lines += [f"#### {_cell(code)} · {_cell(rating)} · {gate}", ""]
+            if verdict.get("error"):
+                lines += [f"> ⚠️ 复核异常：{_cell(str(verdict['error']), 400)}", ""]
+            else:
+                lines += [_rationale(verdict.get("rationale")), ""]
         usage = result.get("agent_usage") or {}
         if usage:
             lines += ["", f"- 调用：{int(usage.get('calls', 0) or 0)} 次",
@@ -367,9 +458,17 @@ def render(result: dict) -> str:
         if review.get("report_path"):
             lines.append(f"- 报告：`{review['report_path']}`")
         lines.append("")
+    # 这段以前把「顾问模式不接触券商」写死了，于是 PAPER 模式真的下了单
+    # 之后，日报还在告诉人"本系统不接触券商"。按实际模式说话。
+    mode = str(result.get("execution_mode") or result.get("mode") or "ADVISORY").upper()
     lines += ["## 建议与限制", "",
-              "- 当前历史股票池有生存者偏差，回测收益不能视为未来预期。",
-              "- 顾问模式不接触券商；实际成交必须由次日持仓对账确认。", ""]
+              "- 当前历史股票池有生存者偏差，回测收益不能视为未来预期。"]
+    if mode == "ADVISORY":
+        lines.append("- 顾问模式不接触券商；实际成交必须由次日持仓对账确认。")
+    else:
+        lines.append(f"- **{mode} 模式已直接向券商下单**；成交结果以「计划 vs 实际委托」"
+                     "一节的合同编号为准，并由次日持仓复核。")
+    lines.append("")
     return "\n".join(lines)
 
 

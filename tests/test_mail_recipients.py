@@ -61,3 +61,41 @@ def test_empty_yields_empty(raw):
 
 def test_three_recipients():
     assert normalize_recipients("a@x.com;b@y.com,c@z.com") == "a@x.com, b@y.com, c@z.com"
+
+
+# ---------------------------------------------------------------------------
+# 邮件主题必须反映**券商那边实际发生了什么**。
+# 2026-08-25 实测：3 笔单一笔都没进券商，主题却是「已提交3笔」——
+# `submitted` 指的是"顾问清单已落盘"，不是"券商收到了单"。人只看主题。
+# ---------------------------------------------------------------------------
+def _tag(**over):
+    from qbg.notify.digest import status_tag
+    return status_tag({"submitted": True, "allowed_orders": [{}, {}, {}], **over}, [], None)
+
+
+def test_subject_says_failed_when_no_order_reached_broker():
+    tag = _tag(broker={"ok": False, "outcomes": [{"ok": False}]})
+    assert "下单失败" in tag and "0/3" in tag
+    assert "已提交" not in tag
+
+
+def test_subject_flags_partial_fill():
+    assert "部分成交 2/3" in _tag(
+        broker={"ok": False, "outcomes": [{"ok": True}, {"ok": True}, {"ok": False}]})
+
+
+def test_subject_reports_broker_success():
+    assert _tag(broker={"ok": True, "outcomes": [{"ok": True}] * 3}) == "券商已接单3笔"
+
+
+def test_subject_leads_with_unreadable_portfolio():
+    """持仓读不到是最严重的 —— 盖过其他一切状态。"""
+    tag = _tag(portfolio={"source": "default", "degraded": {"reason": "对不上账"}},
+               broker={"ok": True, "outcomes": [{"ok": True}] * 3})
+    assert "持仓读不到" in tag
+
+
+def test_advisory_subject_no_longer_claims_submission():
+    """顾问模式只是生成清单，说「已提交」会让人以为单子下出去了。"""
+    tag = _tag()
+    assert "已生成清单3笔" == tag
