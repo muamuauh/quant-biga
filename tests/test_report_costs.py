@@ -246,3 +246,10 @@ def test_review_error_is_shown_instead_of_rationale():
                                        "rationale": "", "kept": True,
                                        "error": "429 Too Many Requests"}]})
     assert "复核异常" in text and "429" in text
+
+
+def test_subtitle_does_not_claim_success_either():
+    """副标题和主题、一句话结论是同一个毛病，三处都要改到。"""
+    from qbg.report.daily_report import _status
+    assert _status(FAILED_RUN) == "⚠ 下单失败 0/3 笔"
+    assert "已生成清单" not in render(FAILED_RUN).split("## 概览")[0]

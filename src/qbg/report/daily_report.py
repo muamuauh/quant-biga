@@ -33,6 +33,18 @@ def _status(result: dict) -> str:
     review = result.get("daily_review") or {}
     if review and not review.get("ok"):
         return "⚠ 复盘失败"
+    # 券商回执优先于"清单已生成"。副标题和主题、一句话结论是同一个毛病：
+    # submitted 只说明顾问清单落了盘，不代表券商收到了单。
+    portfolio = result.get("portfolio") or {}
+    if str(portfolio.get("source") or "") == "default" and portfolio.get("degraded"):
+        return "⚠ 持仓读不到"
+    broker = result.get("broker")
+    if broker is not None:
+        planned = len(result.get("allowed_orders") or [])
+        ok = sum(1 for o in (broker.get("outcomes") or []) if o.get("ok"))
+        if ok == 0:
+            return f"⚠ 下单失败 0/{planned} 笔"
+        return f"{'⚠ ' if ok < planned else ''}券商接单 {ok}/{planned} 笔"
     if result.get("submitted"):
         return f"已生成清单 {len(result.get('allowed_orders') or [])} 笔"
     if result.get("allowed_orders"):
