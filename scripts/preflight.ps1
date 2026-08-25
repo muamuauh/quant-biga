@@ -329,8 +329,16 @@ if ($clashOk) {
 }
 
 # --- 2/4 等网络落定 ---------------------------------------------------------
-Write-Step "Step 2/5: 等 ${NetworkWaitSec}s 让网络落定"
-Start-Sleep -Seconds $NetworkWaitSec
+# 端口已经在监听就别再等 —— 这个 10s 是给"刚把 Clash 拉起来"准备的。
+# 预检会跑两遍（09:15 独立任务一遍，09:30 run_daily.ps1 内部再一遍），
+# 第二遍 Clash 早就起好了，白等 10s 只是把订单往后推。
+Write-Step "Step 2/5: 等网络落定"
+if (Test-Port "127.0.0.1" $ProxyPort 1500) {
+    Write-Line "  混合端口已在监听，跳过 ${NetworkWaitSec}s 等待。"
+} else {
+    Write-Line "  等 ${NetworkWaitSec}s..."
+    Start-Sleep -Seconds $NetworkWaitSec
+}
 if (Test-Port "127.0.0.1" $ProxyPort) {
     Write-OK "混合端口 $ProxyPort 在监听。"
 } else {

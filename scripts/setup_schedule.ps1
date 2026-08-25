@@ -79,6 +79,13 @@ param(
     [ValidatePattern('^\d{1,2}:\d{2}$')]
     [string]$Time     = '09:30',
     [string]$TaskName = 'quant_biga_daily',
+    # 预检任务：比主任务早 15 分钟，**唯一目的是给人留出人工登录同花顺的时间**。
+    # 预检本身是幂等的（代理检测到开着就不发热键、同花顺在跑就只报告），
+    # 所以 run_daily.ps1 内部那次重跑不会造成任何副作用。
+    [ValidatePattern('^\d{1,2}:\d{2}$')]
+    [string]$PreflightTime     = '09:15',
+    [string]$PreflightTaskName = 'quant_biga_preflight',
+    [switch]$NoPreflightTask,
     [switch]$NoStartupTrigger,
     [switch]$Remove
 )
@@ -94,16 +101,37 @@ function Write-Err($m)  { Write-Host "  [ERROR] $m" -ForegroundColor Red }
 # --- 硬护栏：绝不碰兄弟仓库的任务 -------------------------------------------
 # quant-trading 挂在真钱账户上，它的 qtf_daily / qtf_preflight 由那个仓库自己
 # 管。手滑传个同名参数就会把人家的任务覆盖掉，而且覆盖是静默的。
-if ($TaskName -match '^(qtf|qtagent)') {
-    Write-Err "拒绝操作 '$TaskName' —— qtf_* / qtagent_* 是兄弟仓库的任务，CLAUDE.md 明令禁止动。"
+# 两个名字都要查。兄弟仓库的任务正好也叫 qtf_daily / qtf_preflight，
+# 而 quant-trading 挂在真钱账户上 —— 手滑传个同名参数就会静默覆盖掉人家的。
+foreach ($n in @($TaskName, $PreflightTaskName)) {
+    if ($n -match '^(qtf|qtagent)') {
+        Write-Err "拒绝操作 '$n' —— qtf_* / qtagent_* 是兄弟仓库的任务，CLAUDE.md 明令禁止动。"
+        exit 1
+    }
+}
+if ($TaskName -eq $PreflightTaskName) {
+    Write-Err "主任务和预检任务不能同名（都是 '$TaskName'）—— 后注册的会把前一个覆盖掉。"
+    exit 1
+}
+# 预检必须在主任务**之前**跑，否则它存在的意义（留出登录同花顺的时间）就没了。
+# [timespan] 而不是 [datetime]：前者不依赖区域设置，"09:30" 恒等于 9 小时 30 分。
+$leadMinutes = ([timespan]$Time - [timespan]$PreflightTime).TotalMinutes
+if (-not $NoPreflightTask -and $leadMinutes -le 0) {
+    Write-Err "预检时间 $PreflightTime 不早于主任务 $Time —— 那就起不到提前准备的作用了。"
     exit 1
 }
 
 if ($Remove) {
-    $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $existing) { Write-Warn2 "任务 '$TaskName' 本来就不存在。"; exit 0 }
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    Write-OK "已删除任务 '$TaskName'。"
+    $removed = 0
+    foreach ($n in @($TaskName, $PreflightTaskName)) {
+        if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $n -Confirm:$false
+            Write-OK "已删除任务 '$n'。"
+            $removed++
+        } else {
+            Write-Warn2 "任务 '$n' 本来就不存在。"
+        }
+    }
     exit 0
 }
 
@@ -142,98 +170,148 @@ if ($Mode -eq 'Background' -and -not $isAdmin) {
 # --- 组装任务 ---------------------------------------------------------------
 # -NoProfile：不加载任何 profile，计划任务环境要可复现。
 # -NonInteractive：明确声明没有交互，避免任何 Read-Host 把任务挂死等到超时。
-$argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $Runner
-$action  = New-ScheduledTaskAction -Execute $Shell -Argument $argLine -WorkingDirectory $ProjectRoot
-
-$triggers = @()
-$triggers += New-ScheduledTaskTrigger -Daily -At $Time
-
-if (-not $NoStartupTrigger) {
-    if ($Mode -eq 'Background') {
-        # 开机触发 + 延迟 5 分钟：给网卡拿到 IP、Clash 起来、磁盘落定留时间。
-        # 刚开机就抢跑是最容易出"拉数据超时"的时候。
-        $t = New-ScheduledTaskTrigger -AtStartup
-        $t.Delay = 'PT5M'
-        $triggers += $t
-    } else {
-        $t = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-        $t.Delay = 'PT3M'
-        $triggers += $t
-    }
-}
-
-# StartWhenAvailable：09:30 时机器关着/睡着的那天，开机后尽快补跑。
-# WakeToRun：机器睡着时到点唤醒它（BIOS/电源计划禁用唤醒定时器则无效）。
-# IgnoreNew：上一次还没跑完就不再起第二个 —— run_daily.ps1 里的文件锁是第二道，
-#            这里是第一道，两道都要，因为文件锁挡不住任务本身被重复排队。
-# ExecutionTimeLimit 2h：--retrain 那条路径最慢（三 seed 串行），2 小时足够，
-#            又能保证卡死的任务不会一直占着锁到第二天。
-$settings = New-ScheduledTaskSettingsSet `
-    -StartWhenAvailable `
-    -WakeToRun `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-
-# **刻意不设 -RestartCount。** 计划任务的"失败后重启"只看退出码非零，
-# 分不清失败的种类，而我们这里非零的多数情况都不该重试：
-#   2   硬闸中止 —— 风控说了今天别交易，重试只会再烧一遍 LLM 复核的钱，
-#       然后得出同一个结论。
-#   127 连解释器都没找到 —— 重试一百次也没有。
-# 真正值得重试的只有网络抖动，而那种情况 daily_cycle 内部已经有降级和
-# fail-open，再加上当日幂等标记，外层重试拿不到什么。
-
+#
 # RunLevel Limited 是刻意的：同花顺以普通权限跑，Python 也必须是普通权限，
 # 否则 UIPI 会静默丢弃模拟输入（CLAUDE.md §七 的第一个坑）。
 # 而且定时任务权限越小越好 —— 它每天无人值守地跑。
-if ($Mode -eq 'Background') {
-    # S4U = "不管用户是否登录都运行" 且**不存密码**。代价是拿不到网络凭据
-    # （访问远程共享会失败），但本流程只走 HTTPS 出网和本地磁盘，够用。
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
-} else {
-    $principal = New-ScheduledTaskPrincipal `
+function New-QbgPrincipal {
+    param([string]$Mode)
+    if ($Mode -eq 'Background') {
+        # S4U = "不管用户是否登录都运行" 且**不存密码**。代价是拿不到网络凭据
+        # （访问远程共享会失败），但本流程只走 HTTPS 出网和本地磁盘，够用。
+        return New-ScheduledTaskPrincipal `
+            -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
+    }
+    return New-ScheduledTaskPrincipal `
         -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 }
 
-$desc = "quant-biga 每日编排（$Mode 模式；$Time + " +
-        $(if ($NoStartupTrigger) { "无开机触发" } elseif ($Mode -eq 'Background') { "开机后 5 分钟" } else { "登录后 3 分钟" }) +
-        "）。脚本内部判交易日与当日幂等，重复触发是空转。"
+function Register-QbgTask {
+    param(
+        [string]$Name,
+        [string]$Script,
+        [string]$At,
+        [string]$Description,
+        [switch]$WithStartupTrigger,
+        [int]$TimeLimitHours = 2
+    )
+    $argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $Script
+    $action  = New-ScheduledTaskAction -Execute $Shell -Argument $argLine -WorkingDirectory $ProjectRoot
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
-    -Settings $settings -Principal $principal -Description $desc -Force | Out-Null
+    $triggers = @(New-ScheduledTaskTrigger -Daily -At $At)
+    if ($WithStartupTrigger) {
+        if ($Mode -eq 'Background') {
+            # 开机触发 + 延迟 5 分钟：给网卡拿到 IP、Clash 起来、磁盘落定留时间。
+            # 刚开机就抢跑是最容易出"拉数据超时"的时候。
+            $t = New-ScheduledTaskTrigger -AtStartup
+            $t.Delay = 'PT5M'
+        } else {
+            $t = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+            $t.Delay = 'PT3M'
+        }
+        $triggers += $t
+    }
 
-# --- 回读校验 ---------------------------------------------------------------
-# 不拿"没抛异常"当成功判据 —— 这条纪律和 ths_client 取表用哨兵值是同一条。
-$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if (-not $task) { Write-Err "注册后回读不到任务 '$TaskName'。"; exit 1 }
-$info = Get-ScheduledTaskInfo -TaskName $TaskName
+    # StartWhenAvailable：到点时机器关着/睡着的那天，开机后尽快补跑。
+    # WakeToRun：机器睡着时到点唤醒它（BIOS/电源计划禁用唤醒定时器则无效）。
+    # IgnoreNew：上一次还没跑完就不再起第二个 —— run_daily.ps1 里的文件锁是
+    #            第二道，这里是第一道，两道都要，因为文件锁挡不住任务本身被
+    #            重复排队。
+    #
+    # **刻意不设 -RestartCount。** 计划任务的"失败后重启"只看退出码非零，
+    # 分不清失败的种类，而我们这里非零的多数情况都不该重试：
+    #   2   硬闸中止 —— 风控说了今天别交易，重试只会再烧一遍 LLM 复核的钱，
+    #       然后得出同一个结论。
+    #   127 连解释器都没找到 —— 重试一百次也没有。
+    # 预检更是如此：它的退出码 1 表示"有告警但能跑"，那根本不是失败。
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -WakeToRun `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Hours $TimeLimitHours)
+
+    Register-ScheduledTask -TaskName $Name -Action $action -Trigger $triggers `
+        -Settings $settings -Principal (New-QbgPrincipal $Mode) `
+        -Description $Description -Force | Out-Null
+
+    # 回读校验：不拿"没抛异常"当成功判据 —— 这条纪律和 ths_client 取表
+    # 用哨兵值确认剪贴板真被覆盖是同一条。
+    $task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+    if (-not $task) { Write-Err "注册后回读不到任务 '$Name'。"; exit 1 }
+    $info = Get-ScheduledTaskInfo -TaskName $Name
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------------"
+    Write-Host ("  任务名     : {0}" -f $Name)
+    Write-Host ("  模式       : {0}（{1}）" -f $Mode, $task.Principal.LogonType)
+    Write-Host ("  运行身份   : {0}  RunLevel={1}" -f $task.Principal.UserId, $task.Principal.RunLevel)
+    Write-Host ("  命令       : {0}" -f $argLine)
+    Write-Host ("  触发器     : {0}" -f (($task.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ", "))
+    Write-Host ("  下次运行   : {0}" -f $info.NextRunTime)
+    Write-Host "------------------------------------------------------------"
+}
+
+$startupNote = $(if ($NoStartupTrigger) { "无开机触发" }
+                 elseif ($Mode -eq 'Background') { "开机后 5 分钟" }
+                 else { "登录后 3 分钟" })
 
 Write-Host ""
 Write-Host "============================================================"
 Write-Host " 已注册计划任务"
 Write-Host "============================================================"
-Write-Host ("  任务名     : {0}" -f $TaskName)
-Write-Host ("  模式       : {0}（{1}）" -f $Mode, $task.Principal.LogonType)
-Write-Host ("  运行身份   : {0}  RunLevel={1}" -f $task.Principal.UserId, $task.Principal.RunLevel)
-Write-Host ("  宿主 shell : {0}" -f $Shell)
-Write-Host ("  命令       : {0}" -f $argLine)
-Write-Host ("  触发器     : {0}" -f (($task.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ", "))
-Write-Host ("  下次运行   : {0}" -f $info.NextRunTime)
-Write-Host "============================================================"
+
+# --- 预检任务（先注册，它先跑）---------------------------------------------
+# **它存在的唯一理由是给人留出登录同花顺的时间。** 预检做的事 run_daily.ps1
+# 内部本来也会做一遍，但那时已经 09:30，发现同花顺停在登录框上就来不及了。
+# 提前 15 分钟跑一次，窗口就摆在桌面上等你，主流程到点时客户端已经可用。
+#
+# 重复运行没有副作用：代理/TUN 检测到开着就不发热键（热键是 toggle，
+# 发偶数次等于没发），同花顺在跑就只报告，端口在监听就跳过 10s 等待。
+if (-not $NoPreflightTask) {
+    $preflightScript = Join-Path $ProjectRoot "scripts\preflight.ps1"
+    if (-not (Test-Path $preflightScript)) {
+        Write-Err "找不到 $preflightScript"
+        exit 1
+    }
+    # 不给预检加开机/登录触发器：登录后 3 分钟跑一次预检没有意义
+    # （主任务自己会跑预检），只会多弹一个同花顺窗口。
+    # 1 小时上限：预检最慢的一步是等同花顺主窗口（40s），给足余量即可。
+    Register-QbgTask -Name $PreflightTaskName -Script $preflightScript -At $PreflightTime `
+        -TimeLimitHours 1 `
+        -Description ("quant-biga 盘前预检（$Mode 模式；每天 $PreflightTime）。" +
+                      "起 Clash + 同花顺、开系统代理/TUN，并留出人工登录同花顺的时间。" +
+                      "非交易日会自行跳过。退出码 1 = 有告警但可以跑。")
+}
+
+# --- 主任务 -----------------------------------------------------------------
+Register-QbgTask -Name $TaskName -Script $Runner -At $Time `
+    -WithStartupTrigger:(-not $NoStartupTrigger) `
+    -Description ("quant-biga 每日编排（$Mode 模式；$Time + $startupNote）。" +
+                  "脚本内部判交易日与当日幂等，重复触发是空转。")
+
 Write-Host ""
+if (-not $NoPreflightTask) {
+    Write-Host ("时序：{0} 预检（起 Clash + 同花顺）-> 你在这 {1} 分钟内登录同花顺 -> {2} 主流程下单" -f `
+        $PreflightTime, [int]$leadMinutes, $Time) -ForegroundColor Cyan
+    Write-Host "      没登录也不会出事：取表失败 -> 持仓降级 -> PAPER/LIVE 拒绝下单。" -ForegroundColor Cyan
+    Write-Host ""
+}
 
 if ($Mode -eq 'Background') {
     Write-Warn2 "Background 模式跑在 session 0，没有桌面。已知代价："
     Write-Warn2 "  · TUN 模式开不了（只能开系统代理，走注册表）"
-    Write-Warn2 "  · 同花顺 UI 自动化必定失败 -> 持仓降级到 CSV（日报会标注）"
+    Write-Warn2 "  · 同花顺 UI 自动化必定失败 -> 持仓降级 -> PAPER/LIVE 拒绝下单"
     Write-Warn2 "  两样都要的话看 docs/windows-schedule.md 的「自动登录」一节。"
     Write-Host ""
 }
 
 Write-Host "验证方式：" -ForegroundColor Cyan
-Write-Host "  Start-ScheduledTask -TaskName $TaskName      # 立刻跑一次"
+if (-not $NoPreflightTask) {
+    Write-Host "  Start-ScheduledTask -TaskName $PreflightTaskName   # 只跑预检"
+}
+Write-Host "  Start-ScheduledTask -TaskName $TaskName      # 立刻跑一次主流程"
 Write-Host "  Get-ScheduledTaskInfo -TaskName $TaskName    # 看上次结果/下次时间"
 Write-Host "  Get-Content logs\run_daily.log -Tail 20      # 看启动日志"
 Write-Host "  powershell -ExecutionPolicy Bypass -File run_daily.ps1 --dry-run -Pause   # 手工试跑"
