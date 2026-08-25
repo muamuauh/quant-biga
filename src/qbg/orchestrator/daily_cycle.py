@@ -67,9 +67,16 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         equity, cash = snapshot.total_equity, snapshot.available_cash
         positions = [p.as_dict() for p in snapshot.positions]
         asof = snapshot.asof
-    except (FileNotFoundError, pd.errors.EmptyDataError):
+    except Exception as exc:  # noqa: BLE001 —— 任何读取失败都要留下痕迹，不能只认两种
+        # **别把失败原因丢掉。** 2026-08-25 实测：easytrader 读失败 → 降级到 ocr →
+        # CSV 也不存在 → 落到这里。原来这里只写 source="default"，日报便只说
+        # 「无持仓记录，按默认初始资金假设」—— 完全看不出「本来能读到真实持仓，
+        # 是校验失败才退到这里的」。
         equity, cash, positions, asof = default_equity, default_equity, [], ""
+        degraded = {"from": settings.qbg_portfolio_source,
+                    "reason": f"{type(exc).__name__}: {exc}"}
         portfolio_source = "default"
+        log_event(log, "portfolio.fallback_to_default", **degraded)
     result["account"] = {"total_equity": equity, "available_cash": cash}
     result["positions"] = positions
     # 来源与 asof 必须进日报：降级后用的是**过期持仓**，而那样出的清单
@@ -138,11 +145,38 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         # P9c：非顾问模式再走券商。这里此前**写死了 AdvisoryAdapter**，
         # 和 P9a 之前写死 ManualSource 是同一类问题 —— 配置项存在但没人读。
         if str(settings.qbg_mode).upper() != "ADVISORY":
-            result.update(_submit_to_broker(allowed, today, gate_results))
+            refusal = broker_refusal(portfolio_source, degraded)
+            if refusal:
+                log_event(log, "cycle.broker.refused", reason=refusal)
+                result.update({"execution_mode": str(settings.qbg_mode).upper(),
+                               "broker": {"ok": False, "submitted": 0,
+                                          "message": refusal, "outcomes": []}})
+            else:
+                result.update(_submit_to_broker(allowed, today, gate_results))
 
         save_marker(list(execution.artifacts), today)
         save_rebalance_date(today)
     return _finish(result, dry_run)
+
+
+def broker_refusal(portfolio_source: str, degraded: dict | None) -> str | None:
+    """要不要**拒绝**把订单发给券商？返回拒绝理由，`None` 表示放行。
+
+    **读不到持仓就不许下单。** 2026-08-25 全链路实测的教训：一笔挂单冻结了
+    资金 → 总资产恒等式失败 → easytrader 降级到 ocr → CSV 也不存在 →
+    落到 `default_equity` 的 10 万空仓假设。系统于是照着一个**虚构账户**
+    做规划，并真的把单发了出去（真实账户有 20 万和 3 只持仓）。
+
+    顾问模式下出一份基于假设的清单无所谓 —— 人会看着执行。真下单不行：
+    不知道自己现在持有什么，就可能重复买入、或者卖出根本不存在的股票。
+
+    注意这和风控闸不同：闸是在「持仓已知」的前提下判断订单合不合规，
+    这里判断的是**前提本身成不成立**，所以必须挡在闸之外、更靠前。
+    """
+    if portfolio_source != "default":
+        return None
+    return ("持仓读取失败、已落到默认假设账户 —— "
+            f"拒绝下单（{(degraded or {}).get('reason', '原因未知')}）")
 
 
 def _submit_to_broker(allowed, today: str, gate_results) -> dict:

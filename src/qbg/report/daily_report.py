@@ -200,6 +200,17 @@ def _portfolio_provenance(portfolio: dict) -> list[str]:
         line += f"（截止 {asof}）"
     lines = [line, ""]
     degraded = portfolio.get("degraded")
+    if degraded and source == "default":
+        # 一路降到默认假设账户 —— 这是最危险的一种：清单是照着一个**虚构账户**
+        # 算出来的。必须比普通降级更响。
+        return [
+            f"> 🔴 **持仓完全读不到**：`{degraded.get('from')}` 失败后连降级路径也没成功，"
+            "本次使用的是**默认假设账户**，不是你的真实持仓。",
+            f"> 失败原因：`{_cell(str(degraded.get('reason') or ''))}`",
+            "> **下面的一切（持仓、目标、订单、成本）都建立在这个假设之上，不要照着执行。**",
+            "> PAPER/LIVE 模式下已自动拒绝向券商下单。",
+            "",
+        ]
     if degraded:
         lines = [
             f"> ⚠️ **持仓来源已降级**：`{degraded.get('from')}` 读取失败，"

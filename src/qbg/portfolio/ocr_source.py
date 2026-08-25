@@ -119,8 +119,19 @@ def validate_payload(payload: dict, *, name_map: dict[str, str] | None = None,
         else:
             seen[code] = position
     positions = list(seen.values())
-    if total <= 0 or abs(total - (cash + sum(p.market_value for p in positions))) / total >= tolerance:
-        issues.append(ValidationIssue("总资产", "总资产与可用资金+持仓市值合计偏差达到 1%"))
+    # 总资产恒等式。
+    #
+    # 用「现金总额」而不是「可用资金」—— 两者的差额是**被挂单冻结的钱**，
+    # 它既不在可用资金里，也不在持仓市值里。截图 OCR 那条路只读得到可用资金，
+    # 所以没有「现金总额」时退回用它（截图场景下通常没有挂单）；
+    # 而 easytrader 读得到「资金余额」，必须用它，否则**任何未成交挂单都会让
+    # 这条校验失败**，进而让整个持仓读取降级（2026-08-25 全链路实测踩到）。
+    cash_total = payload.get("现金总额")
+    identity_cash = _number(cash_total, "现金总额", issues) if cash_total is not None else cash
+    label = "现金总额" if cash_total is not None else "可用资金"
+    holdings = sum(p.market_value for p in positions)
+    if total <= 0 or abs(total - (identity_cash + holdings)) / total >= tolerance:
+        issues.append(ValidationIssue("总资产", f"总资产与{label}+持仓市值合计偏差达到 1%"))
     snapshot = PortfolioSnapshot(str(payload.get("asof") or ""), total, cash, tuple(positions))
     return snapshot, issues
 

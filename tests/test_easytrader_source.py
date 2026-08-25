@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from qbg.portfolio import easytrader_source, ocr_source
 from qbg.portfolio import source as source_mod
 from qbg.portfolio.easytrader_source import (
     EasytraderSource,
@@ -25,7 +26,9 @@ REAL_COLUMNS = ["操作", "序号", "证券代码", "证券名称", "股票余�
                 "成本价", "市价", "盈亏", "盈亏比例(%)", "当日盈亏", "当日盈亏比(%)",
                 "市值", "仓位占比(%)", "当日买入", "当日卖出", "交易市场"]
 
-BALANCE = {"资金余额": 100000.0, "可用金额": 40000.0, "可取金额": 0.0, "总资产": 100000.0}
+# 基准场景：**无挂单冻结**，所以资金余额 == 可用金额。
+# 总资产 10 万 = 现金 4 万 + 持仓市值 6 万（`_row()` 的默认值），内部自洽。
+BALANCE = {"资金余额": 40000.0, "可用金额": 40000.0, "可取金额": 0.0, "总资产": 100000.0}
 
 
 def _row(code="600519", name="贵州茅台", qty=100, sellable=100,
@@ -126,7 +129,7 @@ def test_sellable_is_carried_through(no_price_check):
     场景就是当日买入 200 股：股票余额 300、可用余额 100，差额当日不可卖。
     """
     rows = [_row(qty=300, sellable=100, value=180000.0)]
-    balance = {**BALANCE, "总资产": 220000.0, "可用金额": 40000.0}
+    balance = {**BALANCE, "总资产": 220000.0, "可用金额": 40000.0, "资金余额": 40000.0}
     snapshot = EasytraderSource(reader=_reader(_tables(rows, balance))).load()
     assert (snapshot.positions[0].qty, snapshot.positions[0].sellable_qty) == (300, 100)
 
@@ -139,7 +142,7 @@ def test_market_value_mismatch_is_fatal(no_price_check):
 
 def test_totals_mismatch_is_fatal(no_price_check):
     """总资产 ≠ 可用资金 + 持仓市值。"""
-    balance = {**BALANCE, "总资产": 100000.0, "可用金额": 1.0}
+    balance = {**BALANCE, "总资产": 100000.0, "可用金额": 1.0, "资金余额": 1.0}
     with pytest.raises(PortfolioValidationError):
         EasytraderSource(reader=_reader(_tables([_row()], balance))).load()
 
@@ -222,7 +225,8 @@ def test_closed_out_row_is_dropped():
 
 def test_closed_out_row_does_not_break_load(no_price_check):
     """清仓当天必须还能正常读出「空仓」，而不是抛异常。"""
-    balance = {**BALANCE, "总资产": 200004.1, "可用金额": 200004.1}
+    balance = {**BALANCE, "总资产": 200004.1, "可用金额": 200004.1,
+               "资金余额": 200004.1}
     snapshot = EasytraderSource(reader=_reader(_tables([CLOSED_OUT], balance))).load()
     assert snapshot.positions == ()
     assert snapshot.available_cash == 200004.1
@@ -238,3 +242,55 @@ def test_zero_qty_with_nonzero_value_is_not_dropped():
     """股数 0 但市值非 0 = 取表出错，该报 FATAL 让人看见，不能当清仓静静丢掉。"""
     broken = {**CLOSED_OUT, "股票余额": 0, "市值": 783.0}
     assert len(to_payload(_tables([broken]))["positions"]) == 1
+
+
+# --- 挂单冻结资金：总资产恒等式必须用「资金余额」而不是「可用金额」 ---
+#
+# 2026-08-25 全链路实测踩到的真实故障：一笔挂单未成交把现金冻住，
+# 于是 `总资产 ≈ 可用金额 + 市值` 这条校验必然失败 —— 持仓读取整个降级，
+# 系统改用一个虚构的默认账户去规划并真的下了单。
+
+def _tables_with_frozen_cash():
+    """账户有一笔 5 万挂单冻结：可用 3 万、余额 8 万、持仓 12 万、总资产 20 万。"""
+    return {
+        "columns": list(easytrader_source.POSITION_COLUMNS),
+        "balance": {"总资产": 200_000.0, "可用金额": 30_000.0, "资金余额": 80_000.0},
+        "position": [{"证券代码": "600519", "证券名称": "贵州茅台", "股票余额": 100,
+                      "可用余额": 100, "成本价": 1150.0, "市价": 1200.0,
+                      "市值": 120_000.0, "盈亏": 5000.0}],
+    }
+
+
+def test_frozen_cash_does_not_break_total_equity_identity():
+    payload = easytrader_source.to_payload(_tables_with_frozen_cash())
+    assert payload["可用资金"] == 30_000.0   # 可负担性过滤仍然只看能动的钱
+    assert payload["现金总额"] == 80_000.0   # 恒等式看含冻结的余额
+    snapshot, issues = ocr_source.validate_payload(
+        payload, name_map={"600519.SH": "贵州茅台"},
+        price_history={"600519.SH": (1180.0, False)})
+    assert not [i for i in issues if i.fatal], [i.message for i in issues]
+    # 快照里的 available_cash 必须是**可用金额**，不能被恒等式那个字段污染 ——
+    # 用 8 万去规划会下出买不起的单。
+    assert snapshot.available_cash == 30_000.0
+    assert snapshot.total_equity == 200_000.0
+
+
+def test_identity_falls_back_to_available_cash_for_ocr_path():
+    """截图 OCR 读不到「资金余额」，没有该字段时退回用可用资金，行为不变。"""
+    snapshot, issues = ocr_source.validate_payload(
+        {"asof": "2026-08-25", "总资产": 150_000.0, "可用资金": 30_000.0,
+         "positions": [{"名称": "贵州茅台", "代码": "600519", "股数": 100, "可用股数": 100,
+                        "成本价": 1150.0, "现价": 1200.0, "市值": 120_000.0, "盈亏": 5000.0}]},
+        name_map={"600519.SH": "贵州茅台"}, price_history={"600519.SH": (1180.0, False)})
+    assert not [i for i in issues if i.fatal]
+    assert snapshot.total_equity == 150_000.0
+
+
+def test_identity_still_catches_real_mismatch():
+    """修的是漏报，不是把校验关掉：真对不上账时仍须报 FATAL。"""
+    tables = _tables_with_frozen_cash()
+    tables["balance"]["资金余额"] = 20_000.0  # 20万 ≠ 2万 + 12万
+    _, issues = ocr_source.validate_payload(
+        easytrader_source.to_payload(tables), name_map={"600519.SH": "贵州茅台"},
+        price_history={"600519.SH": (1180.0, False)})
+    assert any(i.fatal and i.field == "总资产" for i in issues)
