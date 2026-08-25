@@ -32,10 +32,17 @@ def test_paths_are_under_project_root():
 
 
 def test_default_mode_is_advisory():
-    """默认必须是只出清单的顾问模式，绝不能默认碰实盘。"""
-    assert settings.qbg_mode.upper() == "ADVISORY"
-    assert settings.i_confirm_real == 0
-    assert settings.is_live is False
+    """默认必须是只出清单的顾问模式，绝不能默认碰实盘。
+
+    **测代码默认值，不测全局 `settings`**（理由同 test_small_account_defaults）：
+    部署的 `.env` 里 QBG_MODE 是使用者的选择，改成 PAPER 天经地义，
+    不该让测试变红。这条测试守的是**代码契约** —— 一个没有 `.env` 的新环境
+    起来必须是 ADVISORY，绝不能默认就能下单。
+    """
+    defaults = Settings(_env_file=None)
+    assert defaults.qbg_mode.upper() == "ADVISORY"
+    assert defaults.i_confirm_real == 0
+    assert defaults.is_live is False
 
 
 def test_is_live_needs_both_env_locks():
