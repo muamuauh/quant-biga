@@ -350,15 +350,40 @@ def place_order(user, *, code: str, side: str, quantity: int, price: float) -> P
     price_text = f"{float(price):.2f}"
     amount_text = str(int(quantity))
 
+    # **先清掉任何遗留的模态框。**
+    #
+    # 2026-08-25 全链路实测踩到：读持仓会触发反爬验证码，而那个框是**异步**弹的
+    # —— `read_tables` 收尾清理几秒之后它才冒出来。等到这里开始填单时，
+    # 一个模态框正挡在前面，于是 `force_foreground` 到主窗口也没用
+    # （模态框会吃掉所有输入），表现就是「填了代码但客户端没有回填证券名称」。
+    #
+    # 单独跑 probe_ths_order 时一切正常，只有跟在读持仓后面才失败 ——
+    # 这种"只在特定顺序下复现"的故障，不主动清理就只能靠运气。
+    leftovers = cleanup_dialogs()
+    if leftovers:
+        log_event(log, "ths.order.dialogs_cleared_before_fill", detail=leftovers[:3])
+        time.sleep(0.5)
+
     force_foreground(user.main.wrapper_object().handle)
     user._switch_left_menus(MENU[side])
     time.sleep(0.5)
     force_foreground(user.main.wrapper_object().handle)
     _assert_side(user, side)
 
-    fill_field(user, CODE_ID, six)
-    time.sleep(1.2)
-    if not _static(user, NAME_ID).strip():
+    # 填代码后客户端会自动回填证券名称，这是「输入真的被接收了」唯一可靠的
+    # 预言机（控件文本回读恒为空）。重试一次：模态框刚被清掉时客户端可能还没
+    # 缓过来，而这一步失败会中止整批订单，代价太大。
+    for attempt in range(2):
+        fill_field(user, CODE_ID, six)
+        time.sleep(1.2)
+        if _static(user, NAME_ID).strip():
+            break
+        if attempt == 0:
+            log_event(log, "ths.order.name_not_filled_retry", code=six,
+                      cleared=cleanup_dialogs()[:3])
+            force_foreground(user.main.wrapper_object().handle)
+            time.sleep(0.5)
+    else:
         raise OrderFormError(f"填入 {six} 后客户端没有回填证券名称 —— 输入没被接收，中止")
 
     fill_field(user, PRICE_ID, price_text)
