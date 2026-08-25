@@ -46,6 +46,23 @@ BALANCE_COLUMNS = {"总资产": "总资产", "可用金额": "可用资金"}
 _REQUIRED = ("证券代码", "证券名称", "股票余额", "可用余额", "成本价", "市价", "市值")
 
 
+def _as_number(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_closed_out(mapped: dict) -> bool:
+    """这一行是不是「今天清掉的仓」的残留。
+
+    判据要同时看**股数和市值都为 0** —— 只看股数会误伤一种真实情况：
+    股数 > 0 但市值被读成 0（取表出错）。那种情况应该报 FATAL 让人看见，
+    而不是被当成清仓静静丢掉。
+    """
+    return _as_number(mapped.get("股数")) <= 0 and _as_number(mapped.get("市值")) <= 0
+
+
 def to_payload(tables: dict, *, asof: str | None = None) -> dict:
     """同花顺的表 → P5 的 OCR payload 形状，以便复用同一套校验。"""
     balance = tables.get("balance") or {}
@@ -59,6 +76,14 @@ def to_payload(tables: dict, *, asof: str | None = None) -> dict:
         # 同花顺在无持仓时会给出整行空白的占位行（字段全空、数字全 0），
         # 它们不是持仓，直接丢掉；留着会被校验层当成「代码缺失」报一堆假错误。
         if not str(mapped.get("代码") or "").strip() and not str(mapped.get("名称") or "").strip():
+            continue
+        # **当天清仓后的残留行**：代码和名称都还在，但股数/成本价/市值全归零，
+        # 只剩市价和当日盈亏。2026-08-25 实测卖光 601398 之后就是这样：
+        #     股票余额=0 可用余额=0 成本价=0.0 市值=0.0 市价=7.89
+        # 它表示「今天持有过、现在没了」，不是持仓。不滤掉的话会连报三条
+        # FATAL（股数不合理 / 成本价必须>0 / 市值与股数×现价偏差），
+        # 于是整个 load() 抛异常 —— 清仓当天持仓源直接不可用。
+        if _is_closed_out(mapped):
             continue
         positions.append(mapped)
     payload["positions"] = positions

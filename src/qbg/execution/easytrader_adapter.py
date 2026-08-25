@@ -24,6 +24,7 @@ A 股 T+1 下卖出资金当日可用于买入，但**必须等卖单真的成�
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -46,6 +47,17 @@ SIDE_LABEL = {"BUY": "买入", "SELL": "卖出"}
 # 价格比对容差。委托价格回读是浮点数，直接 == 比会被表示误差咬到；
 # A 股最小价位是 0.01，半个价位足够区分「同一笔」和「另一笔」。
 PRICE_TOLERANCE = 0.005
+
+# 提交后回读校验的轮询参数。
+#
+# **必须轮询。** 2026-08-25 实测：一笔卖单实际「全部成交」了，但提交后立刻
+# 读到的当日委托表里还没有它，于是被判成「没下出去」并中止了整批订单。
+# 客户端把委托刷出来需要一点时间（要走一次服务器往返）。
+#
+# 这个方向的误判特别危险 —— 我们以为没下成、实际下成了。上层若据此重试，
+# 就会**重复下单**。取表本身约 10 秒，3 次 × 4 秒间隔足以覆盖实测的延迟。
+VERIFY_ATTEMPTS = 3
+VERIFY_INTERVAL_SEC = 4.0
 
 
 class LiveLockError(RuntimeError):
@@ -284,16 +296,33 @@ class EasytraderAdapter:
             return OrderOutcome(order, False, result.message, dialogs=result.dialogs)
 
         # 回读校验：券商自己的委托记录才是唯一可信的成功判据。
-        try:
-            entrusts = self._entrusts(user)
-        except Exception as exc:  # noqa: BLE001
-            return OrderOutcome(order, False, f"提交后读不到当日委托，无法确认：{exc}",
+        #
+        # **必须轮询，不能读一次就下结论。** 2026-08-25 实测：一笔卖单实际
+        # 「全部成交」了，但提交后立刻读到的委托表里还没有它，于是被判成
+        # 「没下出去」并中止了整批订单。这个方向的误判特别危险 ——
+        # 我们以为没下成、实际下成了，上层若据此重试就会**重复下单**。
+        row, read_ok, last_error = None, False, None
+        for attempt in range(VERIFY_ATTEMPTS):
+            if attempt:
+                time.sleep(VERIFY_INTERVAL_SEC)
+            try:
+                entrusts = self._entrusts(user)
+            except Exception as exc:  # noqa: BLE001 —— 取表本身可能瞬时失败，重试
+                last_error = exc
+                continue
+            read_ok = True
+            # 只在**新出现**的合同编号里找。当日委托里可能已经躺着同参数的旧
+            # 记录（含已撤单的），在全表里找会匹配到它们，然后报告成功并带回
+            # 错误的编号。
+            fresh = [r for r in entrusts
+                     if str(r.get(ENTRUST_ID) or "").strip() not in known_ids]
+            row = find_entrust(fresh, order)
+            if row is not None:
+                break
+        if row is None and not read_ok:
+            # 一次都没读成 —— 这和「读成了但没有这笔」是两回事，别混为一谈。
+            return OrderOutcome(order, False, f"提交后读不到当日委托，无法确认：{last_error}",
                                 dialogs=result.dialogs)
-        # 只在**新出现**的合同编号里找。当日委托里可能已经躺着同参数的旧记录
-        # （含已撤单的），在全表里找会匹配到它们，然后报告成功并带回错误的编号。
-        fresh = [row for row in entrusts
-                 if str(row.get(ENTRUST_ID) or "").strip() not in known_ids]
-        row = find_entrust(fresh, order)
         if row is None:
             # 2026-08-24 实测：同花顺对「T+1 不可卖的卖单」是**静默拒绝** ——
             # 让你走完委托确认、点了「是」，然后什么都不做：不建委托、不报错、

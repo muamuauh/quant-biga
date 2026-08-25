@@ -198,3 +198,43 @@ def test_csv_source_failure_never_degrades(monkeypatch):
         "S", (), {"load": lambda self: (_ for _ in ()).throw(FileNotFoundError("no csv"))})())
     with pytest.raises(FileNotFoundError):
         source_mod.load_portfolio("ocr")
+
+
+# ---------------------------------------------------------------------------
+# 清仓后的残留行
+#
+# 2026-08-25 实测：卖光 601398 之后，持仓表**仍保留一行**，代码和名称都在，
+# 但股数/可用/成本价/市值全归零，只剩市价和当日盈亏。它表示「今天持有过、
+# 现在没了」，不是持仓。不滤掉会连报三条 FATAL，整个 load() 抛异常 ——
+# 清仓当天持仓源直接不可用。
+# ---------------------------------------------------------------------------
+CLOSED_OUT = {"操作": "", "序号": 1, "证券代码": "601398", "证券名称": "工商银行",
+              "股票余额": 0, "可用余额": 0, "冻结数量": 0, "成本价": 0.0,
+              "市价": 7.89, "盈亏": 4.1, "盈亏比例(%)": 0.0, "当日盈亏": 0.0,
+              "当日盈亏比(%)": 0.0, "市值": 0.0, "仓位占比(%)": 0.0,
+              "当日买入": 0, "当日卖出": 100, "交易市场": "上海Ａ股"}
+
+
+def test_closed_out_row_is_dropped():
+    payload = to_payload(_tables([CLOSED_OUT]))
+    assert payload["positions"] == []
+
+
+def test_closed_out_row_does_not_break_load(no_price_check):
+    """清仓当天必须还能正常读出「空仓」，而不是抛异常。"""
+    balance = {**BALANCE, "总资产": 200004.1, "可用金额": 200004.1}
+    snapshot = EasytraderSource(reader=_reader(_tables([CLOSED_OUT], balance))).load()
+    assert snapshot.positions == ()
+    assert snapshot.available_cash == 200004.1
+
+
+def test_real_position_alongside_closed_out(no_price_check):
+    """清掉的那只被滤掉，还持有的那只要留下。"""
+    payload = to_payload(_tables([CLOSED_OUT, _row()]))
+    assert [p["代码"] for p in payload["positions"]] == ["600519"]
+
+
+def test_zero_qty_with_nonzero_value_is_not_dropped():
+    """股数 0 但市值非 0 = 取表出错，该报 FATAL 让人看见，不能当清仓静静丢掉。"""
+    broken = {**CLOSED_OUT, "股票余额": 0, "市值": 783.0}
+    assert len(to_payload(_tables([broken]))["positions"]) == 1

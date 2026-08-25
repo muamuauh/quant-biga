@@ -103,9 +103,28 @@ class MailConfig:
         return missing
 
 
+def normalize_recipients(raw: str) -> str:
+    """把收件人列表规范成 `a@x.com, b@y.com`。
+
+    `smtplib.send_message` 从 To 头解析收件人，逗号分隔本来就支持（含空格、
+    尾随逗号都能正确解析）。但**分号分隔会静默丢掉除第一个以外的所有人** ——
+    只发给第一个，不报错、不告警。而 `a@x.com;b@y.com` 是很常见的写法
+    （Outlook 习惯）。
+
+    所以这里两种分隔符都接受，顺手去重去空。多写一行，换掉一整类
+    「以为通知了两个人、其实只通知了一个」的静默故障。
+    """
+    parts = [p.strip() for chunk in str(raw or "").split(";") for p in chunk.split(",")]
+    seen: list[str] = []
+    for part in parts:
+        if part and part not in seen:
+            seen.append(part)
+    return ", ".join(seen)
+
+
 def load_config() -> MailConfig:
     user = str(settings.smtp_user or "").strip()
-    recipient = str(settings.notify_email_to or "").strip() or user
+    recipient = normalize_recipients(settings.notify_email_to) or user
     return MailConfig(
         enabled=bool(int(settings.notify_email_enabled or 0)),
         host=str(settings.smtp_host or "").strip(),
