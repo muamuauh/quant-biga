@@ -117,9 +117,12 @@ log_event(log, "ingest.fetch.ok", code="600519.SH", rows=1234)
 - [x] **P6** 编排 + 日报 + store
 - [x] **P7** TradingAgents 逐票复核闸（真实调用通过；当前部署已启用，异常 fail-open）
 - [x] **P8** 自动复盘 agent（第三方 OpenAI-compatible 中转；严格 JSON、白名单、八闸、回滚、熔断；真实复盘通过）
-- [ ] **P9** easytrader 接管持仓与下单（见 `plan.md` §2.2.1/§7-P9）
-      - [x] **P9a 只读持仓**（已接入 `daily_cycle`；待有持仓后验证取值）
-      - [ ] P9b 下单  - [ ] P9c 编排接入
+- [x] **P9** easytrader 接管持仓与下单（见 `plan.md` §2.2.1/§7-P9）
+      - [x] **P9a 只读持仓**（模拟账户实测：4 行取表、T+1 可卖量、清仓残留行过滤）
+      - [x] **P9b 下单**（三道校验：填单前回读 → 确认框解析 → 提交后
+            `today_entrusts` 按合同编号比对。模拟账户实下 3 笔通过）
+      - [x] **P9c 编排接入**（`daily_cycle._submit_to_broker`；持仓读不到时
+            `broker_refusal` 拒绝下单）
 
 出站邮件通知已接入日流程；SMTP 未配置时静默跳过，任何邮件失败不得影响清单和风控。
 当前没有入站邮件命令通道，邮件回复不得进入交易路径。
@@ -184,3 +187,73 @@ python tools/probe_ths.py                    # 只读四表 + 字段对照
 1047 表格）。同花顺重排控件就会失效，**而且失效往往是静默的** ——
 读到空表，或把数字打进错误的框。所以下单后**必须回读 `today_entrusts` 校验**
 代码/方向/数量/价格，不一致立即停止后续订单。
+
+---
+
+## 八、定时运行（Windows 计划任务）
+
+**详见 `docs/windows-schedule.md`。** 这里只记纪律。
+
+```
+scripts/preflight.ps1      Clash 代理/TUN + 同花顺 + qbg 环境预检（不跑流程）
+run_daily.ps1              锁 → 预检 → daily_cycle → 原样传出退出码
+scripts/setup_schedule.ps1 注册**两个**计划任务
+```
+
+`run_daily.bat` / `setup_schedule.bat` 只是双击用的壳。
+
+### 为什么是两个任务、为什么是 09:15 / 09:30
+
+```
+09:15  quant_biga_preflight   起 Clash + 同花顺，开系统代理/TUN
+       ↓  这 15 分钟是留给**人工登录同花顺**的 —— 脚本做不到这件事
+09:30  quant_biga_daily       预检（幂等重跑）→ 拉数 → 打分 → 复核 → 下单
+```
+
+**09:30 不是随便选的。** `configs/risk_limits.yaml` 的 `require_trading_session`
+随 P9c 改成了 `true`，而它是硬闸 —— 盘前跑会被 `session_guard` 一票否决，
+当天什么都不做。07:30 是半自动时代的值（盘前出清单、开盘人工执行）。
+**不要为了早点成交把时间往前提**：硬闸是流程跑到一半才判的，
+非交易时段会让整天作废，而那时 LLM 复核的钱已经花掉了。
+
+预检跑两遍是**故意的**，它从设计上就幂等：代理/TUN 检测到开着就不发热键
+（热键是 toggle，发偶数次等于没发）、同花顺在跑就只报告、端口在监听就跳过
+等待。预检的退出码 `1` 是「有告警但可以跑」，**不是失败**。
+
+### 三条不许简化的地方
+
+1. **退出码原样传出**。`0` 正常（含安静跳过）、`2` 硬闸中止、`127` 连解释器
+   都没找到、其他为异常。`127` 尤其要留：那时 Python 根本没跑，
+   `notify_failure` 的邮件链是断的，计划任务的 `LastTaskResult` 是唯一痕迹。
+
+2. **交易日闸看输出，不看退出码**。`00_market_check.py` 的退出码 `1` 既可能是
+   「休市」也可能是「脚本自己崩了」，拿它当判据会让一次 import 错误安静地跳过
+   一个真正的交易日。只有明确读到 `'trading_day': False` 才跳过。
+
+3. **代理/TUN 失败只告警，不阻断**。行情走 BaoStock（境内直连），代理只服务
+   P7/P8 的 LLM 中转站，而那两条链路本来就 fail-open。这一点和
+   `quant-trading` 相反 —— 那边 OpenD 端口不通是真的没法交易。
+
+### 会话感知：热键和 UI 自动化都要先判会话
+
+SendKeys 只能送到**同一个交互会话**里的 Clash；同花顺自动化同理。
+在 session 0（「不管用户是否登录」的任务）或锁屏时，两者都是**静默失败**。
+`preflight.ps1` 因此先判会话（session id / explorer / LogonUI / Clash 在哪个
+会话），判不过就不发热键，改走注册表兜底或如实告警。
+
+**注册表兜底必须有端口守卫**：把系统代理指向一个没在监听的端口会让整机 HTTP
+断网，而且表现是「网坏了」，没人会往这个脚本上想。
+
+### 两个不许动的地方
+
+- `setup_schedule.ps1` **拒绝** `qtf_*` / `qtagent_*` 开头的任务名（两个任务名
+  都查）。那是兄弟仓库的任务（§一），而且它那两个正好也叫 `qtf_daily` /
+  `qtf_preflight` —— 覆盖是静默的。
+- 计划任务的 `RunLevel` 固定 `Limited`。同花顺以普通权限跑，Python 也必须是
+  普通权限，否则 UIPI 静默丢输入（§七）。
+
+### 三个 `.ps1` 必须带 UTF-8 BOM
+
+计划任务用 System32 的 `powershell.exe`（5.1），没有 BOM 它按 GBK 读，
+中文全乱。**不要**改用 `pwsh.exe`：本机那份装在 WindowsApps 下，是应用执行
+别名，session 0 里解析不开，报的还是「找不到文件」。

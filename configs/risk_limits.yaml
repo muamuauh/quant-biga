@@ -11,9 +11,16 @@
 allow_live_mode: false
 
 # --- 交易时段 ---
-# 顾问模式是盘后跑、次日人工执行，所以默认关掉时段检查。
-# 将来接 PAPER/LIVE 自动下单时必须改成 true。
-require_trading_session: false
+# 2026-08-25 随 P9c（券商自动下单）接通改为 true。
+#
+# 这是**硬闸**：非交易时段一票否决，当天什么都不做。所以它直接决定了计划任务
+# 的触发时间 —— 盘前 07:30 那套是半自动时代的值（出清单给人工执行），
+# 自动下单必须在盘中，现在是 09:30（见 docs/windows-schedule.md）。
+#
+# 改回 false 只有一种正当理由：退回顾问模式，盘后跑、次日人工执行。
+# 那种情况下 QBG_MODE 也该是 ADVISORY —— 两者要一起改，否则就是在盘后
+# 往券商发单。
+require_trading_session: true
 
 # --- 仓位 ---
 # 单票上限。k=3 等权是 0.30，留一点余量给 renormalize 之后的偏移；
