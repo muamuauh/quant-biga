@@ -10,6 +10,8 @@ reports/
 logs/
 # 邮件模板参考件：可能是真实日报的渲染样张，含账户金额。留本地不入库。
 mail_template.pdf
+# 收到的日报邮件（含真实账户金额）—— 和 reports/ 同一条规矩：账户数据不入库
+mail/
 *.mail-sample.pdf
 
 # --- 数据与产物：可重新生成 ---
