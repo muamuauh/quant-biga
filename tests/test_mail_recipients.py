@@ -107,3 +107,30 @@ def test_subject_distinguishes_unverified_from_failed():
         {"ok": False, "verified": False}]})
     assert "待人工核对" in tag
     assert "下单失败" not in tag
+
+
+# ---------------------------------------------------------------------------
+# store 的 runs 表没有 broker / portfolio 两列，而主题最要紧的信息恰恰在那里。
+# 2026-08-26 实测：两笔单真的进了券商并回读通过，主题却是「已生成清单2笔」；
+# 而 08:43 那次一笔都没成功，主题也是同一句式 —— 完全区分不出来。
+# ---------------------------------------------------------------------------
+def test_digest_merges_broker_facts_from_the_run_result():
+    from qbg.notify.digest import build_digest
+    store_row = {"submitted": 1, "hard_ok": 1}          # store 里有的那些列
+    result = {"date": "2026-08-26", "mode": "PAPER",
+              "allowed_orders": [{}, {}],
+              "broker": {"ok": True, "outcomes": [{"ok": True}, {"ok": True}]}}
+    subject, _body = build_digest("2026-08-26", "PAPER",
+                                  db_path=None, fallback_run=result)
+    assert "已生成清单" not in subject, "store 行盖住了券商回执"
+    assert "券商已接单2笔" in subject
+
+
+def test_digest_merges_portfolio_degradation():
+    from qbg.notify.digest import build_digest
+    result = {"date": "2026-08-26", "mode": "PAPER", "allowed_orders": [{}],
+              "portfolio": {"source": "default", "degraded": {"reason": "对不上账"}},
+              "broker": {"ok": True, "outcomes": [{"ok": True}]}}
+    subject, _body = build_digest("2026-08-26", "PAPER",
+                                  db_path=None, fallback_run=result)
+    assert "持仓读不到" in subject

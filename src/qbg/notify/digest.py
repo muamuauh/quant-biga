@@ -300,12 +300,22 @@ def build_digest(when: str | None = None, mode: str | None = None,
     mode = str(mode or settings.qbg_mode).upper()
 
     run = _safe(lambda: run_row(when, mode, db_path), "runs") or fallback_run
-    # 订单列表 store 里**根本没有**（只有 plans 存目标持仓），所以从调用方那里
-    # 叠加过来不构成"真相源打架"——它是纯附加信息。没有它主题只能说"目标3只"，
-    # 而人真正要知道的是"今天要敲 8 笔单"。
-    # TODO: 更彻底的做法是给 store 加一张 orders 表，这样补发历史邮件也有单数。
-    if run is not None and fallback_run and "allowed_orders" in fallback_run:
-        run = {**run, "allowed_orders": fallback_run["allowed_orders"]}
+    # 下面这几项 store 的 `runs` 表里**根本没有对应的列**，所以从调用方那里
+    # 叠加过来不构成"真相源打架"——它是纯附加信息：
+    #
+    #   allowed_orders  只有 plans 存目标持仓，没有订单笔数。没有它主题只能说
+    #                   "目标3只"，而人真正要知道的是"今天要敲 8 笔单"。
+    #   broker          券商回执（接了几笔、有没有确认不了的）。**没有它，主题
+    #                   永远只会说"已生成清单N笔"** —— 2026-08-26 实测：两笔单
+    #                   真的进了券商并回读通过，主题却还是"已生成清单2笔"，
+    #                   而 08:43 那次一笔都没成功，主题也是同一句式。
+    #   portfolio       持仓来源与降级。持仓读不到时主题必须喊出来。
+    #
+    # TODO: 更彻底的做法是给 store 加 orders / broker 两张表，
+    #       这样补发历史邮件也有这些事实。
+    _FROM_RESULT = ("allowed_orders", "broker", "portfolio", "skipped_reason")
+    if run is not None and fallback_run:
+        run = {**run, **{k: fallback_run[k] for k in _FROM_RESULT if k in fallback_run}}
     equity = _safe(lambda: equity_row(when, mode, db_path), "equity")
     finds = _safe(lambda: findings(when, mode, db_path), "findings") or []
     due = _safe(lambda: due_hypotheses(when, mode, db_path), "hypotheses") or []

@@ -70,13 +70,19 @@ class OrderOutcome:
     ok: bool
     message: str
     entrust_no: str = ""
+    # **下面两个字段是 keyword-only 的**，这是刻意的：`verified` 是后加的，
+    # 而 2026-08-26 加它的时候有个调用点还在用位置参数传 dialogs ——
+    # 于是一整串对话框文本落进了 `verified`。那个方向很危险：
+    # 非空列表不是 `False`，`verified is False` 的判断就失效，
+    # 「确认不了」会被当成「确实被拒」，而后者的建议是补单。
+    #
     # 回读是否**可信**。区分三种状态，别塌缩成 ok/not ok 两种：
     #   ok=True                成功，券商记录里确实有这一笔
     #   ok=False verified=True 确实被拒（读到了别的委托，就是没有这笔）
     #   ok=False verified=False **确认不了**（读不到/读到空表）——
     #                           可能已成交，绝不能据此重试
-    verified: bool = True
-    dialogs: list[str] = field(default_factory=list)
+    verified: bool = field(default=True, kw_only=True)
+    dialogs: list[str] = field(default_factory=list, kw_only=True)
 
     def as_dict(self) -> dict:
         return {"code": self.order.code, "side": self.order.side,
@@ -394,4 +400,5 @@ class EasytraderAdapter:
         entrust_no = str(row.get(ENTRUST_ID) or "")
         log_event(log, "ths.order.verified", code=order.code, side=order.side,
                   quantity=order.quantity, price=order.price, entrust_no=entrust_no)
-        return OrderOutcome(order, True, "已提交且回读校验通过", entrust_no, result.dialogs)
+        return OrderOutcome(order, True, "已提交且回读校验通过", entrust_no,
+                            dialogs=result.dialogs)
