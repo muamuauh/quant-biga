@@ -32,6 +32,19 @@ from qbg.utils.logging import get_logger, log_event
 
 log = get_logger("qbg.orchestrator.daily_cycle")
 
+# 早退的宽限窗口。
+#
+# 判据不是"现在离开盘还有多久"，而是**"等我们跑到判闸那一刻，市场开没开"**——
+# 从启动到 run_all_gates 要走完拉数、打分、LLM 逐票复核，实测 5-8 分钟。
+# 所以开盘在 5 分钟以内的就照常往下跑，等判闸时它早开了。
+#
+# 别把这个值调大。设成 15 会让 09:16 启动的那次跑完整条流程（含 LLM），
+# 到 09:24 判闸时市场还没开 —— 钱花了，结果扔了，正是这个早退要避免的事。
+#
+# 被早退跳过也不会丢掉一天：早退**不写当日幂等标记**（save_marker 只在
+# hard_ok 分支里调），09:30 那个日触发器照样会正常跑一遍。
+SESSION_GRACE_MINUTES = 5
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
@@ -51,6 +64,28 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     if not force and already_completed_today(today):
         result["skipped_reason"] = "already_completed_today"
         return _finish(result, dry_run)
+
+    # 交易时段早退。
+    #
+    # `session_guard` 是硬闸，但它在流程**跑到一半**才判 —— 拉数、打分、
+    # LLM 逐票复核都做完了才发现"不在交易时段"，然后整天作废。那几毛钱和
+    # 五到八分钟是白花的，而且每次都会发一封「⚠ 硬闸中止」的邮件。
+    #
+    # 2026-08-26 实测触发这条：计划任务的"登录后 3 分钟"触发器在 08:40
+    # 跑了一次（盘前 50 分钟），全程跑完才被闸拦下。那天恰好 risk-off 没调
+    # LLM，算是运气好。
+    #
+    # 用「多久以后开盘」而不是「现在开没开」：09:30:00 触发的任务可能因为
+    # 几秒时钟偏差落在 09:29:5x，那时 in_session() 还是 False，
+    # 按它早退会把**一整个交易日**跳过去。
+    limits = load_limits()
+    if not force and limits.get("require_trading_session", False):
+        wait = calendar.minutes_until_session()
+        if wait is None or wait > SESSION_GRACE_MINUTES:
+            result["skipped_reason"] = "not_trading_session"
+            log_event(log, "cycle.skipped.not_trading_session",
+                      minutes_until_session=wait)
+            return _finish(result, dry_run)
     if not skip_ingest:
         subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "01_ingest.py"),
                         "--skip-meta"], check=True)
@@ -104,7 +139,6 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         previous[code] = float(frame.iloc[-2].close if len(frame) > 1 else row.close)
         st[code], suspended[code] = bool(row.is_st), bool(row.is_suspended)
         dates.append(pd.Timestamp(row.date))
-    limits = load_limits()
     filtered = affordable_scores(scores, last, equity, settings.qbg_top_k,
                                  cap=float(limits["max_position_pct"]))
     risk_on = market_risk_on(list(last), settings.qbg_market_sma)
@@ -129,7 +163,12 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         target_weights=targets, orders=orders, current_cash=cash, total_equity=equity,
         today_pnl=0, latest_data_date=max(dates) if dates else None, asof=today,
         prev_close=previous, market_price=last, is_st=st, suspended=suspended,
-        sellable_qty=sellable, current_qty=current, limits=limits)
+        sellable_qty=sellable, current_qty=current, limits=limits,
+        # **这个参数以前没传。** 它默认 None，而 session_guard 对 None 返回
+        # False —— 于是 require_trading_session 一改成 true，这个硬闸就在
+        # 任何时间都必然失败，系统永远不下单。和此前写死 AdvisoryAdapter、
+        # 写死 ManualSource 是同一类问题：配置项存在，但没人读。
+        session_open=calendar.in_session())
     result.update(market_risk_on=risk_on, targets=targets, hard_ok=hard_ok,
                   agent_verdicts=review_verdicts, agent_usage=review_usage,
                   orders=[o.as_dict() for o in orders], allowed_orders=[o.as_dict() for o in allowed],

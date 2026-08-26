@@ -215,6 +215,9 @@ def daily_report_path(when: str) -> Path | None:
 SKIP_LABELS = {
     "not_rebalance_day": "监控日",
     "not_trading_day": "非交易日",
+    # 盘前/盘后触发的安静跳过**不是故障**，主题不带 ⚠。每天登录都收到一封
+    # 像出事了的邮件，人很快就不看邮件了 —— 而这套系统的安全网全靠人看邮件。
+    "not_trading_session": "非交易时段·已跳过",
     "already_completed_today": "今日已运行",
 }
 

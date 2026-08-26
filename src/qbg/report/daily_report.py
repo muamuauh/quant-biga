@@ -24,6 +24,7 @@ def _status(result: dict) -> str:
     labels = {
         "not_rebalance_day": "监控日",
         "not_trading_day": "非交易日",
+        "not_trading_session": "非交易时段",
         "already_completed_today": "今日已完成",
     }
     if skipped:
@@ -91,6 +92,11 @@ def _headline(result: dict) -> str:
     skipped = result.get("skipped_reason")
     if skipped == "not_rebalance_day":
         base = "今日为监控日：已更新账户与持仓事实，不生成新的调仓订单。"
+    elif skipped == "not_trading_session":
+        # 这不是故障。自动下单要求在盘中，盘前/盘后触发就安静跳过 ——
+        # 说清楚它是**预期行为**，否则每次登录都收到一封像出事了的邮件。
+        base = ("当前不在交易时段，已提前退出（自动下单必须在盘中）。"
+                "这是预期行为，不是故障；下一个交易时段内的计划任务会正常执行。")
     elif skipped:
         base = f"本次流程未执行：{_status(result)}。"
     elif not result.get("hard_ok", True):
