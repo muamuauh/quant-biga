@@ -24,7 +24,15 @@ log = get_logger(__name__)
 IMPLICIT_TLS_PORTS = (465, 8465)
 # 这两种状态没有执行任何日流程，发信只会制造周末/重复运行噪音。监控日确实读取了
 # 账户并生成报告，所以 deliberately 不在此集合中。
-QUIET_SKIPS = frozenset({"not_trading_day", "already_completed_today"})
+# 这些跳过**不发邮件**。共同点：它们都不是"今天本该发生什么但没发生"，
+# 而是"今天本来就不该发生什么"。
+#
+# not_trading_session 是 2026-08-26 加的：计划任务的"登录后 3 分钟"触发器会在
+# 盘前跑一次（那天是 08:40），而自动下单必须在盘中。每天登录都收到一封邮件，
+# 人很快就不看邮件了 —— 而这套系统的安全网全靠人看邮件。
+# 当天真正的那次运行在 09:30，它会照常发信。
+QUIET_SKIPS = frozenset({"not_trading_day", "already_completed_today",
+                         "not_trading_session"})
 
 EMAIL_CSS = """
 body { background:#f4f6f8; margin:0; padding:24px 12px;

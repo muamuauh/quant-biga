@@ -134,3 +134,30 @@ def test_digest_merges_portfolio_degradation():
     subject, _body = build_digest("2026-08-26", "PAPER",
                                   db_path=None, fallback_run=result)
     assert "持仓读不到" in subject
+
+
+def test_out_of_session_skip_sends_no_email_at_all():
+    """盘前触发的跳过**不发信**。
+
+    计划任务的"登录后 3 分钟"触发器每天早上都会跑一次（实测 08:40），
+    而自动下单必须在盘中。每天登录都收到一封邮件，人很快就不看邮件了 ——
+    而这套系统的安全网全靠人看邮件。当天真正那次在 09:30，它会照常发。
+    """
+    from qbg.notify.mailer import QUIET_SKIPS
+    assert "not_trading_session" in QUIET_SKIPS
+
+
+def test_store_row_still_wins_for_skipped_reason():
+    """`runs` 表自己有 skipped_reason 这一列 —— 不能被调用方的值盖过。
+
+    只有 store **根本没有的列**（broker / portfolio / allowed_orders）
+    才从 result 叠加。
+    """
+    from qbg.notify.digest import build_digest
+    _subject, _body = build_digest("2026-08-26", "PAPER", db_path=None,
+                                   fallback_run={"skipped_reason": "not_rebalance_day"})
+    import inspect
+
+    from qbg.notify import digest
+    src = inspect.getsource(digest.build_digest)
+    assert '"skipped_reason"' not in src.split("_FROM_RESULT")[1].split(")")[0]

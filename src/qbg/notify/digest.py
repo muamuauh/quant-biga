@@ -311,9 +311,12 @@ def build_digest(when: str | None = None, mode: str | None = None,
     #                   而 08:43 那次一笔都没成功，主题也是同一句式。
     #   portfolio       持仓来源与降级。持仓读不到时主题必须喊出来。
     #
+    # **skipped_reason 不在这份名单里**：runs 表自己就有这一列，叠加会让调用方
+    # 手里的值盖过真相源（见 test_fallback_run_used_only_when_store_has_nothing）。
+    #
     # TODO: 更彻底的做法是给 store 加 orders / broker 两张表，
     #       这样补发历史邮件也有这些事实。
-    _FROM_RESULT = ("allowed_orders", "broker", "portfolio", "skipped_reason")
+    _FROM_RESULT = ("allowed_orders", "broker", "portfolio")
     if run is not None and fallback_run:
         run = {**run, **{k: fallback_run[k] for k in _FROM_RESULT if k in fallback_run}}
     equity = _safe(lambda: equity_row(when, mode, db_path), "equity")
