@@ -99,3 +99,11 @@ def test_advisory_subject_no_longer_claims_submission():
     """顾问模式只是生成清单，说「已提交」会让人以为单子下出去了。"""
     tag = _tag()
     assert "已生成清单3笔" == tag
+
+
+def test_subject_distinguishes_unverified_from_failed():
+    """「确认不了」比「失败」严重：失败可以补单，确认不了不能碰。"""
+    tag = _tag(broker={"ok": False, "outcomes": [
+        {"ok": False, "verified": False}]})
+    assert "待人工核对" in tag
+    assert "下单失败" not in tag

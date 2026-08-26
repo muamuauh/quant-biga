@@ -146,15 +146,55 @@ def test_sell_orders_go_first(monkeypatch):
     assert [c["side"] for c in calls] == ["SELL", "BUY"]
 
 
-def test_missing_entrust_halts_remaining_orders(monkeypatch):
-    """回读找不到 —— 这笔可能根本没下出去，必须停掉后面所有单。"""
+def _other_entrust(code="600000.SH", eid="9999"):
+    """一笔和我们无关的委托 —— 用来证明「表读到了，只是没有我们那笔」。"""
+    return {"证券代码": code[:6], "证券名称": "别人", "操作": "买入",
+            "委托数量": 200, "委托价格": 10.0, "合同编号": eid, "备注": "已报"}
+
+
+def test_rejected_order_halts_remaining_orders(monkeypatch):
+    """表里读到了别的委托、就是没有我们这笔 —— 这才是券商拒单的样子。"""
     orders = [_order(), _order(code="000001.SZ"), _order(code="000002.SZ")]
-    adapter, calls = _adapter(monkeypatch, entrusts=[])      # 委托表空
+    adapter, calls = _adapter(monkeypatch, entrusts=[_other_entrust()])
     result = adapter.submit(orders, "2026-08-21")
     assert not result.ok
     assert result.submitted == 0
     assert len(calls) == 1, "第一笔就该停，不该继续下第二笔"
     assert "没有出现这一笔" in result.message
+    assert result.outcomes[0]["verified"] is True, "读到了真实记录，这个判断是可信的"
+
+
+def test_empty_entrust_table_is_unverified_not_rejected(monkeypatch):
+    """**读不到 ≠ 没下成。**
+
+    2026-08-26 实测：一笔卖单全部成交（合同 6222104175），三次回读却都读到
+    空表，于是被报成「没下出去」并中止了整批订单。那个方向的误判最危险 ——
+    上层若据此重试就是**重复卖出**。
+
+    我们刚走完委托确认框，委托表却一行真实记录都没有，这不可能是"券商拒了"
+    的样子（拒了也该看得到别人的单），只可能是这次取表不可信。
+    所以既不说成功也不说失败，如实说"确认不了"，并明确叫人别重试。
+    """
+    orders = [_order(), _order(code="000001.SZ"), _order(code="000002.SZ")]
+    adapter, calls = _adapter(monkeypatch, entrusts=[])      # 委托表读到空
+    result = adapter.submit(orders, "2026-08-21")
+    assert not result.ok
+    assert result.submitted == 0
+    assert len(calls) == 1
+    assert result.outcomes[0]["verified"] is False, "空表不构成「没下成」的证据"
+    assert "无法确认" in result.message
+    assert "不要直接重试" in result.message
+    assert "没有出现这一笔" not in result.message, "别说得像是确认过它不存在"
+
+
+def test_blank_placeholder_rows_do_not_count_as_a_real_read(monkeypatch):
+    """同花顺的空白占位行不算「读到了内容」—— 全是占位行等同于空表。"""
+    blank = {"证券代码": "", "证券名称": "", "操作": "", "委托数量": 0,
+             "委托价格": 0.0, "合同编号": "", "备注": ""}
+    adapter, _calls = _adapter(monkeypatch, entrusts=[blank, blank, blank])
+    result = adapter.submit([_order()], "2026-08-21")
+    assert result.outcomes[0]["verified"] is False
+    assert "无法确认" in result.message
 
 
 def test_form_error_halts_remaining_orders(monkeypatch):

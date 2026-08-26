@@ -70,12 +70,18 @@ class OrderOutcome:
     ok: bool
     message: str
     entrust_no: str = ""
+    # 回读是否**可信**。区分三种状态，别塌缩成 ok/not ok 两种：
+    #   ok=True                成功，券商记录里确实有这一笔
+    #   ok=False verified=True 确实被拒（读到了别的委托，就是没有这笔）
+    #   ok=False verified=False **确认不了**（读不到/读到空表）——
+    #                           可能已成交，绝不能据此重试
+    verified: bool = True
     dialogs: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {"code": self.order.code, "side": self.order.side,
                 "quantity": self.order.quantity, "price": self.order.price,
-                "ok": self.ok, "message": self.message,
+                "ok": self.ok, "message": self.message, "verified": self.verified,
                 "entrust_no": self.entrust_no, "dialogs": self.dialogs}
 
 
@@ -302,6 +308,7 @@ class EasytraderAdapter:
         # 「没下出去」并中止了整批订单。这个方向的误判特别危险 ——
         # 我们以为没下成、实际下成了，上层若据此重试就会**重复下单**。
         row, read_ok, last_error = None, False, None
+        real_rows = 0            # 读到的**非空白**委托行数
         for attempt in range(VERIFY_ATTEMPTS):
             if attempt:
                 time.sleep(VERIFY_INTERVAL_SEC)
@@ -311,6 +318,7 @@ class EasytraderAdapter:
                 last_error = exc
                 continue
             read_ok = True
+            real_rows = max(real_rows, sum(1 for r in entrusts if not _is_blank_row(r)))
             # 只在**新出现**的合同编号里找。当日委托里可能已经躺着同参数的旧
             # 记录（含已撤单的），在全表里找会匹配到它们，然后报告成功并带回
             # 错误的编号。
@@ -319,21 +327,54 @@ class EasytraderAdapter:
             row = find_entrust(fresh, order)
             if row is not None:
                 break
+            # 没匹配上就把**实际看到的**记下来。不记的话，事后完全无法区分
+            # 「委托表是空的」和「表里有别的单但都对不上」—— 2026-08-26 那次
+            # 就是因为没有这行日志，只能靠事后手工重读客户端才发现单其实成交了。
+            log_event(log, "ths.order.verify_miss", attempt=attempt, code=order.code,
+                      rows=len(entrusts), real_rows=real_rows, fresh=len(fresh),
+                      seen=[{"code": r.get(ENTRUST_CODE), "side": r.get(ENTRUST_SIDE),
+                             "qty": r.get(ENTRUST_QTY), "price": r.get(ENTRUST_PRICE),
+                             "id": r.get(ENTRUST_ID)}
+                            for r in fresh if not _is_blank_row(r)][:5])
         if row is None and not read_ok:
             # 一次都没读成 —— 这和「读成了但没有这笔」是两回事，别混为一谈。
             return OrderOutcome(order, False, f"提交后读不到当日委托，无法确认：{last_error}",
-                                dialogs=result.dialogs)
+                                dialogs=result.dialogs, verified=False)
+        if row is None and real_rows == 0:
+            # **读不到 ≠ 没下成。**
+            #
+            # 我们刚刚走完了委托确认框，当日委托表却一行真实记录都没有 ——
+            # 这不可能是"券商拒绝了"的样子（拒绝了也该看得到别人的单，
+            # 何况今天早些时候的单也会在），只可能是这次取表不可信：
+            # 剪贴板没被覆盖、弹窗挡住了表格、或者读到了别的网格。
+            #
+            # 2026-08-26 实测：一笔卖单**全部成交**（合同 6222104175），
+            # 而三次回读都读到空表，于是被报成「没下出去」并中止了整批订单。
+            # 那个方向的误判最危险 —— 上层若据此重试就是**重复卖出**。
+            #
+            # 所以这里既不说成功也不说失败，如实说"确认不了"，
+            # 并且明确叫人**不要重试**。
+            log_event(log, "ths.order.unverified", code=order.code, side=order.side,
+                      quantity=order.quantity, price=order.price)
+            return OrderOutcome(
+                order, False,
+                "⚠ 无法确认：提交后当日委托表读到 0 行真实记录 —— 这是取表不可信的表现，"
+                "**不是**券商拒单的证据。这笔单可能已经成交。"
+                "请到同花顺「今日委托」人工核对后再决定，**不要直接重试**（会重复下单）。"
+                "已停止后续订单。",
+                dialogs=result.dialogs, verified=False)
         if row is None:
+            # 读到了别人的委托、就是没有这一笔 —— 这才是拒单的样子。
             # 2026-08-24 实测：同花顺对「T+1 不可卖的卖单」是**静默拒绝** ——
             # 让你走完委托确认、点了「是」，然后什么都不做：不建委托、不报错、
             # 不弹任何拒绝提示（只弹了个无关的营销框）。
-            # 所以这里既不能报「成功」，也没法说出拒绝理由，只能如实描述。
             return OrderOutcome(
                 order, False,
-                "提交后当日委托里没有出现这一笔（代码/方向/数量/价格四项全对的新记录）。"
+                f"提交后当日委托里没有出现这一笔（表里有 {real_rows} 行其他记录，"
+                "代码/方向/数量/价格四项全对的新记录一条都没有）。"
                 "客户端也没有给出拒绝理由 —— 同花顺对这类拒绝是静默的（实测 T+1 不可卖时如此）。"
                 "已停止后续订单。常见原因：可用股份/资金不足、超出涨跌停、非交易时段",
-                dialogs=result.dialogs)
+                dialogs=result.dialogs, verified=True)
         entrust_no = str(row.get(ENTRUST_ID) or "")
         log_event(log, "ths.order.verified", code=order.code, side=order.side,
                   quantity=order.quantity, price=order.price, entrust_no=entrust_no)

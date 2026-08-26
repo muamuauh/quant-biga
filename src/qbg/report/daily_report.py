@@ -78,6 +78,9 @@ def _outcome_facts(result: dict) -> list[str]:
             facts.append(f"券商已接单 {ok}/{planned} 笔并通过回读校验")
         elif ok:
             facts.append(f"券商只接了 {ok}/{planned} 笔，其余失败或未尝试")
+        elif any(o.get("verified") is False for o in outcomes):
+            facts.append("🔴 下单结果**无法确认**（回读不可信）——"
+                         "可能已成交，先人工核对再决定，别补单")
         else:
             facts.append(f"⚠ 下单全部未成功（0/{planned} 笔）")
     return facts
@@ -258,9 +261,22 @@ def _broker_section(result: dict) -> list[str]:
     if untried:
         header += f"（其中 {untried} 笔因中止未尝试）"
     lines = ["## 计划 vs 实际委托", "", header, ""]
+    # **「确认不了」和「确实被拒」要分开说，因为该做的事完全相反。**
+    # 被拒 -> 可以补单；确认不了 -> 可能已经成交，补单就是重复下单。
+    # 2026-08-26 实测：一笔卖单全部成交（合同 6222104175），回读却读到空表，
+    # 被报成失败。当时日报只说「请人工核对后决定是否补单」，
+    # 而正确的提示应该是「先去客户端看这笔在不在，别急着补」。
+    unverified = [o for o in outcomes if not o.get("ok") and o.get("verified") is False]
+    if unverified:
+        lines += ["> 🔴 **有订单无法确认状态**（回读不可信，不是券商拒单的证据）："
+                  f"{'、'.join(str(o.get('code')) for o in unverified)}",
+                  "> **这些单可能已经成交。** 请先到同花顺「今日委托」核对，"
+                  "**不要直接补单** —— 补单会变成重复下单。", ""]
     if not broker.get("ok"):
-        lines += [f"> ⚠️ **下单未全部成功**：{_cell(str(broker.get('message') or ''))}",
-                  "> 顾问清单仍然有效，请人工核对后决定是否补单。", ""]
+        lines += [f"> ⚠️ **下单未全部成功**：{_cell(str(broker.get('message') or ''))}"]
+        if not unverified:
+            lines.append("> 顾问清单仍然有效，请人工核对后决定是否补单。")
+        lines.append("")
     if outcomes:
         lines += ["|代码|方向|股数|委托价|结果|合同编号|说明|", "|---|---|---:|---:|---|---|---|"]
         for item in outcomes:

@@ -259,6 +259,10 @@ def status_tag(run: dict | None, finds: list[dict], failure: dict | None) -> str
     if broker is not None:
         ok = sum(1 for o in (broker.get("outcomes") or []) if o.get("ok"))
         planned = n_orders if n_orders is not None else len(broker.get("outcomes") or [])
+        outcomes = broker.get("outcomes") or []
+        if any(o.get("verified") is False for o in outcomes):
+            # 「确认不了」比「失败」严重：失败可以补单，确认不了不能碰。
+            return "🔴 下单结果待人工核对"
         if ok == 0:
             return f"⚠ 下单失败 0/{planned}笔"
         if ok < planned:

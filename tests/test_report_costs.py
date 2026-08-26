@@ -253,3 +253,46 @@ def test_subtitle_does_not_claim_success_either():
     from qbg.report.daily_report import _status
     assert _status(FAILED_RUN) == "⚠ 下单失败 0/3 笔"
     assert "已生成清单" not in render(FAILED_RUN).split("## 概览")[0]
+
+
+# ---------------------------------------------------------------------------
+# 「确认不了」和「确实被拒」必须分开显示 —— 该做的事完全相反。
+# 被拒 -> 可以补单；确认不了 -> 可能已成交，补单就是重复下单。
+#
+# 2026-08-26 实测：一笔卖单全部成交（合同 6222104175），回读读到空表被判失败。
+# 当时日报只说「请人工核对后决定是否补单」，而正确提示是「先看在不在，别急着补」。
+# ---------------------------------------------------------------------------
+UNVERIFIED_RUN = {
+    "date": "2026-08-26", "hard_ok": True, "execution_mode": "PAPER", "submitted": True,
+    "allowed_orders": [{"code": "002384.SZ", "side": "SELL", "quantity": 100,
+                        "notional": 19046.0}],
+    "broker": {"ok": False, "submitted": 0, "message": "⚠ 无法确认：读到 0 行真实记录",
+               "outcomes": [{"code": "002384.SZ", "side": "SELL", "quantity": 100,
+                             "price": 190.46, "ok": False, "verified": False,
+                             "entrust_no": "", "message": "⚠ 无法确认"}]},
+}
+
+
+def test_report_separates_unverified_from_rejected():
+    text = render(UNVERIFIED_RUN)
+    assert "无法确认状态" in text
+    assert "可能已经成交" in text
+    assert "不要直接补单" in text
+    assert "请人工核对后决定是否补单" not in text, "确认不了时不该建议补单"
+
+
+def test_rejected_order_still_suggests_manual_topup():
+    rejected = {**UNVERIFIED_RUN,
+                "broker": {**UNVERIFIED_RUN["broker"],
+                           "outcomes": [{**UNVERIFIED_RUN["broker"]["outcomes"][0],
+                                         "verified": True}]}}
+    text = render(rejected)
+    assert "无法确认状态" not in text
+    assert "请人工核对后决定是否补单" in text
+
+
+def test_headline_flags_unverified_loudly():
+    headline = render(UNVERIFIED_RUN).split("## 一句话结论", 1)[1].split("##", 1)[0]
+    assert "无法确认" in headline
+    assert "别补单" in headline
+    assert "下单全部未成功" not in headline, "说成「失败」会诱导补单"
