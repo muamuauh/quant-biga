@@ -236,6 +236,44 @@ def _cost_section(result: dict) -> list[str]:
     return lines
 
 
+def _regime_section(result: dict) -> list[str]:
+    """市场择时状态，以及它**此刻正在做什么决定**。
+
+    为什么值得单开一段：概览表里那个 `risk-off` 是全篇最有后果的一个词 ——
+    它一旦成立，目标持仓直接清零，当天所有订单都是卖出。而表格里孤零零一个
+    英文词完全传达不出这件事，看日报的人会以为"清仓"是选股模型挑出来的结论。
+    不是。选股分数照常在算，只是**一个都不会被采用**。
+    """
+    from qbg.config import settings as _s
+
+    risk_on = bool(result.get("market_risk_on"))
+    window = int(_s.qbg_market_sma or 0)
+    if not window:
+        return []
+    lines = ["## 市场择时", ""]
+    if risk_on:
+        lines += [f"> 🟢 **risk-on**：股票池等权指数在 {window} 日均线**之上**，"
+                  "正常按模型分数选股建仓。", ""]
+        return lines
+    lines += [
+        f"> 🔴 **risk-off**：股票池等权指数跌破 {window} 日均线 —— "
+        "**目标持仓直接清零，当天全部订单都是卖出**。",
+        "",
+        "这不是选股模型的结论。分数照常在算（见下方「量化选择」），"
+        "只是 risk-off 时一个都不会被采用 —— 择时闸在选股之后、下单之前，"
+        "一票否决。",
+        "",
+        f"择时的作用是**削回撤，不是增收益**。含成本压测（2020–2026，10bp 滑点）："
+        f"不择时年化 16.85% / 最大回撤 −22.86%，SMA={window} 年化 11.19% / "
+        "回撤 −18.61%。用大约 5 个点的年化换约 4 个点的回撤。",
+        "",
+        "**指数重新站上均线之前不会自动买回。** 这是设计如此：择时的全部价值就在于"
+        "下跌段不在场，中途抢反弹会把这个价值抵消掉。",
+        "",
+    ]
+    return lines
+
+
 def _broker_section(result: dict) -> list[str]:
     """计划 vs 实际委托对账（P9c）。
 
@@ -389,6 +427,9 @@ def render(result: dict) -> str:
         lines.append("")
 
     verdicts = result.get("agent_verdicts") or []
+    # 择时段放在**这个 if 之外**：risk-off 时恰好没有 targets，
+    # 放进去就正好在它最该出现的时候不出现。
+    lines += _regime_section(result)
     if targets or verdicts:
         lines += ["## 量化选择与 TradingAgents 复核", "",
                   "TradingAgents 复核闸只过滤量化候选，不生成主信号；调用异常按 fail-open 放行。", ""]

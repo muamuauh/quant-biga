@@ -293,6 +293,10 @@ class EasytraderAdapter:
                                tuple(o.as_dict() for o in outcomes))
 
     def _submit_one(self, user, order: Order, known_ids: set[str]) -> OrderOutcome:
+        # 局部导入：ths_client 会拉起 pywinauto/ddddocr，离线测试里那条路
+        # 整个被 mock 掉，模块级导入会把测试也拖进 UI 依赖。
+        from qbg.portfolio.ths_client import cleanup_dialogs
+
         try:
             result = place_order(user, code=order.code, side=order.side,
                                  quantity=order.quantity, price=order.price)
@@ -312,6 +316,18 @@ class EasytraderAdapter:
         for attempt in range(VERIFY_ATTEMPTS):
             if attempt:
                 time.sleep(VERIFY_INTERVAL_SEC)
+            # **每次读之前都先清弹窗。** `today_entrusts` 要先切左侧菜单
+            # 「查询[F4] → 当日委托」才能让那张表变成可见的那个 1047 网格
+            # （同 control_id 的网格有三个，买卖页上那个是另一块）。
+            # 模态框会挡住菜单切换，于是我们读到的还是买卖页那块 —— 空表。
+            #
+            # 提交后的「提示」框是**异步**弹的，place_order 里那次 cleanup
+            # 可能赶在它出现之前。所以这里每一轮都扫一遍，而不是只扫一次。
+            leftovers = cleanup_dialogs()
+            if leftovers:
+                log_event(log, "ths.order.dialogs_cleared_before_verify",
+                          attempt=attempt, detail=leftovers[:3])
+                time.sleep(0.5)
             try:
                 entrusts = self._entrusts(user)
             except Exception as exc:  # noqa: BLE001 —— 取表本身可能瞬时失败，重试
