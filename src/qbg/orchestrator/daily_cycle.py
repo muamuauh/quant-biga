@@ -244,6 +244,29 @@ def _submit_to_broker(allowed, today: str, gate_results) -> dict:
                        "message": outcome.message, "outcomes": list(outcome.outcomes)}}
 
 
+def _start_email_listener() -> None:
+    """日报发完之后拉起入站命令监听器（如果开着）。
+
+    **必须在发信之后**：令牌是由那封日报送出去的，先起监听器的话它读到的
+    还是上一个已经作废的令牌。
+
+    默认关闭。开着时它是一个独立进程，最多活 `EMAIL_LISTENER_MAX_HOURS`
+    小时后自杀；脚本自己有单实例文件锁，所以重复拉起不会叠。
+
+    这里**吞掉所有异常**：命令通道是旁路，它起不来不能反过来影响已经完成的
+    交易流程和日报 —— 和整个 notify 层是同一条纪律。
+    """
+    if not settings.email_commands_enabled:
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, str(PROJECT_ROOT / "scripts" / "email_listener.py")],
+            cwd=str(PROJECT_ROOT))
+        log_event(log, "listener.spawned")
+    except Exception as exc:  # noqa: BLE001
+        log_event(log, "listener.spawn_failed", error=f"{type(exc).__name__}: {exc}")
+
+
 def _finish(result: dict, dry_run: bool) -> dict:
     result["finished_ts"] = _now()
     report = generate(result)
@@ -265,6 +288,7 @@ def _finish(result: dict, dry_run: bool) -> dict:
         from qbg.notify import notify_daily_report
 
         result["email_notification"] = notify_daily_report(result)
+        _start_email_listener()
     return result
 
 
