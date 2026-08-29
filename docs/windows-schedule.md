@@ -96,19 +96,68 @@ Clash 在不在同一会话），判不过就**不发热键**，改走注册表�
 
 只有一条路：**让 Windows 开机自动登录**，然后用 `-Mode Interactive`。
 
-自动登录会把密码写进注册表（或用 `netplwiz` 存进 LSA）。这台机器上挂着真钱
-账户，是一个真实的安全权衡，所以**脚本不替你改**，要做自己动手：
+这台机器上挂着真钱账户，自动登录是一个真实的安全权衡：任何能物理接触它的人，
+开机就是你的桌面和两个券商客户端。所以**脚本不替你改**，要做自己动手。
+
+#### 本机实际做法（2026-08-29 配好，微软账户）
+
+本机的账户是 **MicrosoftAccount**，这一点改变了做法 —— 网上到处都是的
+`netplwiz` 那条路在这里**不适用**：微软账户下那个「要使用本计算机，用户必须
+输入用户名和密码」的勾选框默认是隐藏的。
+
+用 **Sysinternals Autologon**（微软官方签名，已验签）：
 
 ```powershell
-# 方式一（推荐，密码存 LSA 不是明文注册表）：
-#   Win+R -> netplwiz -> 取消勾选"要使用本计算机，用户必须输入用户名和密码"
-#   （Win11 若没有这个勾选框，先执行下面这条再重开 netplwiz）
+# 1. 解除强制无密码登录（本机原值是 2）。管理员 PowerShell。
 Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device" `
     -Name DevicePasswordLessBuildVersion -Value 0
 
-# 之后注册交互模式的任务：
-powershell -ExecutionPolicy Bypass -File scripts\setup_schedule.ps1 -Mode Interactive
+# 2. 图形界面里填账户和密码，点 Enable
+& "$env:USERPROFILE\Downloads\Sysinternals-Autologon\Autologon64.exe"
 ```
+
+**必须用 GUI，不要用它的命令行形式**（`Autologon64.exe 用户 域 密码`）——
+那样密码会进入进程列表和 PowerShell 历史。GUI 输入的密码直接进 **LSA secrets**，
+不落盘成明文。
+
+微软账户在界面里的填法：
+
+| 字段 | 值 |
+|---|---|
+| Username | 微软账户**完整邮箱** |
+| Domain | `MicrosoftAccount` |
+| Password | 微软账户密码（**不是 PIN**） |
+
+配完的验收（注册表值对**不代表登录会成功**，密码错了也一样写得进去，
+所以最后必须真重启一次）：
+
+```powershell
+$k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+Get-ItemProperty $k | Select-Object AutoAdminLogon, DefaultUserName, DefaultDomainName
+# AutoAdminLogon = 1 / DefaultDomainName = MicrosoftAccount
+Get-ItemProperty $k -Name DefaultPassword -ErrorAction SilentlyContinue
+# ↑ **必须查不到**。查得到就说明密码被写成了明文，任何本地用户都能读。
+```
+
+⚠️ **改了微软账户密码，自动登录会静默失效** —— 不报错，只是某天早上停在登录
+界面。那天的运行会因为读不到同花顺而拒绝下单，日报主题是
+「⚠ 持仓读不到·结果不可用」。记住这个信号指向什么。
+
+⚠️ **BitLocker 会让这一切失效**：C: 若开了 BitLocker 且需要开机 PIN，
+无人值守冷启动根本进不到 Windows。管理员窗口跑 `manage-bde -status C:` 确认。
+
+#### 另一条不用存密码的路
+
+本机固件支持 S3 睡眠和休眠，而两个计划任务都带 `WakeToRun=True` ——
+所以**晚上睡眠而不是关机**同样可行，且不需要在机器上留任何凭据：
+
+```powershell
+powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0   # 唤醒不要求密码
+powercfg /setactive SCHEME_CURRENT
+```
+
+代价是停电后机器是关的，第二天不会自己起来 —— 那种情况下只有自动登录能救。
+两条路可以同时留着。
 
 配套还要开两个开关，否则自动登录进桌面了 Clash 还是没起来：
 
