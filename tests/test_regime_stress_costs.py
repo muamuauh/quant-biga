@@ -70,3 +70,68 @@ def test_more_switches_cost_more(profile):
     calm = switch_costs(_exposure(0, 1, 1, 1, 1, 1, 1, 1)).sum()
     choppy = switch_costs(_exposure(0, 1, 0, 1, 0, 1, 0, 1)).sum()
     assert choppy > calm * 3
+
+
+# ---------------------------------------------------------------------------
+# equal_weight_index 必须是**等权组合的净值曲线**，不是归一化价格的平均。
+#
+# 2026-08-31 查出来的口径 bug：原实现把每只股票按首值归一后取平均，于是
+# 涨了 5 倍的票权重就是没涨的 5 倍 —— 那不是任何真实组合的净值。
+# 后果是**用组合 B 的信号去择时组合 A**：本轮 risk-off 窗口里，等权组合
+# +1.96% 而那条"指数"是 -2.16%，方向相反。而 QBG_MARKET_SMA 那张压测表
+# 本身就是在这个错信号上选出来的。
+# ---------------------------------------------------------------------------
+def _fake_cache(frames):
+    def _read(code, root=None):
+        return frames[code]
+    return _read
+
+
+def _bars(prices):
+    return pd.DataFrame({"date": pd.date_range("2026-01-01", periods=len(prices)),
+                         "close": prices, "factor": [1.0] * len(prices)})
+
+
+def test_index_is_the_equal_weight_portfolio_nav(monkeypatch):
+    """一只翻倍、一只腰斩 —— 等权组合应基本持平，而不是被大涨的那只带飞。"""
+    from qbg.strategy import regime
+
+    frames = {"A": _bars([1.0, 2.0]), "B": _bars([1.0, 0.5])}
+    monkeypatch.setattr(regime.cache, "read", _fake_cache(frames))
+    nav = regime.equal_weight_index(["A", "B"])
+    # 等权：一只 +100%、一只 -50%，平均 +25%
+    assert nav.iloc[-1] / nav.iloc[0] - 1 == pytest.approx(0.25)
+
+
+def test_high_growth_names_do_not_dominate(monkeypatch):
+    """旧实现的病灶：某只票历史涨幅越大，它对当日信号的影响越大。
+
+    A 从 1 涨到 100 再到 101（+1%），B 从 1 到 1 再到 1.5（+50%）。
+    等权组合当日应是 +25.5%；旧的"归一化取平均"会被 A 的绝对水平压住。
+    """
+    from qbg.strategy import regime
+
+    frames = {"A": _bars([1.0, 100.0, 101.0]), "B": _bars([1.0, 1.0, 1.5])}
+    monkeypatch.setattr(regime.cache, "read", _fake_cache(frames))
+    nav = regime.equal_weight_index(["A", "B"])
+    last_day = nav.iloc[-1] / nav.iloc[-2] - 1
+    assert last_day == pytest.approx((0.01 + 0.50) / 2)
+
+
+def test_unlisted_names_do_not_drag_the_average(monkeypatch):
+    """还没上市的票当天不参与平均，成分变化不该在曲线上留下跳变。"""
+    from qbg.strategy import regime
+
+    late = _bars([float("nan"), 1.0, 1.2])
+    frames = {"A": _bars([1.0, 1.1, 1.21]), "B": late}
+    monkeypatch.setattr(regime.cache, "read", _fake_cache(frames))
+    nav = regime.equal_weight_index(["A", "B"])
+    assert nav.notna().all()
+    assert (nav > 0).all()
+
+
+def test_empty_universe_is_empty_not_a_crash(monkeypatch):
+    from qbg.strategy import regime
+
+    monkeypatch.setattr(regime.cache, "read", lambda *a, **k: pd.DataFrame())
+    assert regime.equal_weight_index(["A"]).empty
