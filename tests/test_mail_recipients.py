@@ -116,7 +116,6 @@ def test_subject_distinguishes_unverified_from_failed():
 # ---------------------------------------------------------------------------
 def test_digest_merges_broker_facts_from_the_run_result():
     from qbg.notify.digest import build_digest
-    store_row = {"submitted": 1, "hard_ok": 1}          # store 里有的那些列
     result = {"date": "2026-08-26", "mode": "PAPER",
               "allowed_orders": [{}, {}],
               "broker": {"ok": True, "outcomes": [{"ok": True}, {"ok": True}]}}

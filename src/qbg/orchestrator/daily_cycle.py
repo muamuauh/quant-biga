@@ -247,15 +247,24 @@ def _submit_to_broker(allowed, today: str, gate_results) -> dict:
 def _start_email_listener(notification: dict | None) -> None:
     """日报发完之后拉起入站命令监听器（如果开着）。
 
+    标志位和 `quant-trading/scripts/04_execute.py::_launch_listener` 保持一致：
+    只用 `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`。
+
+    **不要加 `CREATE_BREAKAWAY_FROM_JOB`。** 计划任务的 job object 没有设
+    `JOB_OBJECT_LIMIT_BREAKAWAY_OK`，带这个标志的 CreateProcess 会直接返回
+    `ERROR_ACCESS_DENIED`（2026-08-31 实测 `PermissionError: [WinError 5]`，
+    监听器一次都没起来）。代价是监听器留在 job 里，任务在它活着的这几小时里
+    一直显示「正在运行」—— 参考实现也是这样，可以接受。
+
     **只有真的发出了日报才起。** 令牌是由那封日报送出去的 —— 没发信就没有新
-    令牌，监听器起来也只能拿着一个作废的旧令牌空转，任何命令都会被拒。
+    令牌，监听器起来也只能拿着一个作废的旧令牌空转。
 
-    2026-08-31 实测这条的代价远不止"空转"：盘前 09:16 被登录触发器拉起的那次
-    安静跳过了（正确），却照样起了一个 3 小时的监听器；而监听器是计划任务的
-    子进程，任务因此一直算「正在运行」，于是 09:30 真正那次被 `IgnoreNew`
-    拒绝（0x800710E0），**当天一笔单都没下**。
-
-    所以还要 detach：即便将来又有哪条路径提前起了它，也不能再把父任务钉住。
+    这一条是 quant-trading 没有的，因为它把监听器起在**交易那一步**
+    （`04_execute.py`），非交易日根本走不到。而这里是 `_finish`，所有路径的
+    汇合点，包括安静跳过 —— 2026-08-31 就是这么出的事：09:16 那次什么都没做，
+    却起了 3 小时的监听器，把任务钉住，09:30 真正那次被 `IgnoreNew` 拒绝，
+    当天一笔单都没下。判据用「发没发出日报」而不是「跑到哪一步」，
+    因为它同时也正好是「有没有新令牌」。
 
     这里**吞掉所有异常**：命令通道是旁路，它起不来不能反过来影响已经完成的
     交易流程和日报 —— 和整个 notify 层是同一条纪律。
@@ -266,49 +275,16 @@ def _start_email_listener(notification: dict | None) -> None:
         log_event(log, "listener.not_spawned",
                   reason="本次没有发出日报，也就没有新令牌，监听器起了也没用")
         return
-    # DETACHED_PROCESS + CREATE_BREAKAWAY_FROM_JOB：脱离计划任务的 job
-    # object，否则 Task Scheduler 会一直认为任务在跑（见上面的注释）。
-    #
-    # **但 breakaway 可能被拒。** job object 没有设 JOB_OBJECT_LIMIT_BREAKAWAY_OK
-    # 时，带这个标志的 CreateProcess 直接返回 ERROR_ACCESS_DENIED
-    # （2026-08-31 实测：`PermissionError: [WinError 5] 拒绝访问`，
-    # 监听器**一次都没起来**）。所以要降级重试：脱不了就至少 detach，
-    # 拿不到 detach 就裸起 —— 命令通道晚一点收不到命令，
-    # 总好过因为一个标志位彻底没有命令通道。
-    detached = getattr(subprocess, "DETACHED_PROCESS", 0)
-    breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-    new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    if sys.platform == "win32":
-        attempts = [detached | breakaway | new_group, detached | new_group, 0]
-    else:
-        attempts = [0]
-
-    for flags in attempts:
-        try:
-            subprocess.Popen(
-                [sys.executable, str(PROJECT_ROOT / "scripts" / "email_listener.py")],
-                cwd=str(PROJECT_ROOT), creationflags=flags,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, close_fds=True)
-            broke = bool(breakaway and (flags & breakaway))
-            log_event(log, "listener.spawned", flags=flags, broke_away=broke)
-            if sys.platform == "win32" and not broke:
-                # 没能脱离 job object：计划任务会在监听器活着的这几小时里
-                # 一直显示「正在运行」，期间 Start-ScheduledTask 手工重跑会被
-                # IgnoreNew 拒绝。日触发器一天只有一次，所以不冲突；
-                # 但这件事必须能被看见，别再变成一个静默的坑。
-                log_event(log, "listener.pins_parent_task",
-                          hours=settings.email_listener_max_hours,
-                          note="计划任务在这段时间内会显示「正在运行」，手工重跑会被拒；"
-                               "介意的话调小 EMAIL_LISTENER_MAX_HOURS")
-            return
-        except PermissionError:
-            continue          # 这一组标志不被允许，降级再试
-        except Exception as exc:  # noqa: BLE001
-            log_event(log, "listener.spawn_failed", error=f"{type(exc).__name__}: {exc}")
-            return
-    log_event(log, "listener.spawn_failed",
-              error="所有 creationflags 组合都被拒绝（PermissionError）")
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    try:
+        subprocess.Popen(
+            [sys.executable, str(PROJECT_ROOT / "scripts" / "email_listener.py")],
+            cwd=str(PROJECT_ROOT), creationflags=flags,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log_event(log, "listener.spawned")
+    except Exception as exc:  # noqa: BLE001
+        log_event(log, "listener.spawn_failed", error=f"{type(exc).__name__}: {exc}")
 
 
 def _finish(result: dict, dry_run: bool) -> dict:

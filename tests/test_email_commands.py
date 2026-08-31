@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -165,7 +165,7 @@ def test_token_is_single_use(tmp_path, monkeypatch):
 def test_expired_token_is_not_honoured(tmp_path, monkeypatch):
     """兜底过期：第二天手工起监听器时，昨天那封信的令牌不能还能用。"""
     monkeypatch.setattr(tokens.settings, "snapshot_dir", tmp_path, raising=False)
-    stale = datetime.now(timezone.utc) - timedelta(hours=tokens.TOKEN_TTL_HOURS + 1)
+    stale = datetime.now(UTC) - timedelta(hours=tokens.TOKEN_TTL_HOURS + 1)
     (tmp_path / "command_token.json").write_text(
         json.dumps({"token": "aabbccdd", "issued": stale.isoformat()}), encoding="utf-8")
     assert tokens.current_token() is None
@@ -216,8 +216,14 @@ def test_listener_not_spawned_without_a_fresh_token(monkeypatch):
     assert len(spawned) == 1, "真的发了日报（也就发了新令牌）才起"
 
 
-def test_listener_is_detached_from_the_scheduled_task(monkeypatch):
-    """监听器必须脱离父任务的 job object，否则会把计划任务钉成「正在运行」。"""
+def test_listener_flags_match_quant_trading(monkeypatch):
+    """标志位和 quant-trading 的 `_launch_listener` 保持一致。
+
+    **绝不能加 `CREATE_BREAKAWAY_FROM_JOB`。** 计划任务的 job object 没有设
+    `JOB_OBJECT_LIMIT_BREAKAWAY_OK`，带它的 CreateProcess 直接返回
+    `ERROR_ACCESS_DENIED` —— 2026-08-31 实测 `PermissionError: [WinError 5]`，
+    监听器一次都没起来。参考实现从来没请求过脱离，所以从来没遇到这个问题。
+    """
     import subprocess as sp
     import sys as _sys
 
@@ -228,10 +234,12 @@ def test_listener_is_detached_from_the_scheduled_task(monkeypatch):
     monkeypatch.setattr(daily_cycle.subprocess, "Popen",
                         lambda *a, **k: captured.update(k))
     daily_cycle._start_email_listener({"sent": True})
+    flags = captured.get("creationflags", 0)
     if _sys.platform == "win32":
-        flags = captured.get("creationflags", 0)
         assert flags & sp.DETACHED_PROCESS
-        assert flags & sp.CREATE_BREAKAWAY_FROM_JOB
+        assert flags & sp.CREATE_NEW_PROCESS_GROUP
+        assert not (flags & sp.CREATE_BREAKAWAY_FROM_JOB), (
+            "别再加 breakaway —— job object 不允许时会 WinError 5，监听器起不来")
 
 
 def test_poll_error_is_reported_to_the_caller(monkeypatch):
@@ -295,34 +303,6 @@ def test_imap_id_failure_does_not_break_other_providers():
             raise RuntimeError("ID not supported")
 
     _send_imap_id(_Conn())      # 不抛异常即通过
-
-
-def test_spawn_falls_back_when_breakaway_is_denied(monkeypatch):
-    """job object 不允许脱离时，CreateProcess 直接 ERROR_ACCESS_DENIED。
-
-    2026-08-31 实测：`PermissionError: [WinError 5] 拒绝访问`，
-    监听器**一次都没起来**。命令通道晚一点收到命令，
-    总好过因为一个标志位彻底没有命令通道 —— 所以要降级重试。
-    """
-    import sys as _sys
-
-    from qbg.orchestrator import daily_cycle
-
-    if _sys.platform != "win32":
-        return
-    tried = []
-
-    def _popen(*_a, **kw):
-        flags = kw.get("creationflags", 0)
-        tried.append(flags)
-        if flags & _sys.modules["subprocess"].CREATE_BREAKAWAY_FROM_JOB:
-            raise PermissionError(5, "拒绝访问")
-        return object()
-
-    monkeypatch.setattr(daily_cycle.settings, "email_commands_enabled", 1, raising=False)
-    monkeypatch.setattr(daily_cycle.subprocess, "Popen", _popen)
-    daily_cycle._start_email_listener({"sent": True})
-    assert len(tried) == 2, "第一组被拒后应该降级再试一次"
 
 
 def test_no_orders_is_not_a_failure():
