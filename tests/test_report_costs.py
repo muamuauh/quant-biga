@@ -296,3 +296,71 @@ def test_headline_flags_unverified_loudly():
     assert "无法确认" in headline
     assert "别补单" in headline
     assert "下单全部未成功" not in headline, "说成「失败」会诱导补单"
+
+
+def test_rerender_from_log_restores_truncated_rationale(tmp_path):
+    """日报是渲染产物，`logs/qbg.jsonl` 才是真相源 —— 渲染代码修好后，
+    旧日报能从日志重建，什么都不会丢。
+
+    2026-08-10 那份的复核理由被砍到 180 字加省略号（当时用表格渲染），
+    而日志里存的是完整的 455~564 字。这条测试钉住"重渲染确实能恢复"。
+    """
+    import json
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    rerender = __import__("11_rerender_reports")
+
+    # 用一个模板里不会出现的字符 —— 「细」会和「复核明细」撞上，
+    # 全文计数就多出两个，得出一个和被测行为无关的失败。
+    long_rationale = "**Executive Summary**: " + "囧" * 300 + "\n\n**Time Horizon**: 6-12个月"
+    record = {"msg": "cycle.completed", "date": "2026-08-10", "hard_ok": True,
+              "agent_verdicts": [{"code": "600549.SH", "rating": "Hold",
+                                  "rationale": long_rationale, "kept": True,
+                                  "error": None}]}
+    log = tmp_path / "qbg.jsonl"
+    log.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    runs = rerender.load_runs(log)
+    assert set(runs) == {"2026-08-10"}
+    text = render(runs["2026-08-10"])
+    assert "…" not in text, "理由不该再被截断"
+    assert "Time Horizon" in text, "最后一节必须还在"
+    block = text.split("#### 600549.SH", 1)[1]
+    assert block.count("囧") == 300, "理由必须一字不差地展开"
+
+
+def test_rerender_keeps_the_last_run_of_a_day(tmp_path):
+    """同一天可能跑多次（补跑/手工重跑）。取最后一次 —— 和当初落盘的一致，
+    因为 generate 每次都覆盖同名文件。"""
+    import json
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    rerender = __import__("11_rerender_reports")
+
+    log = tmp_path / "qbg.jsonl"
+    log.write_text("\n".join(
+        json.dumps({"msg": "cycle.completed", "date": "2026-08-10", "run": n})
+        for n in (1, 2, 3)) + "\n", encoding="utf-8")
+    assert rerender.load_runs(log)["2026-08-10"]["run"] == 3
+
+
+def test_rerender_survives_a_corrupt_log_line(tmp_path):
+    """日志被写坏一行不该让整个重渲染失败 —— 它是追加写的运行日志，
+    不是事务性存储。"""
+    import json
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    rerender = __import__("11_rerender_reports")
+
+    log = tmp_path / "qbg.jsonl"
+    log.write_text(
+        "{坏掉的一行\n"
+        + json.dumps({"msg": "cycle.completed", "date": "2026-08-11"}) + "\n",
+        encoding="utf-8")
+    assert set(rerender.load_runs(log)) == {"2026-08-11"}
