@@ -244,25 +244,43 @@ def _submit_to_broker(allowed, today: str, gate_results) -> dict:
                        "message": outcome.message, "outcomes": list(outcome.outcomes)}}
 
 
-def _start_email_listener() -> None:
+def _start_email_listener(notification: dict | None) -> None:
     """日报发完之后拉起入站命令监听器（如果开着）。
 
-    **必须在发信之后**：令牌是由那封日报送出去的，先起监听器的话它读到的
-    还是上一个已经作废的令牌。
+    **只有真的发出了日报才起。** 令牌是由那封日报送出去的 —— 没发信就没有新
+    令牌，监听器起来也只能拿着一个作废的旧令牌空转，任何命令都会被拒。
 
-    默认关闭。开着时它是一个独立进程，最多活 `EMAIL_LISTENER_MAX_HOURS`
-    小时后自杀；脚本自己有单实例文件锁，所以重复拉起不会叠。
+    2026-08-31 实测这条的代价远不止"空转"：盘前 09:16 被登录触发器拉起的那次
+    安静跳过了（正确），却照样起了一个 3 小时的监听器；而监听器是计划任务的
+    子进程，任务因此一直算「正在运行」，于是 09:30 真正那次被 `IgnoreNew`
+    拒绝（0x800710E0），**当天一笔单都没下**。
+
+    所以还要 detach：即便将来又有哪条路径提前起了它，也不能再把父任务钉住。
 
     这里**吞掉所有异常**：命令通道是旁路，它起不来不能反过来影响已经完成的
     交易流程和日报 —— 和整个 notify 层是同一条纪律。
     """
     if not settings.email_commands_enabled:
         return
+    if not (notification or {}).get("sent"):
+        log_event(log, "listener.not_spawned",
+                  reason="本次没有发出日报，也就没有新令牌，监听器起了也没用")
+        return
     try:
+        # DETACHED_PROCESS + CREATE_BREAKAWAY_FROM_JOB：脱离计划任务的 job
+        # object，否则 Task Scheduler 会一直认为任务在跑（见上面的注释）。
+        # 这两个标志只在 Windows 上有；别的平台按 0 处理。
+        flags = 0
+        if sys.platform == "win32":
+            flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                     | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         subprocess.Popen(
             [sys.executable, str(PROJECT_ROOT / "scripts" / "email_listener.py")],
-            cwd=str(PROJECT_ROOT))
-        log_event(log, "listener.spawned")
+            cwd=str(PROJECT_ROOT), creationflags=flags,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True)
+        log_event(log, "listener.spawned", detached=bool(flags))
     except Exception as exc:  # noqa: BLE001
         log_event(log, "listener.spawn_failed", error=f"{type(exc).__name__}: {exc}")
 
@@ -288,7 +306,7 @@ def _finish(result: dict, dry_run: bool) -> dict:
         from qbg.notify import notify_daily_report
 
         result["email_notification"] = notify_daily_report(result)
-        _start_email_listener()
+        _start_email_listener(result["email_notification"])
     return result
 
 

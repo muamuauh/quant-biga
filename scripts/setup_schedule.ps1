@@ -86,6 +86,15 @@ param(
     [string]$PreflightTime     = '09:15',
     [string]$PreflightTaskName = 'quant_biga_preflight',
     [switch]$NoPreflightTask,
+    # **默认不加开机/登录触发器。** 2026-08-29 配好自动登录之后，机器 09:00
+    # 开机、自动进桌面，于是这个触发器每天都会在 09:16 拉起一次必然早退的运行 ——
+    # 而它会占住 MultipleInstances=IgnoreNew 的名额：2026-08-31 那次监听器
+    # 把任务钉住到 09:30，真正的日触发器被拒绝（0x800710E0「操作员或系统管理员
+    # 拒绝了请求」），**当天一笔单都没下**。
+    #
+    # 它原本的价值是"到点时机器关着，开机后补跑" —— 而 `-StartWhenAvailable`
+    # 已经覆盖了那个场景，不需要额外的触发器。
+    [switch]$WithStartupTrigger,
     [switch]$NoStartupTrigger,
     [switch]$Remove
 )
@@ -253,7 +262,7 @@ function Register-QbgTask {
     Write-Host "------------------------------------------------------------"
 }
 
-$startupNote = $(if ($NoStartupTrigger) { "无开机触发" }
+$startupNote = $(if (-not $WithStartupTrigger -or $NoStartupTrigger) { "无开机触发" }
                  elseif ($Mode -eq 'Background') { "开机后 5 分钟" }
                  else { "登录后 3 分钟" })
 
@@ -287,7 +296,7 @@ if (-not $NoPreflightTask) {
 
 # --- 主任务 -----------------------------------------------------------------
 Register-QbgTask -Name $TaskName -Script $Runner -At $Time `
-    -WithStartupTrigger:(-not $NoStartupTrigger) `
+    -WithStartupTrigger:($WithStartupTrigger -and -not $NoStartupTrigger) `
     -Description ("quant-biga 每日编排（$Mode 模式；$Time + $startupNote）。" +
                   "脚本内部判交易日与当日幂等，重复触发是空转。")
 

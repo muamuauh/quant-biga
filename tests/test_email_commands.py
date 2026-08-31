@@ -187,3 +187,111 @@ def test_unreadable_token_file_fails_closed(tmp_path, monkeypatch, payload):
 def test_extract_token_tolerates_client_punctuation():
     assert tokens.extract_token(f"Re: 报告 {tokens.SUBJECT_TAG}a1b2c3d4>") == "a1b2c3d4"
     assert tokens.extract_token("Re: 报告（没有令牌）") is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-31 实测的三个故障，逐条钉住。
+# ---------------------------------------------------------------------------
+def test_listener_not_spawned_without_a_fresh_token(monkeypatch):
+    """没发出日报就不该起监听器 —— 没发信 = 没发新令牌 = 它起来也只能空转。
+
+    实测代价远不止空转：盘前那次安静跳过后照样起了 3 小时的监听器，
+    而监听器是计划任务的子进程，任务因此一直算「正在运行」，
+    09:30 真正那次被 IgnoreNew 拒绝，**当天一笔单都没下**。
+    """
+    from qbg.orchestrator import daily_cycle
+
+    spawned = []
+    monkeypatch.setattr(daily_cycle.settings, "email_commands_enabled", 1, raising=False)
+    monkeypatch.setattr(daily_cycle.subprocess, "Popen",
+                        lambda *a, **k: spawned.append(a))
+
+    daily_cycle._start_email_listener({"sent": False, "skipped": "not_trading_session"})
+    assert spawned == [], "静默跳过的运行不该起监听器"
+
+    daily_cycle._start_email_listener(None)
+    assert spawned == [], "拿不到通知结果时同样不起"
+
+    daily_cycle._start_email_listener({"sent": True})
+    assert len(spawned) == 1, "真的发了日报（也就发了新令牌）才起"
+
+
+def test_listener_is_detached_from_the_scheduled_task(monkeypatch):
+    """监听器必须脱离父任务的 job object，否则会把计划任务钉成「正在运行」。"""
+    import subprocess as sp
+    import sys as _sys
+
+    from qbg.orchestrator import daily_cycle
+
+    captured = {}
+    monkeypatch.setattr(daily_cycle.settings, "email_commands_enabled", 1, raising=False)
+    monkeypatch.setattr(daily_cycle.subprocess, "Popen",
+                        lambda *a, **k: captured.update(k))
+    daily_cycle._start_email_listener({"sent": True})
+    if _sys.platform == "win32":
+        flags = captured.get("creationflags", 0)
+        assert flags & sp.DETACHED_PROCESS
+        assert flags & sp.CREATE_BREAKAWAY_FROM_JOB
+
+
+def test_poll_error_is_reported_to_the_caller(monkeypatch):
+    """轮询失败要留下痕迹，好让监听器把「连续失败」升级成告警。
+
+    没有这个的话，同一条错误会每 60 秒刷一次刷三小时，
+    而没有任何人知道命令通道其实已经死了。
+    """
+    from qbg.notify import inbox
+
+    monkeypatch.setattr(inbox.settings, "email_commands_enabled", 1, raising=False)
+    monkeypatch.setattr(inbox.settings, "smtp_user", "u@163.com", raising=False)
+    monkeypatch.setattr(inbox.settings, "smtp_password", "pw", raising=False)
+    monkeypatch.setattr(inbox.settings, "imap_host", "imap.163.com", raising=False)
+
+    def _boom(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", _boom)
+    assert inbox.poll_once() == []
+    assert "connection refused" in (inbox.last_poll_error["detail"] or "")
+
+
+def test_successful_poll_clears_the_error(monkeypatch):
+    """一次成功要把连续失败计数清零 —— 否则偶发抖动会累积成误报。"""
+    from qbg.notify import inbox
+
+    inbox.last_poll_error["detail"] = "旧的错误"
+    monkeypatch.setattr(inbox.settings, "email_commands_enabled", 0, raising=False)
+    inbox.poll_once()          # 通道关着：直接返回，不该动错误状态
+    assert inbox.last_poll_error["detail"] == "旧的错误"
+
+
+def test_imap_id_is_registered_for_163():
+    """163/126 登录后必须先发 IMAP ID，否则 SELECT 被拒、
+    后续每条命令都报 "illegal in state AUTH"。"""
+    import imaplib
+
+    from qbg.notify.inbox import _send_imap_id
+
+    class _Conn:
+        def __init__(self):
+            self.sent = []
+
+        def _simple_command(self, name, arg):
+            self.sent.append((name, arg))
+            return "OK", []
+
+    conn = _Conn()
+    _send_imap_id(conn)
+    assert conn.sent and conn.sent[0][0] == "ID"
+    assert "ID" in imaplib.Commands
+
+
+def test_imap_id_failure_does_not_break_other_providers():
+    """别家服务器不需要 ID，发不出去不该让连接失败。"""
+    from qbg.notify.inbox import _send_imap_id
+
+    class _Conn:
+        def _simple_command(self, *a):
+            raise RuntimeError("ID not supported")
+
+    _send_imap_id(_Conn())      # 不抛异常即通过

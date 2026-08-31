@@ -28,7 +28,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from qbg.config import settings  # noqa: E402
-from qbg.notify.inbox import RERUN, SHUTDOWN, STATUS, poll_once  # noqa: E402
+from qbg.notify.inbox import (  # noqa: E402
+    RERUN,
+    SHUTDOWN,
+    STATUS,
+    last_poll_error,
+    poll_once,
+)
 from qbg.utils.logging import get_logger, log_event  # noqa: E402
 
 log = get_logger("qbg.email_listener")
@@ -37,6 +43,14 @@ _LOCK = ROOT / "data" / "snapshots" / "email_listener.lock"
 # 关机前给在跑的流程留的时间。`shutdown /t` 的秒数，不是我们自己 sleep ——
 # 这样 `shutdown /a` 还能在这段时间里取消掉，是一条真实的后悔药。
 SHUTDOWN_DELAY_SEC = 60
+
+# 连续轮询失败多少次之后放弃并告警。
+#
+# **不能无限重试。** 2026-08-31 实测：163 需要先发 IMAP ID 命令，我们没发，
+# 于是 SELECT 一直失败，同一条错误每 60 秒刷一次、刷了三个小时 —— 而且
+# 没有任何人知道命令通道其实是死的。会自愈的故障（网络抖动）几次之内就会好；
+# 好不了的都是配置问题，重试一万次也一样。
+MAX_CONSECUTIVE_FAILURES = 5
 
 
 def _acquire_lock():
@@ -118,6 +132,36 @@ def _run_shutdown() -> None:
                       "/c", "quant-biga: shutdown by email command"])
 
 
+def _report_dead_channel(detail: str, failures: int) -> None:
+    """连续失败到放弃时，**告诉人一声再退出**。
+
+    安静地死掉是最糟的结局：你以为命令通道在，其实它三小时前就废了。
+    """
+    log_event(log, "listener.exit", reason="poll failures", failures=failures,
+              error=detail)
+    try:
+        from qbg.notify.mailer import notify_owner
+
+        body = [
+            f"监听器连续 {failures} 次轮询失败，已退出。"
+            "**回复邮件不再能触发任何命令。**",
+            "",
+            "最后一次的错误：",
+            "",
+            "```",
+            detail,
+            "```",
+            "",
+            "常见原因：`IMAP_HOST` 和 SMTP 不是同一家；163/126 没在邮箱设置里"
+            "开启 IMAP；`SMTP_PASSWORD` 用了登录密码而不是授权码。",
+            "",
+            "日流程和下单**不受影响** —— 命令通道是旁路。",
+        ]
+        notify_owner("⚠ 入站命令通道已停止", "\n".join(body))
+    except Exception as exc:  # noqa: BLE001
+        log_event(log, "listener.report_failed", error=str(exc))
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="quant-biga 入站邮件命令监听器")
     parser.add_argument("--poll-sec", type=int, default=settings.email_listener_poll_sec)
@@ -141,8 +185,17 @@ def main(argv=None) -> int:
     log_event(log, "listener.start", poll_sec=args.poll_sec,
               max_hours=args.max_hours, dry_run=bool(args.dry_run))
     try:
+        failures = 0
         while time.time() < deadline:
-            for cmd in poll_once():
+            commands = poll_once()
+            if last_poll_error["detail"]:
+                failures += 1
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    _report_dead_channel(last_poll_error["detail"], failures)
+                    return 0
+            else:
+                failures = 0
+            for cmd in commands:
                 if args.dry_run:
                     _ack(cmd, "当前是**测试模式**，因此未执行任何动作。"
                               "可以再回复本邮件测试下一条命令。")

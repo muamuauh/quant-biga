@@ -210,6 +210,33 @@ def _save_seen(seen: set[str]) -> None:
     p.write_text(json.dumps(sorted(seen)[-500:]), encoding="utf-8")   # 有界
 
 
+class ImapSelectError(RuntimeError):
+    """选不中收件箱。单独一个类型，好让调用方把它和网络抖动区分开。"""
+
+
+def _send_imap_id(conn) -> None:
+    """向服务器自报家门（RFC 2971 的 `ID` 命令）。
+
+    **163/126 必须发这个**，否则 `SELECT` 会被拒（服务器认为是"不安全登录"），
+    而 imaplib 对 `NO` 不抛异常 —— 表现就是后面每一条命令都报
+    "illegal in state AUTH"。
+
+    `imaplib` 没有内建 ID，所以要先把它登记进命令表再走 `_simple_command`。
+    发不出去只记日志：别家服务器不需要它，不该因此连不上。
+    """
+    try:
+        imaplib.Commands.setdefault("ID", ("AUTH", "SELECTED"))
+        conn._simple_command(
+            "ID", '("name" "quant-biga" "version" "1.0" "vendor" "quant-biga")')
+    except Exception as exc:  # noqa: BLE001
+        log_event(log, "inbox.imap_id.skipped", error=f"{type(exc).__name__}: {exc}")
+
+
+# 最近一次轮询的失败原因。监听器据此判断"连续失败"并升级上报。
+# 用可变字典而不是全局变量：模块级 `global` 在测试里更难隔离。
+last_poll_error: dict[str, str | None] = {"detail": None}
+
+
 def poll_once() -> list[str]:
     """查一次收件箱；拒绝在内部处理掉；返回**待派发**的合法命令，最新的在最后。
 
@@ -218,6 +245,7 @@ def poll_once() -> list[str]:
     if not (settings.email_commands_enabled and settings.smtp_user
             and settings.smtp_password and settings.imap_host):
         return []
+    last_poll_error["detail"] = None
     allow = allowlist()
     token_now = current_token()
     seen = _load_seen()
@@ -226,7 +254,16 @@ def poll_once() -> list[str]:
     try:
         conn = imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port, timeout=30)
         conn.login(settings.smtp_user, settings.smtp_password)
-        conn.select("INBOX")
+        _send_imap_id(conn)
+        # **必须检查 select 的返回值。** imaplib 对服务器的 `NO` 不抛异常，
+        # 只是返回 ('NO', ...)。不检查的话我们会在 AUTH 态里继续发 SEARCH，
+        # 服务器回一句 "command SEARCH illegal in state AUTH"，
+        # 然后每 60 秒重复一次 —— 2026-08-31 实测刷了三小时。
+        typ, _ = conn.select("INBOX")
+        if typ != "OK":
+            raise ImapSelectError(
+                f"select INBOX 失败（{typ}）—— 163/126 需要登录后先发 IMAP ID 命令，"
+                f"且必须在邮箱设置里开启 IMAP、用「授权码」而不是登录密码")
         typ, data = conn.uid("SEARCH", None, "UNSEEN")
         if typ != "OK":
             return []
@@ -270,7 +307,11 @@ def poll_once() -> list[str]:
         _save_seen(seen)
         return commands
     except Exception as exc:  # noqa: BLE001 —— 轮询失败绝不能杀掉监听器
-        log_event(log, "inbox.poll.error", error=f"{type(exc).__name__}: {exc}")
+        detail = f"{type(exc).__name__}: {exc}"
+        log_event(log, "inbox.poll.error", error=detail)
+        # 把失败原因留给调用方：连续失败要能升级成"告诉人"，而不是
+        # 每 60 秒刷一条一模一样的日志刷三小时（2026-08-31 实测）。
+        last_poll_error["detail"] = detail
         return []
     finally:
         if conn is not None:
