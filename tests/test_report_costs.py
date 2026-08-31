@@ -364,3 +364,80 @@ def test_rerender_survives_a_corrupt_log_line(tmp_path):
         + json.dumps({"msg": "cycle.completed", "date": "2026-08-11"}) + "\n",
         encoding="utf-8")
     assert set(rerender.load_runs(log)) == {"2026-08-11"}
+
+
+# ---------------------------------------------------------------------------
+# 复核理由的规整。参照 quant-trading 30cd72b / quant-agent 66e5ea3
+# （两个仓库 2026-08-31 各自修掉了 600 / 400 字截断，并加了标题降级和分割线过滤）。
+#
+# 本仓库 08-25 已先一步改成完全不截断；这里补齐它们多做的三件事。
+# 历史 19 条理由里标题和分割线**一次都没触发过** —— 加它们是因为兄弟仓库
+# 实际遇到了：同一个上游 TradingAgents，只是换了模型。
+# ---------------------------------------------------------------------------
+def _rendered_rationale(text):
+    from qbg.report.daily_report import _rationale
+    return _rationale(text)
+
+
+def test_rationale_is_never_truncated_at_normal_length():
+    """真实理由 400~600 字，一个字都不该少。
+
+    截断总是从后面开始，砍掉的恰好是 Price Target / Time Horizon
+    这些最具体的部分 —— 也就是花钱买来的那部分。
+    """
+    body = "**Executive Summary**: " + "甲" * 600 + "\n\n**Time Horizon**: 6-12个月"
+    out = _rendered_rationale(body)
+    assert out.count("甲") == 600
+    assert "Time Horizon" in out
+    assert "截断" not in out
+
+
+def test_runaway_rationale_is_capped():
+    """LLM 死循环那种病态输出会把日报和邮件一起撑爆 —— 必须有兜底。
+
+    本仓库 08-25 把截断整个删掉了，连这个兜底也一起没了；
+    两个兄弟仓库都保留了 8000 字上限。
+    """
+    from qbg.report.daily_report import RATIONALE_MAX_CHARS
+
+    out = _rendered_rationale("啊" * (RATIONALE_MAX_CHARS + 5000))
+    assert len(out) < RATIONALE_MAX_CHARS + 100
+    assert "过长已截断" in out
+
+
+def test_model_headings_are_demoted_to_bold():
+    """模型输出的 `#` 标题不能变成真 markdown 标题。
+
+    不降级的话，一条复核理由能让「### 复核明细」下面凭空冒出几个
+    和报告结构平级的章节，把日报大纲搅乱。
+    """
+    out = _rendered_rationale("# 投资论点\n\n## 风险\n\n正文")
+    assert not any(line.startswith("#") for line in out.splitlines())
+    assert "**投资论点**" in out
+    assert "**风险**" in out
+
+
+def test_model_horizontal_rules_are_dropped():
+    """模型自己的分割线会把一票的内容割成几块，看起来像好几条独立记录。"""
+    for hr in ("---", "***", "___", "- - -", "-----"):
+        out = _rendered_rationale(f"上半段\n\n{hr}\n\n下半段")
+        assert hr.replace(" ", "") not in out, f"{hr} 没被滤掉"
+        assert "上半段" in out and "下半段" in out
+
+
+def test_a_real_dash_line_is_not_mistaken_for_a_rule():
+    """只有整行都是 - * _ 才算分割线 —— 别把正常的破折号句子吃掉。"""
+    out = _rendered_rationale("风险 —— 高负债率")
+    assert "高负债率" in out
+
+
+def test_duplicate_rating_line_is_still_dropped():
+    out = _rendered_rationale("**Rating**: Hold\n\n**Executive Summary**: 维持")
+    assert "**Rating**" not in out
+    assert "维持" in out
+
+
+def test_empty_rationale_says_so():
+    assert _rendered_rationale("") == "_无复核理由_"
+    assert _rendered_rationale(None) == "_无复核理由_"
+    assert _rendered_rationale("**Rating**: Hold") == "_无复核理由_"

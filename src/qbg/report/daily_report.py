@@ -126,21 +126,64 @@ def _headline(result: dict) -> str:
     return _cell(" ".join(parts), 400)
 
 
+# 失控兜底。真实理由 400~600 字（本仓库 19 条历史记录：均值 459、最长 564），
+# 所以这个上限**平时永远不会生效** —— 它防的是 LLM 死循环那种病态输出，
+# 那种东西会把日报和邮件一起撑爆。和 quant-trading / quant-agent 取同一个值。
+RATIONALE_MAX_CHARS = 8000
+
+# 水平分割线：整行只由 - * _ 组成且至少三个。模型有时会用它分节，
+# 但在日报里它会把那一票的内容割成几块，视觉上像是好几条独立记录。
+_HR_CHARS = {"-", "*", "_"}
+
+
 def _rationale(text) -> str:
-    """把 LLM 的复核理由原样铺开，只做最低限度的规整。
+    """把 LLM 的复核理由铺开，只做最低限度的规整。
 
-    **不截断。** 这段文字是 P7 每票十几次 LLM 调用换来的唯一产物，
-    截掉就等于把钱花了却看不到结论。
+    **不按字数截断。** 这段文字是 P7 每票十几次 LLM 调用换来的唯一产物，
+    截掉就等于把钱花了却看不到结论 —— 而且截断总是从后面开始，
+    砍掉的恰好是 Price Target / Time Horizon 这些最具体的部分。
+    （quant-trading 和 quant-agent 2026-08-31 各自修掉了 600 / 400 字的截断，
+    本仓库 08-25 已经先一步改成不截断。）
 
-    只做两件事：去掉重复的 `**Rating**:` 行（评级已经在标题里了），
-    以及把各小节之间补上空行，让 markdown→HTML 转换时能正确分段。
+    只做四件事：
+
+    1. 去掉重复的 `**Rating**` 行 —— 评级已经在小标题里了。
+    2. **把模型输出的 `#` 标题降级成粗体。** 不降级的话它们会变成真正的
+       markdown 标题，混进日报自己的大纲里 —— 一条复核理由能让"### 复核明细"
+       下面凭空冒出几个和报告结构平级的章节。
+    3. **丢掉模型输出的水平分割线。** 它会把一票的内容割成几块，
+       看起来像好几条独立记录。
+    4. 只在**超长**时截断（见 RATIONALE_MAX_CHARS），并明确标注。
+
+    2、3 两条在本仓库的历史数据里一次都没触发过（19 条全都没有标题和分割线），
+    加它们是因为**两个兄弟仓库都实际遇到了** —— 同一个上游 TradingAgents，
+    只是换了模型，输出格式随时可能变成那样。
     """
     body = str(text or "").strip()
     if not body:
         return "_无复核理由_"
-    kept = [ln.strip() for ln in body.splitlines()
-            if ln.strip() and not ln.strip().startswith("**Rating**")]
-    return "\n\n".join(kept)
+    if len(body) > RATIONALE_MAX_CHARS:
+        body = body[:RATIONALE_MAX_CHARS] + "…（过长已截断）"
+
+    lines: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if line.startswith("**Rating**"):
+            continue
+        stripped = line.replace(" ", "")
+        if len(stripped) >= 3 and set(stripped) <= _HR_CHARS:
+            continue                      # 模型自己的分割线
+        if line.startswith("#"):
+            line = line.lstrip("#").strip()
+            line = f"**{line}**" if line else ""
+        if not line and lines and not lines[-1]:
+            continue                      # 连续空行压成一个
+        lines.append(line)
+    while lines and not lines[-1]:
+        lines.pop()
+    # 每个非空段落之间留一个空行，markdown→HTML 才会分段。
+    out = "\n\n".join(line for line in lines if line)
+    return out or "_无复核理由_"
 
 
 def _trading_costs(orders: list[dict]) -> dict:
