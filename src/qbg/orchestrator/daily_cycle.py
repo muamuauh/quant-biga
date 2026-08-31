@@ -266,23 +266,49 @@ def _start_email_listener(notification: dict | None) -> None:
         log_event(log, "listener.not_spawned",
                   reason="本次没有发出日报，也就没有新令牌，监听器起了也没用")
         return
-    try:
-        # DETACHED_PROCESS + CREATE_BREAKAWAY_FROM_JOB：脱离计划任务的 job
-        # object，否则 Task Scheduler 会一直认为任务在跑（见上面的注释）。
-        # 这两个标志只在 Windows 上有；别的平台按 0 处理。
-        flags = 0
-        if sys.platform == "win32":
-            flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
-                     | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-        subprocess.Popen(
-            [sys.executable, str(PROJECT_ROOT / "scripts" / "email_listener.py")],
-            cwd=str(PROJECT_ROOT), creationflags=flags,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, close_fds=True)
-        log_event(log, "listener.spawned", detached=bool(flags))
-    except Exception as exc:  # noqa: BLE001
-        log_event(log, "listener.spawn_failed", error=f"{type(exc).__name__}: {exc}")
+    # DETACHED_PROCESS + CREATE_BREAKAWAY_FROM_JOB：脱离计划任务的 job
+    # object，否则 Task Scheduler 会一直认为任务在跑（见上面的注释）。
+    #
+    # **但 breakaway 可能被拒。** job object 没有设 JOB_OBJECT_LIMIT_BREAKAWAY_OK
+    # 时，带这个标志的 CreateProcess 直接返回 ERROR_ACCESS_DENIED
+    # （2026-08-31 实测：`PermissionError: [WinError 5] 拒绝访问`，
+    # 监听器**一次都没起来**）。所以要降级重试：脱不了就至少 detach，
+    # 拿不到 detach 就裸起 —— 命令通道晚一点收不到命令，
+    # 总好过因为一个标志位彻底没有命令通道。
+    detached = getattr(subprocess, "DETACHED_PROCESS", 0)
+    breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    if sys.platform == "win32":
+        attempts = [detached | breakaway | new_group, detached | new_group, 0]
+    else:
+        attempts = [0]
+
+    for flags in attempts:
+        try:
+            subprocess.Popen(
+                [sys.executable, str(PROJECT_ROOT / "scripts" / "email_listener.py")],
+                cwd=str(PROJECT_ROOT), creationflags=flags,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True)
+            broke = bool(breakaway and (flags & breakaway))
+            log_event(log, "listener.spawned", flags=flags, broke_away=broke)
+            if sys.platform == "win32" and not broke:
+                # 没能脱离 job object：计划任务会在监听器活着的这几小时里
+                # 一直显示「正在运行」，期间 Start-ScheduledTask 手工重跑会被
+                # IgnoreNew 拒绝。日触发器一天只有一次，所以不冲突；
+                # 但这件事必须能被看见，别再变成一个静默的坑。
+                log_event(log, "listener.pins_parent_task",
+                          hours=settings.email_listener_max_hours,
+                          note="计划任务在这段时间内会显示「正在运行」，手工重跑会被拒；"
+                               "介意的话调小 EMAIL_LISTENER_MAX_HOURS")
+            return
+        except PermissionError:
+            continue          # 这一组标志不被允许，降级再试
+        except Exception as exc:  # noqa: BLE001
+            log_event(log, "listener.spawn_failed", error=f"{type(exc).__name__}: {exc}")
+            return
+    log_event(log, "listener.spawn_failed",
+              error="所有 creationflags 组合都被拒绝（PermissionError）")
 
 
 def _finish(result: dict, dry_run: bool) -> dict:

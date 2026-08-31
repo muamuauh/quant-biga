@@ -295,3 +295,50 @@ def test_imap_id_failure_does_not_break_other_providers():
             raise RuntimeError("ID not supported")
 
     _send_imap_id(_Conn())      # 不抛异常即通过
+
+
+def test_spawn_falls_back_when_breakaway_is_denied(monkeypatch):
+    """job object 不允许脱离时，CreateProcess 直接 ERROR_ACCESS_DENIED。
+
+    2026-08-31 实测：`PermissionError: [WinError 5] 拒绝访问`，
+    监听器**一次都没起来**。命令通道晚一点收到命令，
+    总好过因为一个标志位彻底没有命令通道 —— 所以要降级重试。
+    """
+    import sys as _sys
+
+    from qbg.orchestrator import daily_cycle
+
+    if _sys.platform != "win32":
+        return
+    tried = []
+
+    def _popen(*_a, **kw):
+        flags = kw.get("creationflags", 0)
+        tried.append(flags)
+        if flags & _sys.modules["subprocess"].CREATE_BREAKAWAY_FROM_JOB:
+            raise PermissionError(5, "拒绝访问")
+        return object()
+
+    monkeypatch.setattr(daily_cycle.settings, "email_commands_enabled", 1, raising=False)
+    monkeypatch.setattr(daily_cycle.subprocess, "Popen", _popen)
+    daily_cycle._start_email_listener({"sent": True})
+    assert len(tried) == 2, "第一组被拒后应该降级再试一次"
+
+
+def test_no_orders_is_not_a_failure():
+    """一笔都没打算下 ≠ 下单失败。
+
+    2026-08-31 实测：risk-off + 空仓，本来就无事可做，主题却写
+    「⚠ 下单失败 0/0笔」。假警报和漏报一样有害 —— 它会训练人忽略这个前缀，
+    而真出事时也是同一个前缀。
+    """
+    from qbg.notify.digest import status_tag
+    from qbg.report.daily_report import _status, render
+
+    run = {"submitted": True, "allowed_orders": [],
+           "broker": {"ok": True, "submitted": 0, "message": "没有可提交的订单",
+                      "outcomes": []}}
+    assert "失败" not in status_tag(run, [], None)
+    assert "失败" not in _status({**run, "hard_ok": True})
+    text = render({**run, "date": "2026-08-31", "hard_ok": True})
+    assert "下单全部未成功" not in text

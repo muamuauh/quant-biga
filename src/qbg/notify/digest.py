@@ -259,6 +259,11 @@ def status_tag(run: dict | None, finds: list[dict], failure: dict | None) -> str
     if broker is not None:
         ok = sum(1 for o in (broker.get("outcomes") or []) if o.get("ok"))
         planned = n_orders if n_orders is not None else len(broker.get("outcomes") or [])
+        # **一笔都没打算下 ≠ 下单失败。** 2026-08-31 实测：risk-off + 空仓，
+        # 本来就无事可做，主题却写「⚠ 下单失败 0/0笔」—— 假警报和漏报一样
+        # 有害，它会训练人忽略这个前缀，而真出事时也是同一个前缀。
+        if planned == 0:
+            return "正常·无订单"
         outcomes = broker.get("outcomes") or []
         if any(o.get("verified") is False for o in outcomes):
             # 「确认不了」比「失败」严重：失败可以补单，确认不了不能碰。

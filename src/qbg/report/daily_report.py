@@ -43,6 +43,8 @@ def _status(result: dict) -> str:
     if broker is not None:
         planned = len(result.get("allowed_orders") or [])
         ok = sum(1 for o in (broker.get("outcomes") or []) if o.get("ok"))
+        if planned == 0:
+            return "正常 · 无订单"      # 没打算下单，不是失败
         if ok == 0:
             return f"⚠ 下单失败 0/{planned} 笔"
         return f"{'⚠ ' if ok < planned else ''}券商接单 {ok}/{planned} 笔"
@@ -74,7 +76,9 @@ def _outcome_facts(result: dict) -> list[str]:
         outcomes = broker.get("outcomes") or []
         ok = sum(1 for o in outcomes if o.get("ok"))
         planned = len(result.get("allowed_orders") or [])
-        if broker.get("ok") and ok:
+        if planned == 0:
+            pass                        # 没打算下单，没什么可汇报的
+        elif broker.get("ok") and ok:
             facts.append(f"券商已接单 {ok}/{planned} 笔并通过回读校验")
         elif ok:
             facts.append(f"券商只接了 {ok}/{planned} 笔，其余失败或未尝试")
