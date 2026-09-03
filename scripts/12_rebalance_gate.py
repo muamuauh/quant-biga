@@ -1,0 +1,180 @@
+"""`QBG_REBALANCE_EVERY_DAYS` 的受控评估 —— 过 `tuning/` 的八项回测闸。
+
+现行部署是 **1（每日调仓）**，而代码默认是 10。`fee_profile.yaml` 末尾算过账：
+往返约 10bp + 滑点，一次完整调仓 20~30bp；`plan.md` §8.5 把「成本吃掉 alpha」
+列为小账户第一杀手。但那些都是**推理**，不是这套策略上的实测 —— 这个脚本补上。
+
+和中性化那次（`10_neutralize_gate.py`）不同，**这次「参数高原」那一闸真的适用**：
+调仓间隔是连续取值，候选左右都有邻居，可以检查它是不是站在一个平坦的区域上，
+而不是一根靠运气立住的尖峰。
+
+基线 = 现行配置，候选 = 命令行给的那个值。两边共用同一份预测、同一个股票池、
+同一个引擎，只差 `rebalance_every`。择时按现行配置加上，以反映实盘。
+
+用法：
+    python scripts/12_rebalance_gate.py --candidate 5
+    python scripts/12_rebalance_gate.py --candidate 10 --neighbors 5,15
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+import numpy as np  # noqa: E402
+
+from qbg.backtest import engine  # noqa: E402
+from qbg.backtest import panel as panel_mod  # noqa: E402
+from qbg.config import load_universe, settings  # noqa: E402
+from qbg.execution import fees  # noqa: E402
+from qbg.strategy.predict import (  # noqa: E402
+    load_latest_predictions,
+    neutralize_frame,
+    predictions_to_frame,
+)
+from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
+from qbg.tuning.gates import Check, GateReport  # noqa: E402
+
+SUBPERIODS = 4
+HIGH_COST_MULT = 1.75      # 八项闸要求 +75% 成本下仍为正
+# 每次 LLM 逐票复核的实测成本（2026-08 那几次：80 次调用、约 34 万 tokens）。
+# 只有调仓日才复核，所以这一项和调仓频率成正比 —— 而它不在回测里，
+# 得单独算出来摆在旁边。
+LLM_COST_PER_REBALANCE_USD = 0.29
+TRADING_DAYS_PER_YEAR = 252
+
+
+def _annual(returns) -> float:
+    if len(returns) == 0:
+        return 0.0
+    return float((1 + returns).prod()) ** (TRADING_DAYS_PER_YEAR / len(returns)) - 1
+
+
+def _facts(res) -> dict:
+    m = res.strategy
+    return {"annual_return": m.annual_return, "sharpe": m.sharpe,
+            "max_drawdown": m.max_drawdown, "avg_turnover": res.avg_turnover,
+            "rank_ic": res.rank_ic}
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="调仓间隔的八项闸评估")
+    parser.add_argument("--candidate", type=int, required=True, help="候选调仓间隔")
+    parser.add_argument("--neighbors", default="", help="高原闸用的相邻取值，逗号分隔")
+    parser.add_argument("--k", type=int, default=settings.qbg_top_k)
+    args = parser.parse_args(argv)
+
+    baseline_every = int(settings.qbg_rebalance_every_days)
+    candidate_every = args.candidate
+    neighbors = ([int(x) for x in args.neighbors.split(",") if x.strip()]
+                 or sorted({max(1, candidate_every - 5), candidate_every + 5}))
+
+    members = load_universe()
+    scores = predictions_to_frame(load_latest_predictions())
+    if settings.qbg_industry_neutral:
+        scores = neutralize_frame(scores)
+    panel = panel_mod.build_panel(members, start=str(scores.index.min().date()),
+                                  end=str(scores.index.max().date()))
+    scores = scores.reindex(index=panel.dates, columns=panel.instruments)
+
+    regime = "关闭"
+    if settings.qbg_market_sma:
+        level = equal_weight_index(members).reindex(panel.dates).ffill()
+        on = risk_on_series(level, settings.qbg_market_sma).reindex(panel.dates).fillna(True)
+        scores = scores.where(on)
+        regime = f"SMA={settings.qbg_market_sma}"
+
+    print(f"窗口 {panel.dates[0].date()} ~ {panel.dates[-1].date()}   "
+          f"{len(panel.dates)} 个交易日   k={args.k}   择时={regime}")
+    print(f"基线 = 每 {baseline_every} 日调仓（现行配置）   "
+          f"候选 = 每 {candidate_every} 日   高原邻居 = {neighbors}\n")
+
+    def run(every, profile=None):
+        return engine.run_backtest(scores, panel, k=args.k,
+                                   rebalance_every=every, fee_profile=profile)
+
+    base_res, cand_res = run(baseline_every), run(candidate_every)
+    baseline, candidate = _facts(base_res), _facts(cand_res)
+
+    profile = fees.FeeProfile.load()
+    high = fees.FeeProfile(
+        commission_rate=profile.commission_rate * HIGH_COST_MULT,
+        commission_min=profile.commission_min * HIGH_COST_MULT,
+        stamp_tax_rate=profile.stamp_tax_rate * HIGH_COST_MULT,
+        transfer_fee_rate=profile.transfer_fee_rate * HIGH_COST_MULT)
+    high_cost = _facts(run(candidate_every, profile=high))
+
+    print(f"{'指标':<16}{f'基线(每{baseline_every}日)':>16}"
+          f"{f'候选(每{candidate_every}日)':>16}{'差':>12}")
+    print("-" * 62)
+    for key, fmt in (("annual_return", "{:+.2%}"), ("sharpe", "{:.4f}"),
+                     ("max_drawdown", "{:.2%}"), ("avg_turnover", "{:.4f}"),
+                     ("rank_ic", "{:+.4f}")):
+        b, c = baseline[key], candidate[key]
+        print(f"{key:<16}{fmt.format(b):>16}{fmt.format(c):>16}{fmt.format(c - b):>12}")
+
+    # LLM 账单：只有调仓日才做逐票复核，所以它和频率成正比，而回测看不到这一项。
+    print(f"\nLLM 逐票复核年账单（每次 ${LLM_COST_PER_REBALANCE_USD:.2f}）：")
+    for label, every in (("基线", baseline_every), ("候选", candidate_every)):
+        per_year = TRADING_DAYS_PER_YEAR / every
+        print(f"  {label} 每 {every:>2} 日 → 约 {per_year:5.0f} 次/年 = "
+              f"${per_year * LLM_COST_PER_REBALANCE_USD:,.0f}")
+
+    chunks = np.array_split(np.arange(len(base_res.daily_returns)), SUBPERIODS)
+    excess = []
+    print(f"\n子区间超额（候选 − 基线，年化），切成 {SUBPERIODS} 段：")
+    for i, idx in enumerate(chunks, 1):
+        b, c = _annual(base_res.daily_returns.iloc[idx]), _annual(cand_res.daily_returns.iloc[idx])
+        excess.append(c - b)
+        span = base_res.daily_returns.index[idx]
+        print(f"  第{i}段 {span[0].date()}~{span[-1].date()}  "
+              f"基线 {b:+9.2%}  候选 {c:+9.2%}  超额 {c - b:+9.2%}")
+
+    neighbor_sharpes = []
+    print("\n相邻取值（高原闸）：")
+    for every in neighbors:
+        sharpe = run(every).strategy.sharpe
+        neighbor_sharpes.append(sharpe)
+        print(f"  每 {every:>2} 日 → Sharpe {sharpe:.4f}")
+
+    report = GateReport(tuple(
+        _evaluate(baseline, candidate, excess, neighbor_sharpes, high_cost)))
+    print("\n八项闸：")
+    for check in report.checks:
+        print(f"  {'✅' if check.passed else '❌'} {check.name:<16} {check.detail}")
+    failed = [c.name for c in report.checks if not c.passed]
+    print(f"\n结论：{'通过' if not failed else '**未通过**'}")
+    print(f"  → {'可以把 QBG_REBALANCE_EVERY_DAYS 改成 ' + str(candidate_every)}"
+          if not failed else f"  → 维持每 {baseline_every} 日。未过：{'、'.join(failed)}")
+    return 0
+
+
+def _evaluate(baseline, candidate, subperiod_excess, neighbor_sharpes, high_cost):
+    passed_sub = sum(v >= 0 for v in subperiod_excess)
+    return [
+        Check("net_return", candidate["annual_return"] >= baseline["annual_return"],
+              "净年化不低于基线"),
+        Check("sharpe", candidate["sharpe"] >= baseline["sharpe"] - 0.05,
+              "Sharpe 允许最多回落 0.05"),
+        Check("drawdown", candidate["max_drawdown"] >= baseline["max_drawdown"] - 0.02,
+              "回撤不显著恶化"),
+        Check("turnover", candidate["avg_turnover"] <= baseline["avg_turnover"] * 1.20,
+              "换手不增加超过 20%"),
+        Check("rank_ic", candidate["rank_ic"] > 0, "Rank IC 必须为正"),
+        Check("subperiod", bool(subperiod_excess) and
+              passed_sub >= (len(subperiod_excess) + 1) // 2,
+              f"至少半数子区间不劣于基线（{passed_sub}/{len(subperiod_excess)}）"),
+        Check("plateau", len(neighbor_sharpes) >= 2 and
+              min(neighbor_sharpes) >= candidate["sharpe"] - 0.20,
+              "相邻取值处于稳定高原（不是靠运气立住的尖峰）"),
+        Check("cost_robustness",
+              high_cost["annual_return"] > 0 and high_cost["sharpe"] > 0,
+              f"+{int((HIGH_COST_MULT - 1) * 100)}% 成本下仍为正"),
+    ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

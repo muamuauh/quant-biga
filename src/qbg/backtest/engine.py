@@ -52,7 +52,6 @@ from qbg.backtest.metrics import (
     compute_metrics,
     equity_curve,
     information_coefficient,
-    turnover,
 )
 from qbg.execution import fees
 from qbg.utils.logging import get_logger, log_event
@@ -198,11 +197,17 @@ def run_backtest(
     *,
     k: int = 3,
     total_weight: float = 0.95,
+    rebalance_every: int = 1,
     extra_slippage: float = 0.0,
     fee_profile: fees.FeeProfile | None = None,
     slippage_grid: tuple[float, ...] = (0.0, 0.001, 0.002, 0.003),
 ) -> BacktestResult:
-    """跑一次 top-K 日频回测。
+    """跑一次 top-K 回测。
+
+    `rebalance_every` 是**调仓间隔（交易日）**，对应实盘的
+    `QBG_REBALANCE_EVERY_DAYS`。默认 1 = 每日调仓。非调仓日完全不碰组合 ——
+    这是引擎此前根本表达不了的一件事：实盘有这个参数，而回测只会每天调，
+    于是任何关于调仓频率的结论都无从验证。
 
     基准是**股票池等权买入持有**——回答"这个模型比无脑等权持有强在哪"，
     比拿沪深300 指数当基准更能隔离出选股能力（指数是市值加权，混进了
@@ -217,14 +222,25 @@ def run_backtest(
     w_target = target_weights_from_scores(scores, k, total_weight, tradable)
     asset_ret = panel.open_to_open_returns()
 
-    daily_returns, weight_rows = [], []
+    daily_returns, weight_rows, traded_turnover = [], [], []
     blocked_total = {"suspended": 0, "limit_up_cannot_buy": 0, "limit_down_cannot_sell": 0}
     w_prev = pd.Series(0.0, index=panel.instruments)
 
     # 最后一天没有 open[t+1]，无法形成一个完整的持有期，所以不进循环。
-    for day in panel.dates[:-1]:
+    for index, day in enumerate(panel.dates[:-1]):
+        # 非调仓日**什么都不做**：目标就是当前（已漂移的）持仓，delta 为零。
+        #
+        # 光把分数 ffill 是不够的 —— 目标权重不变，但 `w_prev` 每天按涨跌漂移
+        # （见循环末尾），引擎会把它拉回目标，于是变成"每天调仓到一个过期目标"，
+        # 恰恰是 rebalance_every 要避免的那件事。真实行为是这几天完全不碰组合。
+        #
+        # 注意这里没有实现实盘的 `rebalance_drift_band`（漂移小于 3% 就不动）：
+        # 调仓日这里会走满到目标。差别只在调仓日的换手上，方向是**高估**换手，
+        # 也就是对低频那一侧不利 —— 结论若仍偏向低频，那是保守的。
+        target = (w_target.loc[day] if rebalance_every <= 1 or index % rebalance_every == 0
+                  else w_prev)
         w_new, blocked = _step_weights(
-            w_prev, w_target.loc[day],
+            w_prev, target,
             panel.suspended.loc[day],
             panel.limit_up_open.loc[day],
             panel.limit_down_open.loc[day],
@@ -235,6 +251,12 @@ def run_backtest(
         delta = w_new - w_prev
         buy_turnover = float(delta.clip(lower=0).sum())
         sell_turnover = float((-delta).clip(lower=0).sum())
+        # **换手要按真正成交的量算，不能用相邻两天的权重差。**
+        # `w_prev` 已经含了当天的价格漂移（见循环末尾），所以
+        # `weights.diff()` 度量的是「漂移 + 交易」。日频调仓时漂移占比小、
+        # 看不出来；但调仓间隔一拉长，漂移就成了主要成分 —— 于是低频策略
+        # 会被报出一个它根本没付的换手，正好在比较调仓频率时误导最大。
+        traded_turnover.append((buy_turnover + sell_turnover) / 2.0)
         # 费率不对称：卖出多 5bp 印花税。滑点两边都吃。
         cost = (buy_turnover * (buy_rate + extra_slippage)
                 + sell_turnover * (sell_rate + extra_slippage))
@@ -255,7 +277,7 @@ def run_backtest(
     bench_s = asset_ret.loc[dates].mean(axis=1).fillna(0.0).rename("benchmark")
 
     ic, rank_ic = _compute_ic(scores, asset_ret)
-    turn = turnover(weights)
+    turn = pd.Series(traded_turnover, index=dates, name="turnover")
 
     slippage_curve = {}
     for slip in slippage_grid:
