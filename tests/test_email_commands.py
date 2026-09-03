@@ -322,3 +322,79 @@ def test_no_orders_is_not_a_failure():
     assert "失败" not in _status({**run, "hard_ok": True})
     text = render({**run, "date": "2026-08-31", "hard_ok": True})
     assert "下单全部未成功" not in text
+
+
+# ---------------------------------------------------------------------------
+# 关机命令：收尾 → 确认信 → 关机
+# ---------------------------------------------------------------------------
+def _listener(monkeypatch, *, postflight):
+    """把 `_run_postflight` 换掉，捕获发出的信和关机调用。"""
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "scripts"))
+    listener = __import__("email_listener")
+
+    mails, popen = [], []
+    monkeypatch.setattr(listener, "_run_postflight", lambda: postflight)
+    monkeypatch.setattr(listener.subprocess, "Popen", lambda *a, **k: popen.append(a[0]))
+    import qbg.notify.mailer as mailer
+    monkeypatch.setattr(mailer, "notify_owner",
+                        lambda subject, body: mails.append((subject, body)))
+    return listener, mails, popen
+
+
+def test_shutdown_runs_teardown_before_powering_off(monkeypatch):
+    """顺序必须是收尾 → 确认信 → 关机。
+
+    反过来的话确认信只能说「即将开始收尾」，而收尾恰恰是最可能出问题的一步
+    （热键送不到、同花顺不肯退），那封信就等于什么都没确认。
+    """
+    listener, mails, popen = _listener(
+        monkeypatch, postflight=(0, "==== Step 1/4 ====\n  [OK] 系统代理 已关闭。"))
+    listener._run_shutdown()
+
+    assert len(mails) == 1, "必须发确认信"
+    subject, body = mails[0]
+    assert "收尾完成" in subject
+    assert "系统代理" in body, "确认信里要带收尾脚本的实际输出"
+    assert popen and popen[0][0] == "shutdown", "确认信发完才关机"
+
+
+def test_shutdown_is_aborted_while_a_run_is_active(monkeypatch):
+    """退出码 2 = 守卫中止（日流程还在跑）—— **绝不关机**。
+
+    下单是「填单 → 提交 → 确认框 → 回读校验」四步，中间断电就会永远不知道
+    那一笔到底进没进券商，正是 verified=False 那种最危险的状态。
+    """
+    listener, mails, popen = _listener(
+        monkeypatch, postflight=(2, "  [ERROR] 还有 1 个日流程进程在跑"))
+    listener._run_shutdown()
+
+    assert popen == [], "守卫中止时一次都不该调 shutdown"
+    subject, body = mails[0]
+    assert "已中止" in subject
+    assert "机器没有关" in body
+
+
+def test_shutdown_still_powers_off_when_teardown_warns(monkeypatch):
+    """收尾有告警（退出码 1）仍然关机。
+
+    你要的是关机，而告警已经写进确认信；因为一个热键没送到就不关机，
+    反而会让机器整夜开着。
+    """
+    listener, mails, popen = _listener(
+        monkeypatch, postflight=(1, "  [WARN] TUN 模式 发完热键仍是开的。"))
+    listener._run_shutdown()
+
+    assert popen and popen[0][0] == "shutdown"
+    assert "收尾有告警" in mails[0][0]
+
+
+def test_postflight_timeout_does_not_hang_the_listener(monkeypatch):
+    """收尾卡住不能把监听器一起挂死 —— 超时后照常发信并关机。"""
+    listener, mails, popen = _listener(
+        monkeypatch, postflight=(124, "收尾脚本超过 120 秒没结束"))
+    listener._run_shutdown()
+    assert popen and popen[0][0] == "shutdown"
+    assert "退出码 124" in mails[0][0]

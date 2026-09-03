@@ -120,14 +120,77 @@ def _run_status() -> None:
     send_with_token("[量化] 运行状态", "\n".join(lines))
 
 
+# 收尾脚本最多跑多久。热键各留 3~4 秒、同花顺最多等 8 秒优雅退出，
+# 正常 30 秒内跑完；120 秒是给 Clash 卡住那种情况留的余量。
+POSTFLIGHT_TIMEOUT_SEC = 120
+
+
+def _run_postflight() -> tuple[int, str]:
+    """跑收尾脚本，**但不让它关机** —— 关机由本模块在发完确认信之后触发。
+
+    这个顺序是刻意的：先收尾、再发信、最后关机。反过来的话，确认信只能说
+    「即将开始收尾」，而收尾恰恰是最可能出问题的一步（热键送不到、
+    同花顺不肯退），那封信就等于什么都没确认。
+    """
+    script = ROOT / "scripts" / "postflight.ps1"
+    if not script.exists():
+        return 127, f"找不到收尾脚本：{script}"
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-File", str(script), "-NoShutdown"],
+            cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=POSTFLIGHT_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        return 124, f"收尾脚本超过 {POSTFLIGHT_TIMEOUT_SEC} 秒没结束，已放弃等待"
+    except Exception as exc:  # noqa: BLE001
+        return 1, f"{type(exc).__name__}: {exc}"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
 def _run_shutdown() -> None:
-    """关机。留 60 秒缓冲，期间 `shutdown /a` 可以取消。"""
-    log_event(log, "listener.dispatch", command=SHUTDOWN, delay=SHUTDOWN_DELAY_SEC)
+    """收尾 → 确认信 → 关机。
+
+    **退出码 2 表示守卫中止**（日流程还在跑）—— 那种情况绝不关机：
+    下单是「填单 → 提交 → 确认框 → 回读校验」四步，中间断电就会永远不知道
+    那一笔到底进没进券商，正是 `verified=False` 那种最危险的状态。
+
+    收尾**有告警**（退出码 1）仍然关机 —— 你要的是关机，而告警已经写进了
+    确认信；因为热键没送到就不关机，反而会让机器整夜开着。
+    """
     from qbg.notify.mailer import notify_owner
 
-    notify_owner("⏻ 收到关机命令",
-                 f"将在 **{SHUTDOWN_DELAY_SEC} 秒**后关机。\n\n"
-                 f"反悔的话在这台机器上执行 `shutdown /a` 取消。")
+    log_event(log, "listener.dispatch", command=SHUTDOWN)
+    code, output = _run_postflight()
+    tail = "\n".join(line for line in output.splitlines() if line.strip())[-3000:]
+
+    if code == 2:
+        log_event(log, "listener.shutdown.aborted", reason="日流程仍在运行")
+        notify_owner("⛔ 关机已中止：日流程还在跑", "\n".join([
+            "收到「关机」命令，但收尾脚本的安全守卫发现**日流程仍在运行**，"
+            "已中止，机器没有关。",
+            "",
+            "交易中途断电会让一笔单停在「不知道进没进券商」的状态 —— "
+            "那是这套系统里最难收拾的情况。",
+            "",
+            "等流程跑完后再发一次「关机」即可。收尾脚本的输出：",
+            "", "```", tail, "```",
+        ]))
+        return
+
+    status = "✅ 收尾完成" if code == 0 else f"⚠ 收尾有告警（退出码 {code}）"
+    log_event(log, "listener.shutdown.postflight_done", code=code)
+    notify_owner(f"⏻ {status}，{SHUTDOWN_DELAY_SEC} 秒后关机", "\n".join([
+        f"「关机」命令已执行。收尾结果：**{status}**。",
+        "",
+        f"系统代理 / TUN → Clash Verge → 同花顺下单端，依次处理完毕，"
+        f"**{SHUTDOWN_DELAY_SEC} 秒后关机**。",
+        "",
+        "反悔的话在这台机器上执行 `shutdown /a` 取消。",
+        "",
+        "收尾脚本输出：", "", "```", tail, "```",
+    ]))
+    log_event(log, "listener.dispatch", command=SHUTDOWN, delay=SHUTDOWN_DELAY_SEC)
     subprocess.Popen(["shutdown", "/s", "/t", str(SHUTDOWN_DELAY_SEC),
                       "/c", "quant-biga: shutdown by email command"])
 
