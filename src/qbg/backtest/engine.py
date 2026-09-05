@@ -54,6 +54,7 @@ from qbg.backtest.metrics import (
     information_coefficient,
 )
 from qbg.execution import fees
+from qbg.strategy import topk_weights
 from qbg.utils.logging import get_logger, log_event
 
 log = get_logger(__name__)
@@ -133,6 +134,7 @@ def target_weights_from_scores(
     k: int,
     total_weight: float = 0.95,
     tradable: pd.DataFrame | None = None,
+    fixed_slots: bool = False,
 ) -> pd.DataFrame:
     """每日分数 → 等权 top-K 目标权重。
 
@@ -141,6 +143,16 @@ def target_weights_from_scores(
     交易，一个典型的前视偏差。
 
     `tradable` 为 False 的票不参与选择：停牌股排进 top-K 只会白占一个槽位。
+
+    `fixed_slots` 决定**候选不足 k 只时那笔钱去哪**：
+
+      * `False`（默认，排序型打分）：按实际选中数归一，仓位摊满。模型分数
+        每天都有几百个非空值，选中数恒等于 k，这一分支的行为和固定槽位一样。
+      * `True`（阈值型打分）：按 k 归一，没填满的槽位**留成现金**。
+        「3日涨幅>5%」这类条件在某些日子只有一只票合格，按实际数归一会把
+        95% 仓位压到那一只上 —— 而真实下单流程（`execution/order_planner`）
+        是按固定槽位预算下的单，槽位空着就是现金，没有任何环节会做那件事。
+        不区分的话，阈值型策略的回测收益里会混进一个它实盘拿不到的杠杆。
     """
     if scores.empty or k <= 0:
         return pd.DataFrame(index=scores.index, columns=scores.columns, dtype=float)
@@ -150,9 +162,39 @@ def target_weights_from_scores(
     ranks = usable.rank(axis=1, ascending=False, method="first")
     picked = (ranks <= k) & usable.notna()
     n_picked = picked.sum(axis=1).replace(0, np.nan)
-    weights = picked.astype(float).div(n_picked, axis=0) * total_weight
+    denom = float(k) if fixed_slots else n_picked
+    weights = picked.astype(float).div(denom, axis=0) * total_weight
     # 关键的一步 shift：t 日的分数决定 t+1 日开盘的持仓。
     return weights.shift(1).fillna(0.0)
+
+
+def _hysteresis_target(
+    row: pd.Series,
+    held: set,
+    k: int,
+    keep_rank: int,
+    total_weight: float,
+    fixed_slots: bool,
+) -> pd.Series:
+    """迟滞选股的当日目标权重：持仓股还在前 `keep_rank` 名内就留着。
+
+    这一步**必须在循环里**做，因为选谁取决于当天持有谁——路径依赖，没法
+    像普通 top-K 那样预先算成一张表。引擎此前表达不了 `QBG_KEEP_RANK`，
+    于是实盘有这个参数、回测却验不了它，和 `rebalance_every` 当初是同一个洞。
+
+    排序用 `rank(method="first")` 而不是 `sort_values`：要和非迟滞路径的
+    并列处理**逐位一致**，否则两条路径在有并列分数时会选出不同的票，
+    而这种差异只在特定数据上出现，最难查。
+    """
+    ranks = row.rank(ascending=False, method="first")
+    ordered = ranks.dropna().sort_values().index.tolist()
+    selected = topk_weights.select_with_hysteresis(ordered, held, k, keep_rank)
+
+    w = pd.Series(0.0, index=row.index)
+    if selected:
+        denom = float(k) if fixed_slots else float(len(selected))
+        w.loc[selected] = total_weight / denom
+    return w
 
 
 def _step_weights(
@@ -198,8 +240,11 @@ def run_backtest(
     k: int = 3,
     total_weight: float = 0.95,
     rebalance_every: int = 1,
+    rebalance_phase: int = 0,
+    keep_rank: int = 0,
     extra_slippage: float = 0.0,
     fee_profile: fees.FeeProfile | None = None,
+    fixed_slots: bool = False,
     slippage_grid: tuple[float, ...] = (0.0, 0.001, 0.002, 0.003),
 ) -> BacktestResult:
     """跑一次 top-K 回测。
@@ -208,6 +253,18 @@ def run_backtest(
     `QBG_REBALANCE_EVERY_DAYS`。默认 1 = 每日调仓。非调仓日完全不碰组合 ——
     这是引擎此前根本表达不了的一件事：实盘有这个参数，而回测只会每天调，
     于是任何关于调仓频率的结论都无从验证。
+
+    `rebalance_phase` 决定**在哪些天调仓**：`every=3` 时相位 0 用第 0/3/6… 天，
+    相位 1 用第 1/4/7… 天。这几组日子几乎不重叠，所以固定相位会把"持有期"
+    和"碰巧在哪些天下的单"混在一起 —— 在 k 小、窗口短的时候，后者能贡献
+    上百个百分点的年化差异。**比较调仓频率时必须扫遍 0..every-1 全部相位
+    再取平均**，相位之间的离散度本身就是结论：散得厉害说明单相位的数字
+    没有信息量。
+
+    `keep_rank` 是**迟滞选股**的保留名次，对应实盘的 `QBG_KEEP_RANK`：
+    持仓股只要还在当日前 `keep_rank` 名内就不换人。`0` = 关闭。这条同样是
+    实盘有、回测原先验不了的参数；而它恰恰是**唯一能在不改信号的前提下压
+    换手**的杠杆（quant-trading 实测把日均换手 0.745 压到 0.524）。
 
     基准是**股票池等权买入持有**——回答"这个模型比无脑等权持有强在哪"，
     比拿沪深300 指数当基准更能隔离出选股能力（指数是市值加权，混进了
@@ -219,7 +276,11 @@ def run_backtest(
 
     scores = scores.reindex(index=panel.dates, columns=panel.instruments)
     tradable = ~panel.suspended
-    w_target = target_weights_from_scores(scores, k, total_weight, tradable)
+    w_target = target_weights_from_scores(scores, k, total_weight, tradable, fixed_slots)
+    # 迟滞要在循环里逐日选股（见 `_hysteresis_target`）。这里预先把"当日可交易 +
+    # 尚未 shift"的分数备好，和 `target_weights_from_scores` 里的口径完全一致：
+    # 按**信号日**的可交易性过滤，再由次日开盘执行。
+    ranking_scores = scores.where(tradable) if keep_rank > 0 else None
     asset_ret = panel.open_to_open_returns()
 
     daily_returns, weight_rows, traded_turnover = [], [], []
@@ -237,8 +298,18 @@ def run_backtest(
         # 注意这里没有实现实盘的 `rebalance_drift_band`（漂移小于 3% 就不动）：
         # 调仓日这里会走满到目标。差别只在调仓日的换手上，方向是**高估**换手，
         # 也就是对低频那一侧不利 —— 结论若仍偏向低频，那是保守的。
-        target = (w_target.loc[day] if rebalance_every <= 1 or index % rebalance_every == 0
-                  else w_prev)
+        is_rebalance_day = (rebalance_every <= 1
+                            or index % rebalance_every == rebalance_phase % rebalance_every)
+        if not is_rebalance_day:
+            target = w_prev
+        elif ranking_scores is None:
+            target = w_target.loc[day]
+        elif index == 0:
+            target = pd.Series(0.0, index=panel.instruments)  # 没有前一日分数
+        else:
+            target = _hysteresis_target(
+                ranking_scores.iloc[index - 1], set(w_prev.index[w_prev > 0]),
+                k, keep_rank, total_weight, fixed_slots)
         w_new, blocked = _step_weights(
             w_prev, target,
             panel.suspended.loc[day],
@@ -302,7 +373,7 @@ def run_backtest(
         buy_cost_rate=buy_rate,
         sell_cost_rate=sell_rate,
     )
-    log_event(log, "backtest.done", k=k, n_days=len(ret_s),
+    log_event(log, "backtest.done", k=k, keep_rank=keep_rank, n_days=len(ret_s),
               sharpe=round(result.strategy.sharpe, 3),
               rank_ic=round(rank_ic, 4),
               avg_turnover=round(result.avg_turnover, 3),

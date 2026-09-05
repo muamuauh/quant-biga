@@ -123,6 +123,91 @@ def test_target_weights_equal_weight_top_k():
     assert row["300750.SZ"] == 0.0
 
 
+def test_fixed_slots_leaves_unfilled_slots_in_cash():
+    """阈值型打分：合格的票不足 k 只时，剩下的槽位是**现金**，不是加仓。
+
+    默认（排序型）按实际选中数归一，一只票就吃满仓位；阈值型必须按 k 归一。
+    这是两条完全不同的曲线，混用等于给回测偷偷加杠杆。
+    """
+    scores = flat_scores([3.0, np.nan, np.nan], 3)
+
+    spread = engine.target_weights_from_scores(scores, k=3, total_weight=0.9)
+    assert spread.iloc[-1]["600519.SH"] == pytest.approx(0.9)
+
+    slots = engine.target_weights_from_scores(scores, k=3, total_weight=0.9, fixed_slots=True)
+    assert slots.iloc[-1]["600519.SH"] == pytest.approx(0.3)
+    assert slots.iloc[-1].sum() == pytest.approx(0.3)
+
+
+def test_fixed_slots_is_a_noop_when_all_slots_fill():
+    """候选够 k 只时两种归一方式必须逐位一致 —— 否则模型那条线也会被改动。"""
+    scores = flat_scores([3.0, 2.0, 1.0], 3)
+    a = engine.target_weights_from_scores(scores, k=2, total_weight=0.9)
+    b = engine.target_weights_from_scores(scores, k=2, total_weight=0.9, fixed_slots=True)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_hysteresis_keeps_a_holding_that_slipped_out_of_top_k():
+    """迟滞的全部意义：掉到第 k 名之外但还在 keep_rank 内，不换人。
+
+    没有它，排名每天抖一下就换一次仓，而换手是这套系统里最贵的东西。
+    """
+    # 分数在第3天翻转：600519 从第1名掉到第3名，仍在 keep_rank=3 内。
+    # 信号 shift 一天，所以这个翻转要到第4天开盘才可能被执行。
+    scores = pd.DataFrame(
+        [[3.0, 2.0, 1.0],
+         [3.0, 2.0, 1.0],
+         [1.0, 3.0, 2.0],
+         [1.0, 3.0, 2.0],
+         [1.0, 3.0, 2.0]],
+        index=DATES[:5], columns=INSTS)
+    panel = make_panel([[10.0, 10.0, 10.0]] * 5)
+
+    plain = engine.run_backtest(scores, panel, k=1, total_weight=1.0,
+                                slippage_grid=())
+    kept = engine.run_backtest(scores, panel, k=1, total_weight=1.0, keep_rank=3,
+                               slippage_grid=())
+    # 无迟滞：换成当日第1名 000858；有迟滞：600519 还在前3名内，不动
+    assert plain.weights.iloc[-1]["000858.SZ"] == pytest.approx(1.0)
+    assert kept.weights.iloc[-1]["600519.SH"] == pytest.approx(1.0)
+    assert kept.avg_turnover < plain.avg_turnover
+
+
+def test_hysteresis_with_keep_rank_equal_k_matches_plain_topk():
+    """keep_rank <= k 时迟滞不该改变任何东西——否则它悄悄换了一套选股逻辑。"""
+    scores = pd.DataFrame(
+        [[3.0, 2.0, 1.0], [1.0, 3.0, 2.0], [2.0, 1.0, 3.0], [3.0, 1.0, 2.0],
+         [1.0, 2.0, 3.0]],
+        index=DATES[:5], columns=INSTS)
+    panel = make_panel([[10.0, 11.0, 12.0]] * 5)
+    plain = engine.run_backtest(scores, panel, k=2, slippage_grid=())
+    kept = engine.run_backtest(scores, panel, k=2, keep_rank=2, slippage_grid=())
+    pd.testing.assert_frame_equal(plain.weights, kept.weights)
+
+
+def test_rebalance_phase_shifts_which_days_are_traded():
+    """相位决定在哪些天调仓。固定相位会把"持有期"和"碰巧哪天下单"混在一起。"""
+    scores = pd.DataFrame(
+        [[3.0, 2.0, 1.0], [1.0, 3.0, 2.0], [2.0, 1.0, 3.0], [3.0, 1.0, 2.0],
+         [1.0, 2.0, 3.0], [2.0, 3.0, 1.0]],
+        index=DATES[:6], columns=INSTS)
+    panel = make_panel([[10.0, 11.0, 12.0]] * 6)
+    a = engine.run_backtest(scores, panel, k=1, rebalance_every=2,
+                            rebalance_phase=0, slippage_grid=())
+    b = engine.run_backtest(scores, panel, k=1, rebalance_every=2,
+                            rebalance_phase=1, slippage_grid=())
+    assert not a.weights.equals(b.weights)
+
+
+def test_rebalance_phase_is_a_noop_at_daily_rebalance():
+    """每日调仓时每天都调，相位无从谈起 —— 不该悄悄改变基准臂。"""
+    scores = flat_scores([3.0, 2.0, 1.0], 4)
+    panel = make_panel([[10.0, 11.0, 12.0]] * 4)
+    a = engine.run_backtest(scores, panel, k=2, rebalance_phase=0, slippage_grid=())
+    b = engine.run_backtest(scores, panel, k=2, rebalance_phase=3, slippage_grid=())
+    pd.testing.assert_frame_equal(a.weights, b.weights)
+
+
 def test_target_weights_skip_untradable():
     """停牌股排进 top-K 只会白占一个槽位。"""
     scores = flat_scores([3.0, 2.0, 1.0], 3)
