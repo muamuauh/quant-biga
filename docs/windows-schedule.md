@@ -231,6 +231,52 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_schedule.ps1 -Remove
 关着或睡着的那天，开机后能自动补上**。任务设置里的 `StartWhenAvailable`
 （错过就尽快补）和 `WakeToRun`（到点唤醒）也是为这个。
 
+### 过期不补跑：窗口闸
+
+`StartWhenAvailable` **没有截止时间**。2026-09-06 之前的表现是：早上没开机的
+那天，晚上一开机 Windows 就把 09:15 的预检和 09:30 的日流程一起补跑 ——
+**预检会在晚上打开系统代理、开 TUN、拉起同花顺下单端**。使用者看到的就是
+"我没让它跑，它自己跑起来了"。
+
+但 `StartWhenAvailable` 要留着：09:35 才开机那天我们**确实**想补上。
+Task Scheduler 表达不了"只补跑两小时以内的"，脚本可以。所以分工是：
+
+> **调度器负责唤起，脚本负责判断这次唤起还算不算数。**
+
+`setup_schedule.ps1` 把 `-ScheduledAt <计划时间> -WindowMinutes <窗口>` 写进
+任务动作，`scripts\window_guard.ps1` 据此判断。超窗就**什么都不做**、退出 0
+（不是失败，不该惊动告警）。
+
+| 情形 | 结果 |
+|---|---|
+| 09:30 触发，09:30 跑 | 正常 |
+| 09:00 开机，09:36 才被唤起 | 正常补跑（窗口内） |
+| 早上没开机，20:00 开机 | **跳过**，不碰代理、不碰同花顺 |
+| 人手工双击 / 终端里跑 | **永远不受限**（手工运行不带 `-ScheduledAt`） |
+| 明知过期也要跑 | 加 `-IgnoreWindow` |
+
+默认窗口 **120 分钟**：09:30 + 2h = 11:30，正好上午收盘。再晚启动的运行即使
+跑完也赶不上有意义的成交，而 `require_trading_session` 是**硬闸**、会在流程跑到
+一半才否决 —— 那时 LLM 复核的钱已经花掉了。
+
+改窗口或关掉：
+
+```powershell
+# 窗口改成 45 分钟
+powershell -ExecutionPolicy Bypass -File scripts\setup_schedule.ps1 -WindowMinutes 45
+
+# 恢复"任何时候被唤起都跑"的老行为
+powershell -ExecutionPolicy Bypass -File scripts\setup_schedule.ps1 -NoWindowGuard
+```
+
+⚠ **改完必须重新注册任务**（跑一次 `setup_schedule.ps1`）。窗口参数是写在
+任务动作里的，已经注册好的旧任务不会自己长出这两个参数。
+
+另外，预检任务被单独叫起来时（09:15）此前**不留任何文件痕迹** —— 出事只剩
+计划任务里一句"上次运行结果 0x1"。现在它认得出自己是被调度器叫起来的
+（带了 `-ScheduledAt`），会自己开 `logs\preflight_YYYYMMDD.log`。手工跑仍然
+只上屏，不产生多余文件。
+
 ---
 
 ## 五、验

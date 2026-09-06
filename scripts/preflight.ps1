@@ -70,7 +70,14 @@ param(
     [switch]$SkipProxyTun,
     [switch]$SkipThsCheck,
     # 持仓源不是 easytrader 时也照样拉起同花顺（手工调试用）。
-    [switch]$ForceLaunchThs
+    [switch]$ForceLaunchThs,
+    # --- 过期不补跑（见 scripts\window_guard.ps1）-----------------------------
+    # 由 setup_schedule.ps1 写进计划任务的动作里，**手工运行不带** —— 不带就
+    # 没有窗口限制。这道闸对预检尤其要紧：预检是有副作用的那一个（开系统代理、
+    # 开 TUN、拉起同花顺下单端），而晚上开机时最不想发生的就是这三件事。
+    [string]$ScheduledAt   = "",
+    [int]   $WindowMinutes = 120,
+    [switch]$IgnoreWindow
 )
 
 $ErrorActionPreference = "Continue"
@@ -82,9 +89,19 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 # **必须自己写文件，不能指望调用方用管道接住。** PowerShell 5.1 的 Write-Host
 # 直接写宿主，**不进管道**（information 流是 6+ 才有的），而计划任务里那个
 # 宿主的输出是被丢弃的 —— 不自己落盘就等于没有日志。
-# run_daily.ps1 会在调用前把当天的运行日志路径塞进 QBG_RUN_LOG；
-# 手工直接跑这个脚本时该变量为空，就只上屏，不产生多余文件。
+# run_daily.ps1 会在调用前把当天的运行日志路径塞进 QBG_RUN_LOG。
+#
+# **被计划任务单独叫起来时（09:15 的预检任务）没人设这个变量**，于是整次运行
+# 不留任何文件痕迹 —— 出事只剩计划任务里一句"上次运行结果 0x1"。所以这里补一个
+# 兜底：认得出自己是被调度器叫起来的（带了 -ScheduledAt），就自己开日志。
+# 人手工跑仍然只上屏，不产生多余文件。
 # ---------------------------------------------------------------------------
+if (-not $env:QBG_RUN_LOG -and $ScheduledAt) {
+    $logDir = Join-Path $ProjectRoot "logs"
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+    $env:QBG_RUN_LOG = Join-Path $logDir ("preflight_{0}.log" -f (Get-Date -Format "yyyyMMdd"))
+}
+
 function Write-Line {
     param([Parameter(Position = 0)][string]$Message = "", [string]$ForegroundColor)
     if ($ForegroundColor) {
@@ -259,6 +276,27 @@ function Get-PortfolioSource {
         if ($m) { return $m.Matches[0].Groups[1].Value.ToLower() }
     }
     return ""
+}
+
+# --- 过期不补跑 -------------------------------------------------------------
+# 必须在**任何副作用之前**。预检往下走就会开系统代理、开 TUN、拉起同花顺，
+# 那三件事一旦做了就不可撤销地改变了这台机器的状态。
+$guardPath = Join-Path $PSScriptRoot "window_guard.ps1"
+if (Test-Path $guardPath) {
+    . $guardPath
+    if (-not $IgnoreWindow) {
+        $skipReason = Get-QbgWindowSkipReason -ScheduledAt $ScheduledAt -WindowMinutes $WindowMinutes
+        if ($skipReason) {
+            Write-Line ""
+            Write-Line "  [SKIP] $skipReason" -ForegroundColor Yellow
+            Write-Line "  [SKIP] 这是 -StartWhenAvailable 的过期补跑，不做任何操作。" -ForegroundColor Yellow
+            Write-Line "         强制运行请加 -IgnoreWindow。"
+            exit 0
+        }
+    }
+} elseif ($ScheduledAt) {
+    # 告警不中止：闸是便利设施不是安全闸（理由同 run_daily.ps1）。
+    Write-Line "  [WARN] 找不到 $guardPath —— 本次不做过期判断。" -ForegroundColor Yellow
 }
 
 Write-Line ""

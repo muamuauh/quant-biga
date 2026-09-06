@@ -96,6 +96,21 @@ param(
     # 已经覆盖了那个场景，不需要额外的触发器。
     [switch]$WithStartupTrigger,
     [switch]$NoStartupTrigger,
+    # --- 过期不补跑 ----------------------------------------------------------
+    # `-StartWhenAvailable`（"错过计划开始时间后尽快启动"）**没有截止时间**：
+    # 早上没开机的那天，晚上一开机 Windows 就把 09:15 的预检和 09:30 的日流程
+    # 一起补跑 —— 预检会在晚上打开系统代理、开 TUN、拉起同花顺下单端。
+    #
+    # 但 `-StartWhenAvailable` 要留着：09:35 才开机那天我们**确实**想补上。
+    # 调度器表达不了"只补跑两小时以内的"，脚本可以。所以把计划时间和窗口写进
+    # 任务动作，由 scripts\window_guard.ps1 判断这次唤起还算不算数。
+    #
+    # 120 分钟：09:30 + 2h = 11:30，正好是上午收盘。再晚启动的运行即使跑完也
+    # 赶不上有意义的成交，而 daily_cycle 的 session_guard 是硬闸、会在流程跑到
+    # 一半才否决 —— 那时 LLM 复核的钱已经花掉了。
+    [int]$WindowMinutes = 120,
+    # 关掉窗口闸，恢复"任何时候被唤起都跑"的老行为。
+    [switch]$NoWindowGuard,
     [switch]$Remove
 )
 
@@ -204,7 +219,13 @@ function Register-QbgTask {
         [switch]$WithStartupTrigger,
         [int]$TimeLimitHours = 2
     )
+    # 把"本该几点跑"和"迟到多久还算数"写进任务动作本身。任务因此是自描述的：
+    # 从任务计划程序里看动作那一行，就知道它的窗口是什么，不用去翻脚本默认值。
+    # **手工运行不带这两个参数，所以永远不受窗口限制**（window_guard.ps1）。
     $argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $Script
+    if (-not $NoWindowGuard) {
+        $argLine += ' -ScheduledAt "{0}" -WindowMinutes {1}' -f $At, $WindowMinutes
+    }
     $action  = New-ScheduledTaskAction -Execute $Shell -Argument $argLine -WorkingDirectory $ProjectRoot
 
     $triggers = @(New-ScheduledTaskTrigger -Daily -At $At)
@@ -222,6 +243,10 @@ function Register-QbgTask {
     }
 
     # StartWhenAvailable：到点时机器关着/睡着的那天，开机后尽快补跑。
+    #     **它没有截止时间** —— 晚上才开机也会补跑。截止时间由脚本侧的
+    #     window_guard 判（见上面 -WindowMinutes）。分工：调度器负责唤起，
+    #     脚本负责判断这次唤起还算不算数。两者缺一：只留调度器 = 晚上乱跑；
+    #     只留脚本 = 09:35 开机那天根本不会被唤起。
     # WakeToRun：机器睡着时到点唤醒它（BIOS/电源计划禁用唤醒定时器则无效）。
     # IgnoreNew：上一次还没跑完就不再起第二个 —— run_daily.ps1 里的文件锁是
     #            第二道，这里是第一道，两道都要，因为文件锁挡不住任务本身被
@@ -259,6 +284,8 @@ function Register-QbgTask {
     Write-Host ("  命令       : {0}" -f $argLine)
     Write-Host ("  触发器     : {0}" -f (($task.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ", "))
     Write-Host ("  下次运行   : {0}" -f $info.NextRunTime)
+    Write-Host ("  过期窗口   : {0}" -f $(if ($NoWindowGuard) { "已关闭（任何时候被唤起都跑）" }
+                                        else { "计划时间后 $WindowMinutes 分钟内有效" }))
     Write-Host "------------------------------------------------------------"
 }
 

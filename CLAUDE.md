@@ -270,8 +270,35 @@ SendKeys 只能送到**同一个交互会话**里的 Clash；同花顺自动化�
 - 计划任务的 `RunLevel` 固定 `Limited`。同花顺以普通权限跑，Python 也必须是
   普通权限，否则 UIPI 静默丢输入（§七）。
 
-### 三个 `.ps1` 必须带 UTF-8 BOM
+### 过期不补跑：调度器唤起，脚本判断算不算数
+
+`-StartWhenAvailable`（错过就尽快补）**没有截止时间** —— 早上没开机的那天，
+晚上一开机就把预检和日流程一起补跑，而预检会在晚上开系统代理、开 TUN、
+拉起同花顺。但它又必须留着：09:35 才开机那天确实想补上。
+
+Task Scheduler 表达不了"只补跑两小时以内的"，所以窗口判断在脚本侧
+（`scripts/window_guard.ps1`，`setup_schedule.ps1` 把 `-ScheduledAt` /
+`-WindowMinutes` 写进任务动作）。两条纪律：
+
+- **手工运行不带 `-ScheduledAt`，因此永远不受窗口限制。** 别为了"统一"给
+  手工入口也加上默认值 —— 盘后跑 `--dry-run` 是完全正当的用法。
+- **预检的闸必须在任何副作用之前。** 开代理/开 TUN/拉同花顺一旦做了就收不
+  回来，闸放在它们之后等于白设。`tests/test_schedule_window.py` 钉住了这个顺序。
+
+窗口闸是便利设施**不是安全闸**：`window_guard.ps1` 丢了或时间格式解析不了，
+一律告警放行。让日流程从此静默不跑，比多跑一次过期补跑严重得多。
+
+### 每一个 `.ps1` 都必须带 UTF-8 BOM
 
 计划任务用 System32 的 `powershell.exe`（5.1），没有 BOM 它按 GBK 读，
-中文全乱。**不要**改用 `pwsh.exe`：本机那份装在 WindowsApps 下，是应用执行
-别名，session 0 里解析不开，报的还是「找不到文件」。
+中文全乱。**新增脚本时一并照做**（这里原本写着个数，加一个脚本就过时一次）。
+**不要**改用 `pwsh.exe`：本机那份装在 WindowsApps 下，是应用执行别名，
+session 0 里解析不开，报的还是「找不到文件」。
+
+```powershell
+# 一条命令查全部
+Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+    $b = [System.IO.File]::ReadAllBytes($_.FullName)[0..2]
+    "{0,-32} {1}" -f $_.Name, $(if ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { "BOM ok" } else { "**缺 BOM**" })
+}
+```

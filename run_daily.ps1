@@ -40,6 +40,13 @@
 param(
     [switch]$SkipPreflight,
     [switch]$Pause,
+    # --- 过期不补跑（见 scripts\window_guard.ps1）-----------------------------
+    # 这两个由 setup_schedule.ps1 写进计划任务的动作里，**手工运行不带** ——
+    # 不带就没有窗口限制，人在任何时候都能跑。
+    [string]$ScheduledAt   = "",
+    [int]   $WindowMinutes = 120,
+    # 明知过期也要跑（补一次昨天的、或者调试）。
+    [switch]$IgnoreWindow,
     # daily_cycle 的参数原样透传：--dry-run / --retrain / --skip-ingest /
     # --date YYYY-MM-DD / --force
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -89,6 +96,31 @@ function Write-Boot([string]$level, [string]$msg) {
     $line = "{0} {1} {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $level, $msg
     try { Add-Content -LiteralPath $BootLog -Value $line -Encoding UTF8 } catch { }
     Write-Run $line
+}
+
+# ---------------------------------------------------------------------------
+# 过期不补跑
+#
+# 必须在**互斥锁之前**判：过期的补跑不该去争锁，更不该在拿不到锁时留下一条
+# "已有实例在运行"的误导记录。也必须在预检之前 —— 预检有副作用（开系统代理、
+# 开 TUN、拉起同花顺），而这正是晚上开机时最不想发生的事。
+# ---------------------------------------------------------------------------
+$guardPath = Join-Path $ProjectRoot "scripts\window_guard.ps1"
+if (Test-Path $guardPath) {
+    . $guardPath
+    if (-not $IgnoreWindow) {
+        $skipReason = Get-QbgWindowSkipReason -ScheduledAt $ScheduledAt -WindowMinutes $WindowMinutes
+        if ($skipReason) {
+            Write-Boot "SKIP" $skipReason
+            Write-Boot "SKIP" "这是 -StartWhenAvailable 的过期补跑，已跳过。强制运行请加 -IgnoreWindow。"
+            exit 0
+        }
+    }
+} elseif ($ScheduledAt) {
+    # **告警而不是中止。** 这道闸是便利设施不是安全闸 —— 文件丢了就让日流程
+    # 从此不跑，比多跑一次过期补跑严重得多。tests/test_schedule_window.py
+    # 会在 CI 阶段挡住"文件被删/没接线"这种情况。
+    Write-Boot "WARN" "找不到 $guardPath —— 本次不做过期判断，照常运行。"
 }
 
 # ---------------------------------------------------------------------------
