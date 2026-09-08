@@ -18,7 +18,14 @@ params:
     scope: settings
     tier: A
     type: int
-    allowed: [0, 20, 50, 100, 200]
+    allowed: [0, 20, 50, 100, 150, 200, 250]
+  # 择时迟滞缓冲带。见 config.py 的实测表：它治的是抖动（1620 日翻 75 次），
+  # 不是"太保守"。上限 0.05 —— 再宽就等于关掉择时，那该直接把 sma 设 0。
+  qbg_market_sma_band:
+    scope: settings
+    tier: A
+    type: float
+    allowed: [0.0, 0.01, 0.02, 0.03, 0.05]
   qbg_industry_neutral:
     scope: settings
     tier: A

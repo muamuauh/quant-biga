@@ -141,7 +141,8 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         dates.append(pd.Timestamp(row.date))
     filtered = affordable_scores(scores, last, equity, settings.qbg_top_k,
                                  cap=float(limits["max_position_pct"]))
-    risk_on = market_risk_on(list(last), settings.qbg_market_sma)
+    risk_on = market_risk_on(list(last), settings.qbg_market_sma,
+                             band=settings.qbg_market_sma_band)
     review_verdicts, review_usage = [], {}
     reviewed_scores = filtered
     if risk_on and settings.qbg_agents_enabled:
