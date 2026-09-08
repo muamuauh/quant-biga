@@ -122,3 +122,56 @@ def test_suspended_rows_are_kept():
     df["is_suspended"] = [False, True]
     out = qlib_dump.to_qlib_frame(df, "600519.SH")
     assert len(out) == 2
+
+
+def test_dump_uses_a_separate_csv_dir_for_a_non_default_provider(tmp_path, monkeypatch):
+    """另辟 bin 时 CSV 中转目录必须分开。
+
+    `dump_bin.py` 把目录里的**每一个** CSV 都塞进 bin。两个池子共用一个 CSV
+    目录的话，小池子那份 bin 也会被灌进大池子的票 —— 而 instruments 清单看
+    起来还是对的，很难发现。
+    """
+    from qbg.data import qlib_dump
+
+    seen = {}
+
+    def fake_export(members, csv_dir=None, parquet_root=None):
+        seen["csv_dir"] = csv_dir
+        return {"exported": 0}
+
+    def fake_instruments(members, provider_uri=None, name="all", parquet_root=None):
+        seen["instruments_uri"] = provider_uri
+        return tmp_path / "instruments.txt"
+
+    def fake_dump_bin(csv_dir=None, provider_uri=None):
+        seen["bin_uri"] = provider_uri
+        return {"status": "ok"}
+
+    monkeypatch.setattr(qlib_dump, "export_csv", fake_export)
+    monkeypatch.setattr(qlib_dump, "write_instruments", fake_instruments)
+    monkeypatch.setattr(qlib_dump, "run_dump_bin", fake_dump_bin)
+
+    ext = tmp_path / "qlib_bin" / "cn_data_ext"
+    qlib_dump.dump(["600519.SH"], provider_uri=ext)
+    assert seen["instruments_uri"] == ext
+    assert seen["bin_uri"] == ext
+    assert seen["csv_dir"].name.endswith("cn_data_ext")
+
+
+def test_dump_keeps_the_production_csv_dir_unchanged(tmp_path, monkeypatch):
+    """不传 provider_uri 时路径必须和以前逐字一致，否则会白搬一次目录。"""
+    from qbg.config import settings
+    from qbg.data import qlib_dump
+
+    seen = {}
+    monkeypatch.setattr(qlib_dump, "export_csv",
+                        lambda m, csv_dir=None, parquet_root=None:
+                        seen.update(csv_dir=csv_dir) or {"exported": 0})
+    monkeypatch.setattr(qlib_dump, "write_instruments",
+                        lambda m, provider_uri=None, name="all", parquet_root=None:
+                        tmp_path / "i.txt")
+    monkeypatch.setattr(qlib_dump, "run_dump_bin",
+                        lambda csv_dir=None, provider_uri=None: {"status": "ok"})
+
+    qlib_dump.dump(["600519.SH"])
+    assert seen["csv_dir"] == settings.qlib_provider_uri.parent / "qlib_csv"
