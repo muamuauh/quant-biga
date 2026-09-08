@@ -26,6 +26,13 @@ params:
     tier: A
     type: float
     allowed: [0.0, 0.01, 0.02, 0.03, 0.05]
+  # 择时指数是否只算当天确实在指数里的票。和缓冲带**捆绑**：单独开任何一个
+  # 都过不了八项闸，两个一起才过。见 config.py 的实测表。
+  qbg_market_index_eligible:
+    scope: settings
+    tier: A
+    type: int
+    allowed: [0, 1]
   qbg_industry_neutral:
     scope: settings
     tier: A

@@ -74,7 +74,8 @@ def is_risk_on(level: pd.Series, sma_window: int, band: float = 0.0) -> bool:
 
 def equal_weight_index(codes_list: list[str], root: Path | None = None,
                        price_column: str = "close",
-                       eligible: pd.DataFrame | None = None) -> pd.Series:
+                       eligible: pd.DataFrame | None = None,
+                       use_inclusion: bool = False) -> pd.Series:
     """从本项目 parquet 构造**等权组合的净值曲线**，作为市场状态代理。
 
     实现是「每日等权收益累乘」，不是「归一化价格取平均」。这个区别至关重要，
@@ -99,7 +100,9 @@ def equal_weight_index(codes_list: list[str], root: Path | None = None,
     所以成分随时间变化不会在曲线上留下跳变。
 
     `eligible`（`date × code` 布尔表，见 `data.universe.eligibility_mask`）传进来
-    时，只有当天**确实在指数里**的票参与平均。不传就是老口径：拿今天的成分
+    时，只有当天**确实在指数里**的票参与平均。`use_inclusion=True` 是它的便利
+    形式：自己去查纳入日期建表（生产链路用这条，因为那里只有代码表没有面板）。
+    两者都给时 `eligible` 优先。不传就是老口径：拿今天的成分
     回看历史，于是 2020 年的曲线里混着 2026 年才被纳入的票 —— 而它们被纳入
     恰恰因为这几年涨得好。**择时信号会因此看到一条比真实市场更强的曲线**，
     SMA 的穿越点也就跟着偏。QBG_MARKET_SMA 那张压测表是在老口径上选出来的。
@@ -114,6 +117,13 @@ def equal_weight_index(codes_list: list[str], root: Path | None = None,
     if not columns:
         return pd.Series(dtype=float)
     prices = pd.DataFrame(columns).sort_index().ffill()
+    if eligible is None and use_inclusion:
+        # 生产链路用这条：只知道 codes_list，日期索引要读完缓存才有，所以
+        # 在这里就地建表，而不是让调用方先算一遍指数拿索引（那要多读一遍
+        # 299 个 parquet，日流程里是几十秒）。
+        from qbg.data.universe import eligibility_mask
+
+        eligible = eligibility_mask(prices.index, prices.columns)
     changes = prices.pct_change()
     if eligible is not None:
         # 先算收益再屏蔽，不能先屏蔽价格 —— 后者会让"刚被纳入"那天冒出一个
@@ -126,9 +136,13 @@ def equal_weight_index(codes_list: list[str], root: Path | None = None,
 
 
 def market_risk_on(codes_list: list[str], sma_window: int | None = None,
-                   root: Path | None = None, band: float | None = None) -> bool:
+                   root: Path | None = None, band: float | None = None,
+                   use_inclusion: bool | None = None) -> bool:
     """读取缓存并报告当前市场状态。"""
     window = settings.qbg_market_sma if sma_window is None else sma_window
     width = settings.qbg_market_sma_band if band is None else band
-    return is_risk_on(equal_weight_index(codes_list, root), window, width)
+    incl = (bool(settings.qbg_market_index_eligible) if use_inclusion is None
+            else use_inclusion)
+    level = equal_weight_index(codes_list, root, use_inclusion=incl)
+    return is_risk_on(level, window, width)
 

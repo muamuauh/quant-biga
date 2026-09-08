@@ -105,3 +105,30 @@ def pytest_approx(x, rel=1e-9):
 def test_equal_weight_index_signature_accepts_eligible():
     """接线：脚本要靠它做修正版指数，签名少一个参数就整条链断了。"""
     assert "eligible" in inspect.signature(equal_weight_index).parameters
+
+
+# ----------------------------------------------------------------------
+# 指数口径开关 —— 和缓冲带捆绑，单独开任何一个都过不了八项闸
+# ----------------------------------------------------------------------
+
+def test_index_eligible_switch_defaults_to_off():
+    """默认必须是老行为，否则这个新开关会悄悄换掉生产的择时信号。"""
+    from qbg.config import settings
+
+    assert int(settings.qbg_market_index_eligible) == 0
+    assert float(settings.qbg_market_sma_band) == 0.0
+
+
+def test_market_risk_on_reads_both_switches():
+    """接线：两个参数都在 config 里，market_risk_on 必须真的读它们。
+
+    本项目被"参数存在但没人读"坑过三次；这两个是第四、第五个同形状的。
+    """
+    src = inspect.getsource(__import__("qbg.strategy.regime", fromlist=["x"]).market_risk_on)
+    assert "qbg_market_sma_band" in src
+    assert "qbg_market_index_eligible" in src
+
+
+def test_equal_weight_index_use_inclusion_is_a_parameter():
+    """生产链路只有代码表、没有面板，所以必须能让它自己建资格表。"""
+    assert "use_inclusion" in inspect.signature(equal_weight_index).parameters
