@@ -82,8 +82,13 @@ def main(argv=None) -> int:
 
     regime = "关闭"
     if settings.qbg_market_sma:
-        level = equal_weight_index(members).reindex(panel.dates).ffill()
-        on = risk_on_series(level, settings.qbg_market_sma).reindex(panel.dates).fillna(True)
+        # **信号在完整历史上算，不能先 reindex 到模型窗再算 SMA。**
+        # `risk_on_series` 的 min_periods=sma_window：388 天的窗口里 SMA100 前 100 天
+        # 没有信号（默认 risk-on）、SMA200 只剩 188 天、更长的干脆整段没有 —— 长窗口
+        # 会静默退化成「不择时」，看起来像「长 SMA 更差」。生产的 `market_risk_on()`
+        # 读的是完整 parquet 历史。2026-09-08 修，和 19/20 号是同一个坑。
+        level = equal_weight_index(members)
+        on = risk_on_series(level, settings.qbg_market_sma).reindex(panel.dates).ffill().fillna(True)
         scores = scores.where(on)
         regime = f"SMA={settings.qbg_market_sma}"
 

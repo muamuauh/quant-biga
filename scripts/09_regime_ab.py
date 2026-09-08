@@ -53,7 +53,12 @@ def main(argv=None) -> int:
     panel = panel_mod.build_panel(members, start=str(scores.index.min().date()),
                                   end=str(scores.index.max().date()))
     scores = scores.reindex(index=panel.dates, columns=panel.instruments)
-    level = equal_weight_index(members).reindex(panel.dates).ffill()
+    # **信号在完整历史上算，不能先 reindex 到模型窗再算 SMA。**
+    # `risk_on_series` 的 min_periods=sma_window：388 天的窗口里 SMA100 前 100 天
+    # 没有信号（默认 risk-on）、SMA200 只剩 188 天、更长的干脆整段没有 —— 长窗口
+    # 会静默退化成「不择时」，看起来像「长 SMA 更差」。生产的 `market_risk_on()`
+    # 读的是完整 parquet 历史。2026-09-08 修，和 19/20 号是同一个坑。
+    level = equal_weight_index(members)
 
     print(f"窗口 {panel.dates[0].date()} ~ {panel.dates[-1].date()}   "
           f"{len(panel.dates)} 个交易日   k={args.k}   "
@@ -66,7 +71,7 @@ def main(argv=None) -> int:
         if w <= 0:
             masked, label, invested = scores, "关闭择时", 1.0
         else:
-            on = risk_on_series(level, w).reindex(panel.dates).fillna(True)
+            on = risk_on_series(level, w).reindex(panel.dates).ffill().fillna(True)
             masked = scores.where(on)
             label, invested = f"SMA={w}", float(on.mean())
         res = engine.run_backtest(masked, panel, k=args.k)
