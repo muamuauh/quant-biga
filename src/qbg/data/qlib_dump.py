@@ -165,7 +165,13 @@ def run_dump_bin(csv_dir: Path | None = None,
         "--date_field_name", "date",
         "--symbol_field_name", "symbol",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # `text=True` 不指定 encoding 时按**本机 ANSI 代码页**解码（本机是 GBK）。
+    # qlib 的 dump_bin 打进度条和路径，含 UTF-8 字节 → UnicodeDecodeError 在
+    # subprocess 的读线程里抛出，主线程只看到 stdout/stderr **是空的**，
+    # 而 returncode 仍然是 0。真失败时的中文报错就这么丢了。
+    # errors="replace"：宁可看到几个替换符，也不要整段日志消失。
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
     ok = proc.returncode == 0
     log_event(log, "qlib_dump.dump_bin",
               ok=ok, returncode=proc.returncode,
@@ -175,9 +181,27 @@ def run_dump_bin(csv_dir: Path | None = None,
             "stderr": (proc.stderr or "")[-2000:]}
 
 
-def dump(members: list[str], parquet_root: Path | None = None) -> dict:
-    """完整流程：导出 CSV → 写 instruments → 转 bin。"""
-    csv_summary = export_csv(members, parquet_root=parquet_root)
-    inst = write_instruments(members, parquet_root=parquet_root)
-    bin_result = run_dump_bin()
-    return {"csv": csv_summary, "instruments": str(inst), "bin": bin_result}
+def dump(members: list[str], parquet_root: Path | None = None,
+         provider_uri: Path | None = None) -> dict:
+    """完整流程：导出 CSV → 写 instruments → 转 bin。
+
+    `provider_uri` 不传就写**生产那份** bin（`settings.qlib_provider_uri`）。
+    传了就写到指定目录，用来在不动生产的前提下试新股票池 —— 扩池要重建 bin，
+    而 workflow 的 `instruments: all` 意味着 bin 里有什么就训什么，直接覆盖
+    等于**静默换掉生产模型的训练池**。
+
+    CSV 中转目录跟着 `provider_uri` 的名字走。`dump_bin.py` 会把目录里的
+    **每一个** CSV 都塞进 bin，两个池子共用一个 CSV 目录的话，小池子那份 bin
+    也会被灌进大池子的票 —— 而 instruments 清单看起来还是对的，很难发现。
+    """
+    provider_uri = provider_uri or settings.qlib_provider_uri
+    # 生产那份保持原路径不变（不制造无谓的目录搬迁）；只有另辟的 bin 才带后缀。
+    csv_dir = (provider_uri.parent / _CSV_SUBDIR
+               if provider_uri == settings.qlib_provider_uri
+               else provider_uri.parent / f"{_CSV_SUBDIR}_{provider_uri.name}")
+    csv_summary = export_csv(members, csv_dir=csv_dir, parquet_root=parquet_root)
+    inst = write_instruments(members, provider_uri=provider_uri,
+                             parquet_root=parquet_root)
+    bin_result = run_dump_bin(csv_dir=csv_dir, provider_uri=provider_uri)
+    return {"csv": csv_summary, "instruments": str(inst), "bin": bin_result,
+            "provider_uri": str(provider_uri)}

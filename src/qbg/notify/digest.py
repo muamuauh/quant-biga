@@ -215,6 +215,9 @@ def daily_report_path(when: str) -> Path | None:
 SKIP_LABELS = {
     "not_rebalance_day": "监控日",
     "not_trading_day": "非交易日",
+    # 盘前/盘后触发的安静跳过**不是故障**，主题不带 ⚠。每天登录都收到一封
+    # 像出事了的邮件，人很快就不看邮件了 —— 而这套系统的安全网全靠人看邮件。
+    "not_trading_session": "非交易时段·已跳过",
     "already_completed_today": "今日已运行",
 }
 
@@ -246,8 +249,33 @@ def status_tag(run: dict | None, finds: list[dict], failure: dict | None) -> str
     n_orders = len(orders) if isinstance(orders, (list, tuple)) else None
     n_plans = run.get("n_plans")
 
+    # **主题必须反映券商那边实际发生了什么。** 2026-08-25 实测那次：
+    # 3 笔单一笔都没进券商，主题却是「已提交3笔」—— `submitted` 指的是
+    # "顾问清单已落盘"，不是"券商收到了单"。人只看主题，报喜的主题最误导。
+    portfolio = run.get("portfolio") or {}
+    if str(portfolio.get("source") or "") == "default" and portfolio.get("degraded"):
+        return "⚠ 持仓读不到·结果不可用"
+    broker = run.get("broker")
+    if broker is not None:
+        ok = sum(1 for o in (broker.get("outcomes") or []) if o.get("ok"))
+        planned = n_orders if n_orders is not None else len(broker.get("outcomes") or [])
+        # **一笔都没打算下 ≠ 下单失败。** 2026-08-31 实测：risk-off + 空仓，
+        # 本来就无事可做，主题却写「⚠ 下单失败 0/0笔」—— 假警报和漏报一样
+        # 有害，它会训练人忽略这个前缀，而真出事时也是同一个前缀。
+        if planned == 0:
+            return "正常·无订单"
+        outcomes = broker.get("outcomes") or []
+        if any(o.get("verified") is False for o in outcomes):
+            # 「确认不了」比「失败」严重：失败可以补单，确认不了不能碰。
+            return "🔴 下单结果待人工核对"
+        if ok == 0:
+            return f"⚠ 下单失败 0/{planned}笔"
+        if ok < planned:
+            return f"⚠ 部分成交 {ok}/{planned}笔"
+        return f"券商已接单{ok}笔"
+
     if run.get("submitted"):
-        return f"已提交{n_orders if n_orders is not None else n_plans or 0}笔"
+        return f"已生成清单{n_orders if n_orders is not None else n_plans or 0}笔"
     if n_orders:
         return f"订单建议{n_orders}笔·未执行"
     if n_orders == 0 and n_plans:
@@ -277,12 +305,25 @@ def build_digest(when: str | None = None, mode: str | None = None,
     mode = str(mode or settings.qbg_mode).upper()
 
     run = _safe(lambda: run_row(when, mode, db_path), "runs") or fallback_run
-    # 订单列表 store 里**根本没有**（只有 plans 存目标持仓），所以从调用方那里
-    # 叠加过来不构成"真相源打架"——它是纯附加信息。没有它主题只能说"目标3只"，
-    # 而人真正要知道的是"今天要敲 8 笔单"。
-    # TODO: 更彻底的做法是给 store 加一张 orders 表，这样补发历史邮件也有单数。
-    if run is not None and fallback_run and "allowed_orders" in fallback_run:
-        run = {**run, "allowed_orders": fallback_run["allowed_orders"]}
+    # 下面这几项 store 的 `runs` 表里**根本没有对应的列**，所以从调用方那里
+    # 叠加过来不构成"真相源打架"——它是纯附加信息：
+    #
+    #   allowed_orders  只有 plans 存目标持仓，没有订单笔数。没有它主题只能说
+    #                   "目标3只"，而人真正要知道的是"今天要敲 8 笔单"。
+    #   broker          券商回执（接了几笔、有没有确认不了的）。**没有它，主题
+    #                   永远只会说"已生成清单N笔"** —— 2026-08-26 实测：两笔单
+    #                   真的进了券商并回读通过，主题却还是"已生成清单2笔"，
+    #                   而 08:43 那次一笔都没成功，主题也是同一句式。
+    #   portfolio       持仓来源与降级。持仓读不到时主题必须喊出来。
+    #
+    # **skipped_reason 不在这份名单里**：runs 表自己就有这一列，叠加会让调用方
+    # 手里的值盖过真相源（见 test_fallback_run_used_only_when_store_has_nothing）。
+    #
+    # TODO: 更彻底的做法是给 store 加 orders / broker 两张表，
+    #       这样补发历史邮件也有这些事实。
+    _FROM_RESULT = ("allowed_orders", "broker", "portfolio")
+    if run is not None and fallback_run:
+        run = {**run, **{k: fallback_run[k] for k in _FROM_RESULT if k in fallback_run}}
     equity = _safe(lambda: equity_row(when, mode, db_path), "equity")
     finds = _safe(lambda: findings(when, mode, db_path), "findings") or []
     due = _safe(lambda: due_hypotheses(when, mode, db_path), "hypotheses") or []

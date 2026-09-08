@@ -138,6 +138,98 @@ def load_snapshot(day: str | date, root: Path | None = None) -> list[str]:
         return []
 
 
+# ----------------------------------------------------------------------
+# 纳入日期 —— 生存者偏差里**能修的那一半**
+# ----------------------------------------------------------------------
+
+# 缓存文件名**必须带指数代码**：多个指数共用一个文件名的话，拉中证500 的
+# 纳入日期会静默覆盖沪深300 那份，而资格表读的就是它 —— 于是择时信号和回测
+# 会安静地用错一套纳入日期，没有任何报错。
+def _inclusion_file(index_code: str) -> str:
+    return f"inclusion_dates_{index_code}.json"
+
+
+def inclusion_dates(index_code: str = "000300", root: Path | None = None,
+                    refresh: bool = False) -> dict[str, str]:
+    """当前成分股各自的**纳入日期**，`{"600519.SH": "2010-01-04", ...}`。
+
+    ## 这修的是哪一半偏差
+
+    "股票池是当前沪深300 成分"其实混着两个不同的偏差：
+
+      * **纳入前视** —— 2026 年才进指数的票，在 2020 年的回测里就已经在池子
+        里了。而它进得去，恰恰是因为这几年涨得好。等于提前知道谁会赢。
+      * **幸存者** —— 2020 年在指数里、后来被剔除的票，样本里根本没有。
+
+    纳入日期只能修**第一个**。实测（2026-09-05）当前 300 只里有 141 只
+    （47%）是 2020-01-01 之后才纳入的 —— 这一半的量级不小。
+    第二个要有历史剔除名单才行，本地拿不到。
+
+    ## 一个已知的保守之处
+
+    接口给的是**最近一次**纳入日期。一只票若曾在 2015–2018 年进过指数、
+    中间被剔、2026 年又回来，这里只会看到 2026 那次，于是 2015–2018 那段
+    会被当成"还没进来"而排除掉。方向是**少算而不是多算**，偏保守 ——
+    宁可漏掉真实的历史成员，也不要把未来的赢家提前放进池子。
+
+    取不到就 fail-soft 回上次缓存（和本模块其它元数据调用一致）。
+    """
+    path = (root or settings.snapshot_dir) / _SNAPSHOT_DIR / _inclusion_file(index_code)
+    if not refresh and path.exists():
+        try:
+            return dict(json.loads(path.read_text(encoding="utf-8")))
+        except Exception as e:  # noqa: BLE001
+            log_event(log, "universe.inclusion.read_error", path=str(path),
+                      error=str(e)[:200])
+
+    try:
+        import akshare as ak
+
+        df = ak.index_stock_cons(symbol=index_code)
+    except Exception as e:  # noqa: BLE001 — 网络/接口变更都不该炸掉调用方
+        log_event(log, "universe.inclusion.fetch_failed", error=str(e)[:200])
+        if path.exists():
+            return dict(json.loads(path.read_text(encoding="utf-8")))
+        return {}
+
+    # 接口列名是中文且改过不止一次，所以按语义找列而不是按字面名。
+    code_col = next((c for c in df.columns if "代码" in c), df.columns[0])
+    date_col = next((c for c in df.columns if "日期" in c), df.columns[-1])
+    out: dict[str, str] = {}
+    for raw, day in zip(df[code_col].astype(str), df[date_col].astype(str), strict=False):
+        try:
+            out[codes.normalize(raw)] = day[:10]
+        except codes.UnknownCodeError:
+            continue
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, ensure_ascii=False, indent=0, sort_keys=True),
+                    encoding="utf-8")
+    log_event(log, "universe.inclusion.saved", index=index_code, count=len(out))
+    return out
+
+
+def eligibility_mask(dates, instruments, dates_by_code: dict[str, str] | None = None,
+                     index_code: str | None = None):
+    """`date × instrument` 的布尔表：这一天这只票**已经在指数里**了吗。
+
+    喂给回测时用 `scores.where(mask)` —— 未纳入的票不参与选择。
+    **基准也必须用同一个 mask**（`asset_ret.where(mask).mean(axis=1)`），
+    否则等于拿一个带偏差的基准去比一个修过偏差的策略，差值没有意义。
+
+    查不到纳入日期的票**放行**（视为一直在池子里）。取不到接口时整张表全
+    放行，退化成修之前的行为 —— 缺数据不该让回测变成另一套口径而不吭声。
+    """
+    mapping = (inclusion_dates(index_code or settings.qbg_index_code)
+               if dates_by_code is None else dates_by_code)
+    mask = pd.DataFrame(True, index=dates, columns=instruments)
+    for code in instruments:
+        day = mapping.get(code)
+        if day:
+            mask[code] = dates >= pd.Timestamp(day)
+    return mask
+
+
 def list_snapshots(root: Path | None = None) -> list[str]:
     """已积累的快照日期，升序。"""
     d = (root or settings.snapshot_dir) / _SNAPSHOT_DIR

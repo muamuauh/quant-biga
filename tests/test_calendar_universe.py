@@ -7,7 +7,9 @@ A股有调休（国庆前后的周末可能开市），所以日历必须来自�
 from __future__ import annotations
 
 import datetime as dt
+import json
 
+import pandas as pd
 import pytest
 
 from qbg.data import cache, universe
@@ -207,3 +209,50 @@ def test_write_universe_file_has_provenance_header(tmp_path):
     assert "请勿手工编辑" in text
     assert "生存者偏差" in text
     assert "600519.SH" in text and "000858.SZ" in text
+
+
+# ----------------------------------------------------------------------
+# 纳入日期 —— 生存者偏差里能修的那一半（全部离线：给字典或给缓存文件）
+# ----------------------------------------------------------------------
+
+def _write_inclusion(tmp_path, mapping, index_code="000300"):
+    p = tmp_path / "universe" / f"inclusion_dates_{index_code}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(mapping), encoding="utf-8")
+    return p
+
+
+def test_inclusion_dates_reads_cache_without_network(tmp_path):
+    """有缓存就不碰网络。测试铁律：不联网。"""
+    _write_inclusion(tmp_path, {"600519.SH": "2010-01-04"})
+    assert universe.inclusion_dates(root=tmp_path) == {"600519.SH": "2010-01-04"}
+
+
+def test_inclusion_cache_is_per_index(tmp_path):
+    """缓存文件名必须带指数代码。
+
+    共用一个文件名的话，拉中证500 的纳入日期会**静默覆盖**沪深300 那份，
+    而资格表读的就是它 —— 择时信号和回测会用错一套纳入日期且不报错。
+    """
+    _write_inclusion(tmp_path, {"600519.SH": "2010-01-04"}, "000300")
+    _write_inclusion(tmp_path, {"300750.SZ": "2021-06-15"}, "000905")
+    assert universe.inclusion_dates("000300", root=tmp_path) == {"600519.SH": "2010-01-04"}
+    assert universe.inclusion_dates("000905", root=tmp_path) == {"300750.SZ": "2021-06-15"}
+
+
+def test_eligibility_mask_excludes_days_before_inclusion():
+    """纳入前的日子必须是 False —— 这正是「提前知道谁会赢」那个偏差的来源。"""
+    dates = pd.date_range("2026-08-03", periods=4, freq="D")
+    insts = ["600519.SH", "000858.SZ"]
+    mask = universe.eligibility_mask(
+        dates, insts, {"600519.SH": "2026-08-05"})
+    assert list(mask["600519.SH"]) == [False, False, True, True]
+    # 查不到纳入日期的票放行，而不是被静默排除
+    assert mask["000858.SZ"].all()
+
+
+def test_eligibility_mask_all_true_when_mapping_empty():
+    """拿不到纳入日期时退化成修之前的行为，不能悄悄换一套口径。"""
+    dates = pd.date_range("2026-08-03", periods=3, freq="D")
+    mask = universe.eligibility_mask(dates, ["600519.SH"], {})
+    assert mask.to_numpy().all()

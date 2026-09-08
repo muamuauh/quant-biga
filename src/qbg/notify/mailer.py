@@ -17,6 +17,12 @@ from pathlib import Path
 
 from qbg.config import settings
 from qbg.notify.digest import build_digest
+from qbg.notify.tokens import (
+    FOOTER_SENTINEL,
+    consume_token,
+    issue_token,
+    tag_subject,
+)
 from qbg.utils.logging import get_logger, log_event
 
 log = get_logger(__name__)
@@ -24,7 +30,15 @@ log = get_logger(__name__)
 IMPLICIT_TLS_PORTS = (465, 8465)
 # 这两种状态没有执行任何日流程，发信只会制造周末/重复运行噪音。监控日确实读取了
 # 账户并生成报告，所以 deliberately 不在此集合中。
-QUIET_SKIPS = frozenset({"not_trading_day", "already_completed_today"})
+# 这些跳过**不发邮件**。共同点：它们都不是"今天本该发生什么但没发生"，
+# 而是"今天本来就不该发生什么"。
+#
+# not_trading_session 是 2026-08-26 加的：计划任务的"登录后 3 分钟"触发器会在
+# 盘前跑一次（那天是 08:40），而自动下单必须在盘中。每天登录都收到一封邮件，
+# 人很快就不看邮件了 —— 而这套系统的安全网全靠人看邮件。
+# 当天真正的那次运行在 09:30，它会照常发信。
+QUIET_SKIPS = frozenset({"not_trading_day", "already_completed_today",
+                         "not_trading_session"})
 
 EMAIL_CSS = """
 body { background:#f4f6f8; margin:0; padding:24px 12px;
@@ -103,9 +117,28 @@ class MailConfig:
         return missing
 
 
+def normalize_recipients(raw: str) -> str:
+    """把收件人列表规范成 `a@x.com, b@y.com`。
+
+    `smtplib.send_message` 从 To 头解析收件人，逗号分隔本来就支持（含空格、
+    尾随逗号都能正确解析）。但**分号分隔会静默丢掉除第一个以外的所有人** ——
+    只发给第一个，不报错、不告警。而 `a@x.com;b@y.com` 是很常见的写法
+    （Outlook 习惯）。
+
+    所以这里两种分隔符都接受，顺手去重去空。多写一行，换掉一整类
+    「以为通知了两个人、其实只通知了一个」的静默故障。
+    """
+    parts = [p.strip() for chunk in str(raw or "").split(";") for p in chunk.split(",")]
+    seen: list[str] = []
+    for part in parts:
+        if part and part not in seen:
+            seen.append(part)
+    return ", ".join(seen)
+
+
 def load_config() -> MailConfig:
     user = str(settings.smtp_user or "").strip()
-    recipient = str(settings.notify_email_to or "").strip() or user
+    recipient = normalize_recipients(settings.notify_email_to) or user
     return MailConfig(
         enabled=bool(int(settings.notify_email_enabled or 0)),
         host=str(settings.smtp_host or "").strip(),
@@ -145,8 +178,12 @@ def markdown_to_html(md_text: str) -> str | None:
 
 
 def send(subject: str, body: str, *, html: str | None = None,
-         cfg: MailConfig | None = None) -> dict:
-    """发送一封邮件；任何失败都转成结果字典，永不抛异常。"""
+         cfg: MailConfig | None = None, to: str | None = None) -> dict:
+    """发送一封邮件；任何失败都转成结果字典，永不抛异常。
+
+    `to` 覆盖默认收件人 —— 只用于回复**白名单内**的命令发件人。
+    调用方负责先确认地址在白名单里；我们绝不回复不可信地址。
+    """
     cfg = cfg or load_config()
     if not cfg.configured:
         return {"sent": False, "skipped": f"未配置邮件通知（缺 {', '.join(cfg.missing())}）"}
@@ -154,7 +191,10 @@ def send(subject: str, body: str, *, html: str | None = None,
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = cfg.user
-    message["To"] = cfg.to
+    message["To"] = to or cfg.to
+    # 这个头就是入站监听器用来认出「这是我们自己发的」的标记（tokens.SELF_HEADER）。
+    # 收件人通常就是发信邮箱，服务商会把副本投回 INBOX，而正文页脚里列着全部
+    # 命令词 —— 不打这个标记的话，监听器会把自己的报告永远读成一条命令。
     message["X-Quant-Biga"] = "notification"
     message.set_content(body)
     if html:
@@ -259,6 +299,10 @@ def notify_daily_report(result: dict | None = None, *, when: str | None = None,
         subject = f"[量化-{env}] 每日报告 {day} — ⚠ 摘要生成失败"
         body = (f"# 摘要生成失败\n\n`build_digest` 抛出 "
                 f"`{type(exc).__name__}: {exc}`\n\n这本身就是需要人看的事。")
+    # 命令通道开着时改走 send_with_token：令牌必须由**出站日报**送出去，
+    # 因为那封信正好只落进那个唯一能用它的邮箱。
+    if commands_enabled():
+        return send_with_token(subject, body)
     return send(subject, body, html=markdown_to_html(body), cfg=cfg)
 
 
@@ -288,3 +332,74 @@ def notify_failure(exc: BaseException, *, when: str | None = None,
         "提示：本次下单清单可能未生成，请检查 logs/qbg.jsonl 和任务计划日志。"
     )
     return send(subject, body, cfg=cfg)
+
+
+# ---------------------------------------------------------------------------
+# 入站命令通道（可选，默认关闭）
+# ---------------------------------------------------------------------------
+def commands_enabled() -> bool:
+    return bool(int(settings.email_commands_enabled or 0))
+
+
+def _command_footer(token: str) -> str:
+    """告诉操作者怎么用回复驱动监听器。
+
+    **以哨兵开头**：命令解析器只读它**上面**的内容，所以下面列出的这些命令词
+    （以及回复时被引用的整份副本）永远不会被当成用户的意图。
+    """
+    lines = [
+        "",
+        "",
+        FOOTER_SENTINEL,
+        "",
+        "**远程命令**（直接回复本邮件，**请勿修改主题** —— 令牌在主题里）。"
+        "指令写在正文**第一行**，整行只写这一个词：",
+        "",
+        "- `重跑`：重新跑一遍今天的流程（风控闸一道不少，**不解锁任何东西**）",
+        "- `状态`：回一封当前运行状态，不做任何动作",
+        "- `关机`：依次关掉系统代理/TUN → 代理软件 → 同花顺，收尾完成后回一封确认信，再关机",
+        "",
+        f"<sub>命令令牌 `{token}`（一次性，用后失效）。命令必须来自白名单地址"
+        "并带本令牌。系统绝不会因为一封邮件而改动三把实盘锁。</sub>",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def send_with_token(subject: str, body: str) -> dict:
+    """发信，并在命令通道开着时附上一个新的一次性令牌。
+
+    令牌在这里生成，因为**正是这封出站邮件**把它送进那个唯一能用它的邮箱。
+
+    发送失败要把令牌回滚 —— 否则一个谁都没收到的新令牌会把操作者手里那个
+    仍然有效的旧令牌顶掉，等于把人锁在门外。
+    """
+    if not commands_enabled():
+        return send(subject, body, html=markdown_to_html(body))
+    token = issue_token()
+    body = body + _command_footer(token)
+    result = send(tag_subject(subject, token), body, html=markdown_to_html(body))
+    if not result.get("sent"):
+        consume_token()
+        log_event(log, "notify.email.token_rolled_back", subject=subject)
+    return result
+
+
+def notify_owner(subject: str, body: str) -> dict:
+    """给机主发一条运维通知。
+
+    监听器用它来报告「拒绝了一条非白名单命令」——**绝不回复那个不可信地址**
+    （回了就是垃圾邮件反射器，还等于确认地址有效）。
+    """
+    mode = str(settings.qbg_mode).upper()
+    return send(f"[量化-{mode}] {subject}", body, html=markdown_to_html(body))
+
+
+def reply_to_sender(to_addr: str, subject: str, body: str) -> dict:
+    """回复一个**白名单内**的发件人（例如令牌过期）。
+
+    调用方负责先确认 `to_addr` 在白名单里 —— 这个函数不自己检查，
+    因为它也被用在已经校验过的路径上。**不要**拿它回复任意地址。
+    """
+    return send(subject, body, html=markdown_to_html(body), to=to_addr)
+

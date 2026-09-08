@@ -16,7 +16,7 @@ import yaml
 
 from qbg.config import settings
 from qbg.execution.base import Order
-from qbg.market import rules
+from qbg.market import calendar, rules
 
 
 @dataclass(frozen=True)
@@ -64,15 +64,38 @@ def session_guard(limits: dict, session_open: bool | None = None) -> GateResult:
     return GateResult("session_guard", False, "不在交易时段或时段未知")
 
 
+def _stale_days(latest: pd.Timestamp, asof: pd.Timestamp) -> tuple[int, str]:
+    """行情落后了几个**交易日**，以及用的是哪种口径。
+
+    必须按交易日数，不能按工作日（`pd.bdate_range` 只排除周末）。差别在长假：
+    春节后第一个交易日，上一根 K 线是 7 个工作日之前，但它就是**最近一个交易
+    日**的收盘，数据一点都不旧。按工作日算会得出 stale=7，直接把硬闸打翻。
+
+    2026 年实算，按工作日口径会误伤 6 天（春节/清明/劳动/端午/中秋/国庆之后
+    的第一个交易日）。而 `max_stale_days` 默认是 1，在 07:30 盘前跑的排程下
+    余量本来就是 0（最新数据必然是上一交易日），所以任何长于周末的假期都会翻车。
+
+    日历缺失时退回工作日口径：它只会**高估**落后天数，对硬闸而言宁可多拦不可
+    少拦。口径会写进闸的 reason，便于事后判断走的是哪条路。
+    """
+    if latest >= asof:
+        return 0, "交易日"
+    start, end = latest.date().isoformat(), asof.date().isoformat()
+    days = calendar.load_cached()
+    if days and days[0] <= start and end <= days[-1]:
+        return max(0, calendar.trading_days_between(start, end)), "交易日"
+    return max(0, len(pd.bdate_range(latest, asof)) - 1), "工作日（交易日历未覆盖）"
+
+
 def data_freshness_guard(latest_date: date | str | None, asof: date | str,
                          limits: dict) -> GateResult:
     if latest_date is None:
         return GateResult("data_freshness_guard", False, "没有行情日期")
     latest, today = pd.Timestamp(latest_date).normalize(), pd.Timestamp(asof).normalize()
-    stale = max(0, len(pd.bdate_range(latest, today)) - 1)
+    stale, unit = _stale_days(latest, today)
     allowed = int(limits.get("max_stale_days", 1))
     return GateResult("data_freshness_guard", stale <= allowed,
-                      f"行情落后 {stale} 个工作日，允许 {allowed}")
+                      f"行情落后 {stale} 个{unit}，允许 {allowed}")
 
 
 def price_limit_guard(orders: list[Order], prev_close: dict[str, float],

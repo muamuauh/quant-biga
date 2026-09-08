@@ -137,6 +137,32 @@ def in_session(now: dt.datetime | None = None) -> bool:
     return (MORNING[0] <= t <= MORNING[1]) or (AFTERNOON[0] <= t <= AFTERNOON[1])
 
 
+def minutes_until_session(now: dt.datetime | None = None) -> float | None:
+    """距离下一个连续竞价时段开始还有几分钟。
+
+    已经在时段内返回 ``0.0``；今天两段都收了返回 ``None``。
+    和 :func:`in_session` 一样**不判交易日**，两件事分开。
+
+    为什么需要它：调用方想在"明知会被时段闸拦下"时提前退出，省掉拉数和
+    LLM 复核的开销。但只看 `in_session()` 是不够的 —— 09:30:00 触发的任务
+    可能因为几秒的时钟偏差落在 09:29:5x，那时 `in_session()` 还是 False，
+    早退就会把**一整个交易日**跳过去。所以要问的是"多久以后开盘"，
+    而不是"现在开没开"。
+    """
+    now = now or dt.datetime.now(TZ)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=TZ)
+    now = now.astimezone(TZ)
+    if in_session(now):
+        return 0.0
+    for start, _end in (MORNING, AFTERNOON):
+        opening = now.replace(hour=start.hour, minute=start.minute,
+                              second=0, microsecond=0)
+        if now < opening:
+            return (opening - now).total_seconds() / 60.0
+    return None
+
+
 def _as_date_str(day: dt.date | str | None) -> str:
     if day is None:
         return dt.datetime.now(TZ).date().isoformat()
