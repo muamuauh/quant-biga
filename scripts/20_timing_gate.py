@@ -165,10 +165,13 @@ def main(argv=None) -> int:
         mp = build_panel(members, start=str(frame.index.min().date()),
                          end=str(frame.index.max().date()))
         sc = frame.reindex(index=mp.dates, columns=mp.instruments)
-        lvl = equal_weight_index(members).reindex(mp.dates).ffill()
+        # **不 reindex 到模型窗**：`risk_on_series` 的 min_periods=sma_window，
+        # 先截到 388 天的话 SMA100 前 100 天没有信号、长 SMA 干脆整段没信号，
+        # 长窗口会退化成"不择时"。生产读的是完整 parquet 历史。
+        lvl = equal_weight_index(members)
         for label, sma in ((f"基线 SMA{base_sma}", base_sma), ("候选 关掉择时", 0)):
             scores = sc if sma <= 0 else sc.where(
-                risk_on_series(lvl, sma, base_band).reindex(mp.dates).fillna(True))
+                risk_on_series(lvl, sma, base_band).reindex(mp.dates).ffill().fillna(True))
             r = engine.run_backtest(scores, mp, k=args.k,
                                     extra_slippage=SLIPPAGE_BP / 1e4, slippage_grid=())
             print(f"  {label:<14} 年化 {r.strategy.annual_return:+9.2%}  "

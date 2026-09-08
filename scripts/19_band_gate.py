@@ -27,8 +27,9 @@
     都没有，那该做的是把择时关掉（`QBG_MARKET_SMA=0`），不是调缓冲带。
 
 用法：
-    python scripts/19_band_gate.py --candidate 0.03
-    python scripts/19_band_gate.py --candidate 0.03 --neighbors 0.02,0.05
+    python scripts/19_band_gate.py --candidate 0.03            # 改缓冲带
+    python scripts/19_band_gate.py --candidate-sma 200         # 改 SMA
+    python scripts/19_band_gate.py --candidate-sma 200 --neighbors 150,250
 """
 
 from __future__ import annotations
@@ -83,8 +84,16 @@ def overlay(asset_returns, level, sma, band, slippage_bp) -> tuple[pd.Series, di
 
 
 def topk_arm(scores, pnl, level, sma, band, k) -> dict | None:
-    """模型窗 k=3 的交叉检查。风控口径和实盘一致：risk-off 当天分数置空。"""
-    on = risk_on_series(level, sma, band).reindex(pnl.dates).fillna(True)
+    """模型窗 k=3 的交叉检查。风控口径和实盘一致：risk-off 当天分数置空。
+
+    **`level` 必须是完整历史（2020 起）的等权净值，不能先截到模型窗再算 SMA。**
+    `risk_on_series` 的 `min_periods=sma_window`：模型窗只有 388 天，先截断的话
+    SMA200 前 200 天没有信号（默认 risk-on），SMA250 干脆整段都没信号 ——
+    于是长 SMA 会退化成"不择时"，看起来像"长 SMA 更差"，其实是**这个窗口
+    测不了它**。生产链路的 `market_risk_on()` 读的是完整 parquet 历史，
+    所以先算信号、再 reindex 才和实盘同口径。
+    """
+    on = risk_on_series(level, sma, band).reindex(pnl.dates).ffill().fillna(True)
     res = engine.run_backtest(scores.where(on), pnl, k=k,
                               extra_slippage=SLIPPAGE_BP / 1e4, slippage_grid=())
     return {"annual_return": res.strategy.annual_return, "sharpe": res.strategy.sharpe,
@@ -92,21 +101,44 @@ def topk_arm(scores, pnl, level, sma, band, k) -> dict | None:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="择时缓冲带的八项闸")
-    p.add_argument("--candidate", type=float, required=True, help="候选缓冲带，小数")
-    p.add_argument("--neighbors", default="", help="高原闸用的相邻取值，逗号分隔")
-    p.add_argument("--sma", type=int, default=settings.qbg_market_sma)
+    p = argparse.ArgumentParser(description="择时参数（缓冲带 / SMA）的八项闸")
+    p.add_argument("--candidate", type=float, default=None, help="候选缓冲带，小数")
+    p.add_argument("--candidate-sma", type=int, default=None, help="候选 SMA 窗口")
+    p.add_argument("--neighbors", default="",
+                   help="高原闸用的相邻取值，逗号分隔。**按变动的那一维解释** —— "
+                        "改 SMA 就填 SMA，改缓冲带就填缓冲带")
+    p.add_argument("--sma", type=int, default=None, help="基线 SMA，默认取生效配置")
     p.add_argument("--k", type=int, default=settings.qbg_top_k)
-    p.add_argument("--index", choices=("raw", "fixed"), default="raw",
-                   help="判据用哪条等权指数。raw = 生产链路现在读的那条（默认）；"
-                        "fixed = 修掉纳入前视的。**选 fixed 等于假设指数那个修也"
-                        "一起上线**，两个改动是捆绑的，不能只上一个")
+    # 默认跟随生效配置。写死 raw 的话，用户一旦打开 QBG_MARKET_INDEX_ELIGIBLE，
+    # 闸就在和一个不存在的配置作比较 —— 20_timing_gate.py 犯过这个错。
+    p.add_argument("--index", choices=("raw", "fixed"),
+                   default=("fixed" if int(settings.qbg_market_index_eligible) else "raw"),
+                   help="判据用哪条等权指数。默认跟随 QBG_MARKET_INDEX_ELIGIBLE；"
+                        "手动选 fixed 等于假设指数那个修也一起上线")
     args = p.parse_args(argv)
 
+    base_sma = int(settings.qbg_market_sma if args.sma is None else args.sma)
     base_band = float(settings.qbg_market_sma_band)
-    cand = args.candidate
-    neighbors = ([float(x) for x in args.neighbors.split(",") if x.strip()]
-                 or sorted({max(0.0, round(cand - 0.01, 4)), round(cand + 0.02, 4)}))
+    cand_sma = base_sma if args.candidate_sma is None else int(args.candidate_sma)
+    cand_band = base_band if args.candidate is None else float(args.candidate)
+    if (cand_sma, cand_band) == (base_sma, base_band):
+        p.error("候选和基线完全相同 —— 至少给 --candidate 或 --candidate-sma 之一")
+
+    # 高原闸只在**变动的那一维**上取邻居。两维一起变时没有一维意义上的"邻居"，
+    # 必须显式给，否则闸会在一条错误的轴上宣布"高原稳定"。
+    sma_moved, band_moved = cand_sma != base_sma, cand_band != base_band
+    explicit = [float(x) for x in args.neighbors.split(",") if x.strip()]
+    if sma_moved and band_moved and not explicit:
+        p.error("同时改了 SMA 和缓冲带 —— 高原闸没有单一维度可测，请显式给 --neighbors")
+    if sma_moved:
+        vals = explicit or [max(20.0, cand_sma - 50), cand_sma + 50]
+        neighbors = [(int(v), cand_band) for v in sorted(vals)]
+        fmt_n = [f"SMA{int(v)}" for v, _ in neighbors]
+    else:
+        vals = explicit or sorted({max(0.0, round(cand_band - 0.01, 4)),
+                                   round(cand_band + 0.02, 4)})
+        neighbors = [(cand_sma, float(v)) for v in sorted(vals)]
+        fmt_n = [f"{b:.1%}" for _, b in neighbors]
 
     members = load_universe()
     pnl = build_panel(members)
@@ -120,9 +152,9 @@ def main(argv=None) -> int:
 
     hold = compute_metrics(asset_returns, asset_returns)
     print(f"窗口 {pnl.dates[0].date()} ~ {pnl.dates[-1].date()}   {len(pnl.dates)} 日   "
-          f"SMA={args.sma}   翻仓滑点 {SLIPPAGE_BP:.0f}bp")
-    print(f"基线 = 缓冲带 {base_band:.1%}（现行）   候选 = {cand:.1%}   "
-          f"高原邻居 = {[f'{n:.1%}' for n in neighbors]}")
+          f"翻仓滑点 {SLIPPAGE_BP:.0f}bp")
+    print(f"基线 = SMA{base_sma} 缓冲{base_band:.1%}（现行生效值）   "
+          f"候选 = SMA{cand_sma} 缓冲{cand_band:.1%}   高原邻居 = {fmt_n}")
     print(f"一直满仓（保护闸的参照）: 年化 {hold.annual_return:+.2%}   "
           f"夏普 {hold.sharpe:.2f}   回撤 {hold.max_drawdown:.2%}\n")
 
@@ -132,10 +164,10 @@ def main(argv=None) -> int:
     witness_name = "修正纳入前视" if args.index == "raw" else "老口径（生产在读）"
     print(f"判据指数 = {judge_name}" + "\n")
 
-    base_net, baseline = overlay(asset_returns, judge, args.sma, base_band, SLIPPAGE_BP)
-    cand_net, candidate = overlay(asset_returns, judge, args.sma, cand, SLIPPAGE_BP)
+    base_net, baseline = overlay(asset_returns, judge, base_sma, base_band, SLIPPAGE_BP)
+    cand_net, candidate = overlay(asset_returns, judge, cand_sma, cand_band, SLIPPAGE_BP)
 
-    print(f"{'指标':<18}{f'基线({base_band:.0%})':>14}{f'候选({cand:.0%})':>14}{'差':>12}")
+    print(f"{'指标':<18}{f'基线(SMA{base_sma})':>14}{f'候选(SMA{cand_sma})':>14}{'差':>12}")
     print("-" * 58)
     for key, fmt in (("annual_return", "{:+.2%}"), ("sharpe", "{:.4f}"),
                      ("max_drawdown", "{:.2%}"), ("switch_cost_pa", "{:.2%}"),
@@ -147,8 +179,8 @@ def main(argv=None) -> int:
 
     # 旁证：同一组参数在**另一条**指数上。两边不一致就不要改 —— 那说明这个
     # 参数的好坏取决于指数口径，而指数口径本身还是个未决的改动。
-    _, base_fx = overlay(asset_returns, witness, args.sma, base_band, SLIPPAGE_BP)
-    _, cand_fx = overlay(asset_returns, witness, args.sma, cand, SLIPPAGE_BP)
+    _, base_fx = overlay(asset_returns, witness, base_sma, base_band, SLIPPAGE_BP)
+    _, cand_fx = overlay(asset_returns, witness, cand_sma, cand_band, SLIPPAGE_BP)
     print(f"\n旁证 · {witness_name}（**非判据**）:")
     print(f"  基线 年化 {base_fx['annual_return']:+.2%} 夏普 {base_fx['sharpe']:.2f} "
           f"翻转 {base_fx['flips']}   →   "
@@ -169,18 +201,18 @@ def main(argv=None) -> int:
 
     neighbor_sharpes = []
     print("\n相邻取值（高原闸）：")
-    for nb in neighbors:
-        _, f = overlay(asset_returns, judge, args.sma, nb, SLIPPAGE_BP)
+    for nb_sma, nb_band in neighbors:
+        _, f = overlay(asset_returns, judge, nb_sma, nb_band, SLIPPAGE_BP)
         neighbor_sharpes.append(f["sharpe"])
-        print(f"  缓冲带 {nb:>5.1%} → 夏普 {f['sharpe']:.4f}  翻转 {f['flips']}")
+        print(f"  SMA{nb_sma:<4} 缓冲{nb_band:>5.1%} → 夏普 {f['sharpe']:.4f}  翻转 {f['flips']}")
 
     # +75% 成本：缓冲带的全部价值就是省成本，成本涨了它只会更有价值 ——
     # 这一闸对它天然友好，所以**同时**要求候选在高成本下仍不劣于基线，
     # 否则等于白送一项。
     profile = fees.FeeProfile.load()
     hi_slip = SLIPPAGE_BP * HIGH_COST_MULT
-    _, high_cost = overlay(asset_returns, judge, args.sma, cand, hi_slip)
-    _, high_base = overlay(asset_returns, judge, args.sma, base_band, hi_slip)
+    _, high_cost = overlay(asset_returns, judge, cand_sma, cand_band, hi_slip)
+    _, high_base = overlay(asset_returns, judge, base_sma, base_band, hi_slip)
     print(f"\n+{int((HIGH_COST_MULT - 1) * 100)}% 成本（滑点 {hi_slip:.0f}bp，"
           f"基础费率往返 {fees.round_trip_rate(profile) * 1e4:.1f}bp）:")
     print(f"  基线 年化 {high_base['annual_return']:+.2%}   "
@@ -200,12 +232,14 @@ def main(argv=None) -> int:
         mp = build_panel(members, start=str(frame.index.min().date()),
                          end=str(frame.index.max().date()))
         sc = frame.reindex(index=mp.dates, columns=mp.instruments)
-        lvl = equal_weight_index(
-            members,
-            eligible=(None if args.index == "raw" else universe_mod.eligibility_mask(
-                mp.dates, mp.instruments, mapping))).reindex(mp.dates).ffill()
-        for label, band in ((f"基线 {base_band:.0%}", base_band), (f"候选 {cand:.0%}", cand)):
-            r = topk_arm(sc, mp, lvl, args.sma, band, args.k)
+        # **不 reindex 到模型窗**：SMA 要在完整历史上算（见 topk_arm 的说明）。
+        # 资格表也因此要覆盖完整历史，不能只给模型窗那 388 天。
+        full_eligible = (None if args.index == "raw" else
+                         universe_mod.eligibility_mask(pnl.dates, pnl.instruments, mapping))
+        lvl = equal_weight_index(members, eligible=full_eligible)
+        for label, sma, band in ((f"基线 SMA{base_sma}", base_sma, base_band),
+                                 (f"候选 SMA{cand_sma}", cand_sma, cand_band)):
+            r = topk_arm(sc, mp, lvl, sma, band, args.k)
             print(f"  {label:<10} 年化 {r['annual_return']:+9.2%}  "
                   f"夏普 {r['sharpe']:>6.2f}  回撤 {r['max_drawdown']:>8.2%}")
     except Exception as exc:  # noqa: BLE001 —— 交叉检查失败不该挡住主判据
@@ -218,8 +252,11 @@ def main(argv=None) -> int:
         print(f"  {'✅' if c.passed else '❌'} {c.name:<16} {c.detail}")
     failed = [c.name for c in report.checks if not c.passed]
     print(f"\n结论：{'通过' if not failed else '**未通过**'}")
-    print(f"  → {'可以把 QBG_MARKET_SMA_BAND 改成 ' + str(cand)}" if not failed
-          else f"  → 维持 {base_band}。未过：{'、'.join(failed)}")
+    moved = ("QBG_MARKET_SMA 改成 " + str(cand_sma) if sma_moved
+             else "QBG_MARKET_SMA_BAND 改成 " + str(cand_band))
+    keep = (f"SMA{base_sma}" if sma_moved else f"缓冲带 {base_band}")
+    print(f"  → 可以把 {moved}" if not failed
+          else f"  → 维持 {keep}。未过：{'、'.join(failed)}")
     return 0 if not failed else 1
 
 
