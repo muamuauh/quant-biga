@@ -215,8 +215,8 @@ def test_write_universe_file_has_provenance_header(tmp_path):
 # 纳入日期 —— 生存者偏差里能修的那一半（全部离线：给字典或给缓存文件）
 # ----------------------------------------------------------------------
 
-def _write_inclusion(tmp_path, mapping):
-    p = tmp_path / "universe" / "inclusion_dates.json"
+def _write_inclusion(tmp_path, mapping, index_code="000300"):
+    p = tmp_path / "universe" / f"inclusion_dates_{index_code}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(mapping), encoding="utf-8")
     return p
@@ -226,6 +226,18 @@ def test_inclusion_dates_reads_cache_without_network(tmp_path):
     """有缓存就不碰网络。测试铁律：不联网。"""
     _write_inclusion(tmp_path, {"600519.SH": "2010-01-04"})
     assert universe.inclusion_dates(root=tmp_path) == {"600519.SH": "2010-01-04"}
+
+
+def test_inclusion_cache_is_per_index(tmp_path):
+    """缓存文件名必须带指数代码。
+
+    共用一个文件名的话，拉中证500 的纳入日期会**静默覆盖**沪深300 那份，
+    而资格表读的就是它 —— 择时信号和回测会用错一套纳入日期且不报错。
+    """
+    _write_inclusion(tmp_path, {"600519.SH": "2010-01-04"}, "000300")
+    _write_inclusion(tmp_path, {"300750.SZ": "2021-06-15"}, "000905")
+    assert universe.inclusion_dates("000300", root=tmp_path) == {"600519.SH": "2010-01-04"}
+    assert universe.inclusion_dates("000905", root=tmp_path) == {"300750.SZ": "2021-06-15"}
 
 
 def test_eligibility_mask_excludes_days_before_inclusion():

@@ -566,7 +566,7 @@ def read_tables(*, exe: str, client: str = "universal_client",
     except Exception as exc:  # noqa: BLE001 —— easytrader 抛的异常类型不稳定
         raise ThsReadError(f"连接同花顺失败：{type(exc).__name__}: {exc}") from exc
 
-    entrusts, columns = None, []
+    entrusts, trades, columns = None, None, []
     try:
         balance = user.balance
         positions = user.position
@@ -582,6 +582,13 @@ def read_tables(*, exe: str, client: str = "universal_client",
             entrusts = user.today_entrusts
         except Exception as exc:  # noqa: BLE001
             log_event(log, "ths.read.entrusts_failed", error=f"{type(exc).__name__}: {exc}")
+        # 今日成交是**第四张尽力而为的表**，只服务一件事：量实际成交价和
+        # 回测假设（次日开盘价）差多少。那是整套回测里唯一没被实测过的输入。
+        # 和委托表同样的纪律 —— 读不到留 None，绝不拖垮资金和持仓。
+        try:
+            trades = user.today_trades
+        except Exception as exc:  # noqa: BLE001
+            log_event(log, "ths.read.trades_failed", error=f"{type(exc).__name__}: {exc}")
     except ThsReadError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -597,7 +604,9 @@ def read_tables(*, exe: str, client: str = "universal_client",
             log_event(log, "ths.dialogs_closed", count=len(leftovers), detail=leftovers[:5])
 
     log_event(log, "ths.read.ok", positions=len(positions), columns=len(columns),
-              entrusts=None if entrusts is None else len(entrusts))
+              entrusts=None if entrusts is None else len(entrusts),
+              trades=None if trades is None else len(trades))
     return {"balance": dict(balance or {}), "position": list(positions or []),
             "columns": columns,
-            "entrusts": None if entrusts is None else list(entrusts)}
+            "entrusts": None if entrusts is None else list(entrusts),
+            "trades": None if trades is None else list(trades)}

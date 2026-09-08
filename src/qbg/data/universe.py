@@ -142,7 +142,11 @@ def load_snapshot(day: str | date, root: Path | None = None) -> list[str]:
 # 纳入日期 —— 生存者偏差里**能修的那一半**
 # ----------------------------------------------------------------------
 
-_INCLUSION_FILE = "inclusion_dates.json"
+# 缓存文件名**必须带指数代码**：多个指数共用一个文件名的话，拉中证500 的
+# 纳入日期会静默覆盖沪深300 那份，而资格表读的就是它 —— 于是择时信号和回测
+# 会安静地用错一套纳入日期，没有任何报错。
+def _inclusion_file(index_code: str) -> str:
+    return f"inclusion_dates_{index_code}.json"
 
 
 def inclusion_dates(index_code: str = "000300", root: Path | None = None,
@@ -170,7 +174,7 @@ def inclusion_dates(index_code: str = "000300", root: Path | None = None,
 
     取不到就 fail-soft 回上次缓存（和本模块其它元数据调用一致）。
     """
-    path = (root or settings.snapshot_dir) / _SNAPSHOT_DIR / _INCLUSION_FILE
+    path = (root or settings.snapshot_dir) / _SNAPSHOT_DIR / _inclusion_file(index_code)
     if not refresh and path.exists():
         try:
             return dict(json.loads(path.read_text(encoding="utf-8")))
@@ -205,7 +209,8 @@ def inclusion_dates(index_code: str = "000300", root: Path | None = None,
     return out
 
 
-def eligibility_mask(dates, instruments, dates_by_code: dict[str, str] | None = None):
+def eligibility_mask(dates, instruments, dates_by_code: dict[str, str] | None = None,
+                     index_code: str | None = None):
     """`date × instrument` 的布尔表：这一天这只票**已经在指数里**了吗。
 
     喂给回测时用 `scores.where(mask)` —— 未纳入的票不参与选择。
@@ -215,7 +220,8 @@ def eligibility_mask(dates, instruments, dates_by_code: dict[str, str] | None = 
     查不到纳入日期的票**放行**（视为一直在池子里）。取不到接口时整张表全
     放行，退化成修之前的行为 —— 缺数据不该让回测变成另一套口径而不吭声。
     """
-    mapping = inclusion_dates() if dates_by_code is None else dates_by_code
+    mapping = (inclusion_dates(index_code or settings.qbg_index_code)
+               if dates_by_code is None else dates_by_code)
     mask = pd.DataFrame(True, index=dates, columns=instruments)
     for code in instruments:
         day = mapping.get(code)
