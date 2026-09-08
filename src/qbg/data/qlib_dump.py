@@ -165,7 +165,13 @@ def run_dump_bin(csv_dir: Path | None = None,
         "--date_field_name", "date",
         "--symbol_field_name", "symbol",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # `text=True` 不指定 encoding 时按**本机 ANSI 代码页**解码（本机是 GBK）。
+    # qlib 的 dump_bin 打进度条和路径，含 UTF-8 字节 → UnicodeDecodeError 在
+    # subprocess 的读线程里抛出，主线程只看到 stdout/stderr **是空的**，
+    # 而 returncode 仍然是 0。真失败时的中文报错就这么丢了。
+    # errors="replace"：宁可看到几个替换符，也不要整段日志消失。
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
     ok = proc.returncode == 0
     log_event(log, "qlib_dump.dump_bin",
               ok=ok, returncode=proc.returncode,
