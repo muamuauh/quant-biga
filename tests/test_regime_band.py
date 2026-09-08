@@ -112,11 +112,17 @@ def test_equal_weight_index_signature_accepts_eligible():
 # ----------------------------------------------------------------------
 
 def test_index_eligible_switch_defaults_to_off():
-    """默认必须是老行为，否则这个新开关会悄悄换掉生产的择时信号。"""
-    from qbg.config import settings
+    """**代码默认**必须是老行为，否则这个新开关会悄悄换掉生产的择时信号。
 
-    assert int(settings.qbg_market_index_eligible) == 0
-    assert float(settings.qbg_market_sma_band) == 0.0
+    断言的是 `model_fields[...].default` 而不是 `settings.x` —— 后者已经合并了
+    本机 `.env`，那样断言等于"用户一旦配置这台机器，测试就红"。测试要钉的是
+    仓库里的默认值，不是某台机器的配置。
+    """
+    from qbg.config import Settings
+
+    fields = Settings.model_fields
+    assert fields["qbg_market_index_eligible"].default == 0
+    assert fields["qbg_market_sma_band"].default == 0.0
 
 
 def test_market_risk_on_reads_both_switches():
