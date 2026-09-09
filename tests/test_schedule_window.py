@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -140,3 +141,58 @@ def test_retrain_is_bound_to_exactly_one_task():
         f"--retrain 没限定给某一个任务，三个任务会一起重训：{line.strip()}"
     assert "$PreflightTaskName" not in line, \
         f"预检不该重训 —— 它的职责是准备环境，不是跑模型：{line.strip()}"
+
+
+# ----------------------------------------------------------------------
+# 三个任务的先后 —— 顺序错了不报错，只是各自白跑一遍
+# ----------------------------------------------------------------------
+
+def _default(src: str, name: str) -> str:
+    """从 param 块里抠出 `[string]$Name = '值'` 的那个值。"""
+    m = re.search(r"\$" + name + r"\s*=\s*'([^']+)'", src)
+    assert m is not None, f"param 块里找不到 ${name} 的默认值"
+    return m.group(1)
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def test_default_times_run_preflight_then_premarket_then_daily():
+    """默认时间必须是 预检 -> 盘前复核 -> 下单。
+
+    · 预检在盘前之前：复核要调 LLM 中转站，那条链路走 Clash 代理，
+      预检不先跑代理就没开。
+    · 盘前在下单之前：复核结论写进缓存，日流程读它才省得下那 58 分钟。
+    """
+    src = read(SETUP)
+    pre = _minutes(_default(src, "PreflightTime"))
+    mkt = _minutes(_default(src, "PremarketTime"))
+    day = _minutes(_default(src, "Time"))
+    assert pre < mkt < day, (
+        f"顺序不对：预检 {pre // 60:02d}:{pre % 60:02d}、"
+        f"盘前 {mkt // 60:02d}:{mkt % 60:02d}、下单 {day // 60:02d}:{day % 60:02d}")
+
+
+def test_setup_refuses_a_wrong_order():
+    """顺序闸得真的在脚本里，不能只靠默认值碰巧是对的。
+
+    用户随手 `-PremarketTime 10:00` 时两个任务都还会跑，只是复核结论赶不上
+    下单 —— **没有任何报错**，账单却付了两遍。所以必须在注册前拦下。
+    """
+    src = read(SETUP)
+    assert "$PremarketTime - [timespan]$Time" in src,         "没有拦「盘前复核晚于下单」"
+    assert "$PreflightTime - [timespan]$PremarketTime" in src,         "没有拦「预检晚于盘前复核」"
+
+
+def test_each_task_carries_its_own_window():
+    """三个任务的过期窗口不该共用一个值。
+
+    此前共用 `$WindowMinutes`，盘前任务因此拿到 120 分钟 —— 09:59 被唤起还会
+    去跑一小时的复核，而 09:30 的日流程早就退回现场复核了，等于账单付两遍。
+    """
+    src = read(SETUP)
+    for name in ("$PreflightWindowMinutes", "$PremarketWindowMinutes"):
+        assert name in src, f"没有给任务单独的窗口参数 {name}"
+        assert f"-Window {name}" in src, f"{name} 声明了却没传给 Register-QbgTask"

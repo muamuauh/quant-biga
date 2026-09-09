@@ -79,11 +79,19 @@ param(
     [ValidatePattern('^\d{1,2}:\d{2}$')]
     [string]$Time     = '09:30',
     [string]$TaskName = 'quant_biga_daily',
-    # 预检任务：比主任务早 15 分钟，**唯一目的是给人留出人工登录同花顺的时间**。
+    # 预检任务：**排在最前面，三个任务的顺序是 预检 -> 盘前复核 -> 下单**。
+    #
+    # 它有两个下游，07:45 这个值是被后者定死的：
+    #   · 人工登录同花顺 —— 只有下单（09:30）真的需要客户端可用
+    #   · **盘前复核要调 LLM 中转站，而那条链路走 Clash 代理**（08:00 起跑）
+    # 第二条才是硬约束。代理没起来，复核整个跑不了；而登录同花顺的窗口
+    # 顺带从 15 分钟变成一小时四十五分。
+    #
     # 预检本身是幂等的（代理检测到开着就不发热键、同花顺在跑就只报告），
-    # 所以 run_daily.ps1 内部那次重跑不会造成任何副作用。
+    # 所以 run_premarket.ps1 和 run_daily.ps1 内部那两次重跑不会有任何副作用 ——
+    # 它们是这个任务没跑成时的兜底。
     [ValidatePattern('^\d{1,2}:\d{2}$')]
-    [string]$PreflightTime     = '09:15',
+    [string]$PreflightTime     = '07:45',
     [string]$PreflightTaskName = 'quant_biga_preflight',
     [switch]$NoPreflightTask,
     # 盘前复核任务。**它才是解决"复核太慢"的那一刀。**
@@ -92,8 +100,9 @@ param(
     # require_trading_session 是硬闸 —— 09:30 现场复核会跑到上午盘尾甚至收盘
     # 之后，整天作废且 LLM 的钱已经花掉（当天 $0.23）。
     #
-    # 08:00 起跑，给复核留足一个半小时；跑完写 data/reviews/<date>.json，
-    # 09:30 的日流程直接读，全程 2 分钟。它**不下单、不碰三把锁**。
+    # 08:00 起跑（预检 07:45 已经把代理和同花顺起好了），给复核留足一个半小时；
+    # 跑完写 data/reviews/<date>.json，09:30 的日流程直接读，全程 2 分钟。
+    # 它**不下单、不碰三把锁**。
     [ValidatePattern('^\d{1,2}:\d{2}$')]
     [string]$PremarketTime     = '08:00',
     [string]$PremarketTaskName = 'quant_biga_premarket',
@@ -110,7 +119,7 @@ param(
     [switch]$NoStartupTrigger,
     # --- 过期不补跑 ----------------------------------------------------------
     # `-StartWhenAvailable`（"错过计划开始时间后尽快启动"）**没有截止时间**：
-    # 早上没开机的那天，晚上一开机 Windows 就把 09:15 的预检和 09:30 的日流程
+    # 早上没开机的那天，晚上一开机 Windows 就把 07:45 的预检和 09:30 的日流程
     # 一起补跑 —— 预检会在晚上打开系统代理、开 TUN、拉起同花顺下单端。
     #
     # 但 `-StartWhenAvailable` 要留着：09:35 才开机那天我们**确实**想补上。
@@ -121,6 +130,17 @@ param(
     # 赶不上有意义的成交，而 daily_cycle 的 session_guard 是硬闸、会在流程跑到
     # 一半才否决 —— 那时 LLM 复核的钱已经花掉了。
     [int]$WindowMinutes = 120,
+    # **三个任务的窗口不一样，因为它们各自的"还来得及吗"是不同的时刻。**
+    # 此前三个共用 $WindowMinutes，盘前任务因此拿到 120 分钟 —— 意味着 09:59
+    # 被唤起还会去跑一小时的复核，而 09:30 的日流程早就退回现场复核了。
+    #
+    # 预检：截止到 09:30，也就是日流程开始的那一刻。再晚就没有独立价值了 ——
+    # run_daily.ps1 内部本来就会自己跑一遍预检。07:45 + 105 = 09:30。
+    [int]$PreflightWindowMinutes = 105,
+    # 盘前复核：截止到 08:30。复核实测 58 分钟，08:30 起跑刚好赶在 09:30 之前
+    # 写完缓存。**再晚就不该跑** —— 跑不完的话日流程照样退回现场复核，
+    # 等于同一批票的 LLM 账单付两遍。08:00 + 30 = 08:30。
+    [int]$PremarketWindowMinutes = 30,
     # 每天滚动重训（写进 cn_lgb_live，由 load_production_predictions 优先读）。
     # **默认开** —— 不重训的话预测会静默冻结在模型 test 段的最后一天，
     # 而那正是 2026-09-09 查出来的故障。挂在**盘前任务**上（见 PremarketTime）。
@@ -155,12 +175,29 @@ if ($TaskName -eq $PreflightTaskName) {
     Write-Err "主任务和预检任务不能同名（都是 '$TaskName'）—— 后注册的会把前一个覆盖掉。"
     exit 1
 }
-# 预检必须在主任务**之前**跑，否则它存在的意义（留出登录同花顺的时间）就没了。
+# **顺序必须是 预检 -> 盘前复核 -> 下单。** 这不是审美问题：
+#   · 预检在盘前之前 —— 复核要调 LLM 中转站，那条链路走 Clash 代理
+#   · 盘前在下单之前 —— 复核结论写进缓存，日流程读它才省得下 58 分钟
+# 顺序错了两个任务都还会跑，只是各自白跑一遍，**没有任何报错**。所以在这里拦。
+#
 # [timespan] 而不是 [datetime]：前者不依赖区域设置，"09:30" 恒等于 9 小时 30 分。
 $leadMinutes = ([timespan]$Time - [timespan]$PreflightTime).TotalMinutes
 if (-not $NoPreflightTask -and $leadMinutes -le 0) {
     Write-Err "预检时间 $PreflightTime 不早于主任务 $Time —— 那就起不到提前准备的作用了。"
     exit 1
+}
+if (-not $NoPremarketTask) {
+    if (([timespan]$PremarketTime - [timespan]$Time).TotalMinutes -ge 0) {
+        Write-Err ("盘前复核 $PremarketTime 不早于主任务 $Time —— 复核结论赶不上下单，" +
+                   "日流程会退回盘中现场复核，这批票的 LLM 账单等于付两遍。")
+        exit 1
+    }
+    if (-not $NoPreflightTask -and
+        ([timespan]$PreflightTime - [timespan]$PremarketTime).TotalMinutes -ge 0) {
+        Write-Err ("预检 $PreflightTime 不早于盘前复核 $PremarketTime —— 复核要调 LLM 中转站，" +
+                   "而那条链路走 Clash 代理，预检没跑代理就没开。")
+        exit 1
+    }
 }
 
 if ($Remove) {
@@ -235,14 +272,17 @@ function Register-QbgTask {
         [string]$At,
         [string]$Description,
         [switch]$WithStartupTrigger,
-        [int]$TimeLimitHours = 2
+        [int]$TimeLimitHours = 2,
+        # 默认取主任务的窗口；预检和盘前各自传自己的（见 $PreflightWindowMinutes）。
+        [int]$Window = 0
     )
+    if ($Window -le 0) { $Window = $WindowMinutes }
     # 把"本该几点跑"和"迟到多久还算数"写进任务动作本身。任务因此是自描述的：
     # 从任务计划程序里看动作那一行，就知道它的窗口是什么，不用去翻脚本默认值。
     # **手工运行不带这两个参数，所以永远不受窗口限制**（window_guard.ps1）。
     $argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $Script
     if (-not $NoWindowGuard) {
-        $argLine += ' -ScheduledAt "{0}" -WindowMinutes {1}' -f $At, $WindowMinutes
+        $argLine += ' -ScheduledAt "{0}" -WindowMinutes {1}' -f $At, $Window
     }
     # **只有日流程任务加 --retrain，预检不加。**
     #
@@ -317,7 +357,8 @@ function Register-QbgTask {
     Write-Host ("  触发器     : {0}" -f (($task.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ", "))
     Write-Host ("  下次运行   : {0}" -f $info.NextRunTime)
     Write-Host ("  过期窗口   : {0}" -f $(if ($NoWindowGuard) { "已关闭（任何时候被唤起都跑）" }
-                                        else { "计划时间后 $WindowMinutes 分钟内有效" }))
+                                        else { "计划时间后 $Window 分钟内有效（截止 {0}）" -f `
+                                               ([timespan]$At).Add([timespan]::FromMinutes($Window)).ToString("hh\:mm") }))
     if ($Name -eq $PremarketTaskName) {
         Write-Host ("  每日重训   : {0}" -f $(if ($Retrain) { "开（--retrain，约 +2 分钟）" }
                                             else { "**关** —— 预测会冻结在模型 test 段最后一天" }))
@@ -334,10 +375,12 @@ Write-Host "============================================================"
 Write-Host " 已注册计划任务"
 Write-Host "============================================================"
 
-# --- 预检任务（先注册，它先跑）---------------------------------------------
-# **它存在的唯一理由是给人留出登录同花顺的时间。** 预检做的事 run_daily.ps1
-# 内部本来也会做一遍，但那时已经 09:30，发现同花顺停在登录框上就来不及了。
-# 提前 15 分钟跑一次，窗口就摆在桌面上等你，主流程到点时客户端已经可用。
+# --- 预检任务（第一个跑）-----------------------------------------------------
+# **它有两个下游，先跑的理由主要是第二个：**
+#   1. 给人留出登录同花顺的时间 —— run_daily.ps1 内部也会跑一遍预检，但那时
+#      已经 09:30，发现同花顺停在登录框上就来不及了。
+#   2. **盘前复核（08:00）要调 LLM 中转站，那条链路走 Clash 代理。**
+#      预检不先跑，代理没开，复核整个跑不起来。
 #
 # 重复运行没有副作用：代理/TUN 检测到开着就不发热键（热键是 toggle，
 # 发偶数次等于没发），同花顺在跑就只报告，端口在监听就跳过 10s 等待。
@@ -351,17 +394,18 @@ if (-not $NoPreflightTask) {
     # （主任务自己会跑预检），只会多弹一个同花顺窗口。
     # 1 小时上限：预检最慢的一步是等同花顺主窗口（40s），给足余量即可。
     Register-QbgTask -Name $PreflightTaskName -Script $preflightScript -At $PreflightTime `
-        -TimeLimitHours 1 `
+        -TimeLimitHours 1 -Window $PreflightWindowMinutes `
         -Description ("quant-biga 盘前预检（$Mode 模式；每天 $PreflightTime）。" +
                       "起 Clash + 同花顺、开系统代理/TUN，并留出人工登录同花顺的时间。" +
                       "非交易日会自行跳过。退出码 1 = 有告警但可以跑。")
 }
 
-# --- 盘前复核 ---------------------------------------------------------------
-# 排在预检**之前**：复核要跑一小时，越早开始越安全。
-# run_premarket.ps1 自己会先跑一次预检 —— 复核要调 LLM 中转站，那条链路走
-# Clash 代理，而预检 09:15 才开代理。副作用是好的：同花顺 08:00 就被拉起来，
-# 人工登录从 15 分钟的窗口变成一个半小时。
+# --- 盘前复核（第二个跑）-----------------------------------------------------
+# 排在预检**之后**、日流程之前。代理已经由 07:45 的预检开好，复核可以直接
+# 调中转站；结论写进 data/reviews/，09:30 的日流程读它。
+#
+# run_premarket.ps1 内部**仍然会再跑一次预检**，那是兜底 —— 预检任务被窗口闸
+# 跳过或自己失败的那天，复核不该跟着一起哑掉。预检幂等，重复跑没有副作用。
 if (-not $NoPremarketTask) {
     $premarketScript = Join-Path $ProjectRoot "run_premarket.ps1"
     if (-not (Test-Path $premarketScript)) {
@@ -369,10 +413,10 @@ if (-not $NoPremarketTask) {
         exit 1
     }
     # 2 小时上限：复核实测 58 分钟 + 重训 2 分钟，留一倍余量。
-    # 窗口闸由 run_premarket.ps1 自己默认成 90 分钟（比日流程的 120 短）——
-    # 09:30 之后才被唤起的盘前任务，跑完也赶不上当天的日流程了。
+    # 窗口只有 30 分钟（见 $PremarketWindowMinutes）—— 08:30 之后被唤起的话
+    # 复核赶不在 09:30 之前写完缓存，日流程照样退回现场复核，等于账单付两遍。
     Register-QbgTask -Name $PremarketTaskName -Script $premarketScript -At $PremarketTime `
-        -TimeLimitHours 2 `
+        -TimeLimitHours 2 -Window $PremarketWindowMinutes `
         -Description ("quant-biga 盘前复核（$Mode 模式；每天 $PremarketTime）。" +
                       "预检 + 拉数 + 滚动重训 + TradingAgents 逐票复核，" +
                       "结论写 data/reviews/。**不下单、不碰三把锁。** " +
@@ -387,8 +431,11 @@ Register-QbgTask -Name $TaskName -Script $Runner -At $Time `
 
 Write-Host ""
 if (-not $NoPreflightTask) {
-    Write-Host ("时序：{0} 预检（起 Clash + 同花顺）-> 你在这 {1} 分钟内登录同花顺 -> {2} 主流程下单" -f `
-        $PreflightTime, [int]$leadMinutes, $Time) -ForegroundColor Cyan
+    Write-Host ("时序：{0} 预检（起 Clash + 同花顺）-> {1} 盘前复核（约 1 小时，不下单）-> {2} 主流程下单" -f `
+        $PreflightTime, $(if ($NoPremarketTask) { "（无盘前任务）" } else { $PremarketTime }), $Time) `
+        -ForegroundColor Cyan
+    Write-Host ("      登录同花顺的窗口有 {0} 分钟（{1} 到 {2}）。" -f `
+        [int]$leadMinutes, $PreflightTime, $Time) -ForegroundColor Cyan
     Write-Host "      没登录也不会出事：取表失败 -> 持仓降级 -> PAPER/LIVE 拒绝下单。" -ForegroundColor Cyan
     Write-Host ""
 }
