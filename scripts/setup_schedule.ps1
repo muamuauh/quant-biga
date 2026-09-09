@@ -109,12 +109,17 @@ param(
     # 赶不上有意义的成交，而 daily_cycle 的 session_guard 是硬闸、会在流程跑到
     # 一半才否决 —— 那时 LLM 复核的钱已经花掉了。
     [int]$WindowMinutes = 120,
+    # 日流程每天滚动重训（写进 cn_lgb_live，由 load_production_predictions 优先读）。
+    # **默认开** —— 不重训的话预测会静默冻结在模型 test 段的最后一天，
+    # 而那正是 2026-09-09 查出来的故障。`-NoRetrain` 可关掉。
+    [switch]$NoRetrain,
     # 关掉窗口闸，恢复"任何时候被唤起都跑"的老行为。
     [switch]$NoWindowGuard,
     [switch]$Remove
 )
 
 $ErrorActionPreference = "Stop"
+$Retrain = -not $NoRetrain
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $Runner      = Join-Path $ProjectRoot "run_daily.ps1"
 
@@ -226,6 +231,16 @@ function Register-QbgTask {
     if (-not $NoWindowGuard) {
         $argLine += ' -ScheduledAt "{0}" -WindowMinutes {1}' -f $At, $WindowMinutes
     }
+    # **只有日流程任务加 --retrain，预检不加。**
+    #
+    # 2026-09-09 实测：日流程连着一个月每天选出完全相同的三只票。根因是
+    # `latest_date_scores` 取"预测里最后一天"，而静态模型的 test 段止于
+    # 2026-08-10 —— 那一天的分数被反复用了 30 天。日流程从不重训，而且
+    # 就算重训了，`train(live=True)` 写的 `cn_lgb_live` 当时也没人读。
+    #
+    # 现在 `load_production_predictions()` 优先读 live、回退静态，所以这里
+    # 加上 --retrain 才真正闭环。代价约 2 分钟/天，换来预测每天都是新的。
+    if ($Retrain -and $Name -eq $TaskName) { $argLine += ' --retrain' }
     $action  = New-ScheduledTaskAction -Execute $Shell -Argument $argLine -WorkingDirectory $ProjectRoot
 
     $triggers = @(New-ScheduledTaskTrigger -Daily -At $At)
@@ -286,6 +301,10 @@ function Register-QbgTask {
     Write-Host ("  下次运行   : {0}" -f $info.NextRunTime)
     Write-Host ("  过期窗口   : {0}" -f $(if ($NoWindowGuard) { "已关闭（任何时候被唤起都跑）" }
                                         else { "计划时间后 $WindowMinutes 分钟内有效" }))
+    if ($Name -eq $TaskName) {
+        Write-Host ("  每日重训   : {0}" -f $(if ($Retrain) { "开（--retrain，约 +2 分钟）" }
+                                            else { "**关** —— 预测会冻结在模型 test 段最后一天" }))
+    }
     Write-Host "------------------------------------------------------------"
 }
 

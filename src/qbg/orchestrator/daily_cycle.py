@@ -25,7 +25,11 @@ from qbg.portfolio.source import load_portfolio
 from qbg.report.daily_report import generate
 from qbg.risk.gates import load_limits, run_all_gates
 from qbg.store.etl import backfill
-from qbg.strategy.predict import latest_date_scores, load_latest_predictions
+from qbg.strategy.predict import (
+    latest_date_scores,
+    load_production_predictions,
+    prediction_asof,
+)
 from qbg.strategy.regime import market_risk_on
 from qbg.strategy.topk_weights import affordable_scores, renormalize_weights, topk_equal_weight
 from qbg.utils.logging import get_logger, log_event
@@ -57,6 +61,7 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     result: dict = {"date": today, "mode": settings.qbg_mode.upper(), "started_ts": _now(),
                     "run_kind": "dry_run" if dry_run else "rebalance", "hard_ok": True,
                     "submitted": False, "market_risk_on": False, "orders": [],
+                    "prediction_source": None, "prediction_asof": None,
                     "allowed_orders": [], "targets": {}, "scores": [], "gates": []}
     if not force and not calendar.is_trading_day(today):
         result["skipped_reason"] = "not_trading_day"
@@ -126,7 +131,16 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
 
     current = {p["code"]: int(p["qty"]) for p in positions}
     sellable = {p["code"]: int(p["sellable_qty"]) for p in positions}
-    scores = latest_date_scores(load_latest_predictions(), neutralize=bool(settings.qbg_industry_neutral))
+    # **优先读滚动重训的 live，回退静态的 cn_lgb。** 2026-09-09 之前这里
+    # 直接读静态那份，而它的 test 段止于 2026-08-10 —— 于是日流程连着一个月
+    # 每天选出完全相同的三只票。predictions 的日期同时喂给
+    # prediction_freshness_guard，让这件事下次不可能再静默发生。
+    raw_pred, pred_source = load_production_predictions()
+    pred_asof = prediction_asof(raw_pred)
+    log_event(log, "cycle.predictions.loaded", source=pred_source, asof=pred_asof)
+    result["prediction_source"] = pred_source
+    result["prediction_asof"] = pred_asof
+    scores = latest_date_scores(raw_pred, neutralize=bool(settings.qbg_industry_neutral))
     result["scores"] = [{"code": code, "score": float(score)} for code, score in scores.items()]
     names = meta.load_cached()
     last, previous, st, suspended, dates = {}, {}, {}, {}, []
@@ -163,6 +177,8 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     hard_ok, allowed, gate_results = run_all_gates(
         target_weights=targets, orders=orders, current_cash=cash, total_equity=equity,
         today_pnl=0, latest_data_date=max(dates) if dates else None, asof=today,
+        # 预测日期。行情闸看不见它 —— 行情每天都在更新，陈旧的是预测。
+        prediction_date=pred_asof,
         prev_close=previous, market_price=last, is_st=st, suspended=suspended,
         sellable_qty=sellable, current_qty=current, limits=limits,
         # **这个参数以前没传。** 它默认 None，而 session_guard 对 None 返回

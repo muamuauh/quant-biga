@@ -91,6 +91,10 @@ def test_all_order_gates_fail_but_sell_is_preserved():
         prev_close={sell.code: 10}, market_price={sell.code: 9}, is_st={sell.code: True},
         suspended={sell.code: True}, sellable_qty={sell.code: 0}, current_qty={sell.code: 100},
         limits=bad,
+        # 这条测的是「所有订单闸都失败时 SELL 仍然放行」，不是新鲜度。
+        # 但 prediction_freshness_guard 是**硬闸**且 None 不放行，所以必须给
+        # 一个新鲜的日期，否则流程在硬闸阶段就 return 了，压根走不到订单闸。
+        prediction_date="2026-08-10",
     )
     assert hard_ok and allowed == [sell]
     assert sum(not result.passed for result in results) >= 4

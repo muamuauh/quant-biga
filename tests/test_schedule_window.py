@@ -104,3 +104,33 @@ def test_preflight_guard_runs_before_any_side_effect():
         if call_at is not None:
             assert guard_at < call_at, \
                 f"预检的窗口闸出现在 {marker} 的调用之后 —— 副作用已经发生了才判断"
+
+
+# ----------------------------------------------------------------------
+# 每日重训 —— 不重训的话预测会静默冻结（2026-09-09 实测连着一个月同一批票）
+# ----------------------------------------------------------------------
+
+def test_setup_adds_retrain_to_the_daily_task():
+    """`--retrain` 必须写进日流程任务的动作里。
+
+    不重训 → `train(live=True)` 从不执行 → `cn_lgb_live` 不存在 →
+    `load_production_predictions` 回退到静态的 `cn_lgb`，而它的 test 段
+    止于模型训练那天。表现是**每天选出完全相同的票**，而且没有任何报错。
+    """
+    src = read(SETUP)
+    assert "--retrain" in src, "setup_schedule.ps1 没给日流程任务加 --retrain"
+    assert "$NoRetrain" in src, "没有留关掉它的出口"
+
+
+def test_retrain_is_only_for_the_daily_task_not_preflight():
+    """预检不该重训 —— 它的职责是把环境准备好，不是跑模型。
+
+    断言的是**那一行赋值**而不是"文件里出现过 --retrain"：注释里也会写到它，
+    按第一次出现去截窗口会截到注释上，测试就变成了"注释写得对不对"。
+    """
+    src = read(SETUP)
+    line = next((ln for ln in src.splitlines()
+                 if "--retrain" in ln and "$argLine" in ln), None)
+    assert line is not None, "找不到把 --retrain 拼进任务动作的那一行"
+    assert "$Name -eq $TaskName" in line, \
+        f"--retrain 没有限定只给日流程任务，预检也会跟着重训：{line.strip()}"

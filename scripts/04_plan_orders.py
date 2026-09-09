@@ -17,7 +17,11 @@ from qbg.execution.advisory import AdvisoryAdapter  # noqa: E402
 from qbg.execution.order_planner import plan_orders  # noqa: E402
 from qbg.report.order_sheet import render_markdown  # noqa: E402
 from qbg.risk.gates import load_limits, run_all_gates  # noqa: E402
-from qbg.strategy.predict import latest_date_scores, load_latest_predictions  # noqa: E402
+from qbg.strategy.predict import (  # noqa: E402
+    latest_date_scores,
+    load_production_predictions,
+    prediction_asof,
+)
 from qbg.strategy.regime import market_risk_on  # noqa: E402
 from qbg.strategy.topk_weights import affordable_scores, topk_equal_weight  # noqa: E402
 
@@ -45,7 +49,8 @@ def main(argv=None) -> int:
     positions = _positions(args.positions)
     current = {str(row.code): int(row.qty) for row in positions.itertuples()}
     sellable = {str(row.code): int(row.sellable_qty) for row in positions.itertuples()}
-    candidates = latest_date_scores(load_latest_predictions(), neutralize=bool(settings.qbg_industry_neutral))
+    raw_pred, _pred_source = load_production_predictions()
+    candidates = latest_date_scores(raw_pred, neutralize=bool(settings.qbg_industry_neutral))
     codes_list = list(dict.fromkeys(list(candidates.index) + list(current)))
     names = meta.load_cached()
     last, previous, st, suspended, latest_dates = {}, {}, {}, {}, []
@@ -60,6 +65,7 @@ def main(argv=None) -> int:
         latest_dates.append(pd.Timestamp(row["date"]))
 
     limits = load_limits()
+    pred_asof = prediction_asof(raw_pred)
     filtered = affordable_scores(candidates, last, args.equity, settings.qbg_top_k,
                                  cap=float(limits["max_position_pct"]))
     risk_on = market_risk_on(list(last), settings.qbg_market_sma)
@@ -73,6 +79,9 @@ def main(argv=None) -> int:
         today_pnl=args.today_pnl, latest_data_date=max(latest_dates) if latest_dates else None,
         asof=args.asof, prev_close=previous, market_price=last, is_st=st, suspended=suspended,
         sellable_qty=sellable, current_qty=current, limits=limits,
+        # 预测日期。不传的话 prediction_freshness_guard 会一票否决 ——
+        # 这是刻意的：忘了传比传了一个过期的更危险。
+        prediction_date=pred_asof,
     )
     print(render_markdown(allowed, results))
     if not hard_ok:
