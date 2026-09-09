@@ -330,6 +330,9 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # 路径
     # ------------------------------------------------------------------
+    # 所有本地产物的根。单列一个是为了让 data/ 下的新目录（reviews/ 之类）
+    # 有一个规范的挂载点，而不是各处写 `parquet_dir.parent`。
+    data_dir: Path = PROJECT_ROOT / "data"
     parquet_dir: Path = PROJECT_ROOT / "data" / "parquet"
     qlib_provider_uri: Path = PROJECT_ROOT / "data" / "qlib_bin" / "cn_data"
     snapshot_dir: Path = PROJECT_ROOT / "data" / "snapshots"

@@ -122,15 +122,21 @@ def test_setup_adds_retrain_to_the_daily_task():
     assert "$NoRetrain" in src, "没有留关掉它的出口"
 
 
-def test_retrain_is_only_for_the_daily_task_not_preflight():
-    """预检不该重训 —— 它的职责是把环境准备好，不是跑模型。
+def test_retrain_is_bound_to_exactly_one_task():
+    """`--retrain` 只能挂在**一个**任务上，而且那个任务不能是预检。
 
     断言的是**那一行赋值**而不是"文件里出现过 --retrain"：注释里也会写到它，
     按第一次出现去截窗口会截到注释上，测试就变成了"注释写得对不对"。
+
+    2026-09-09 起它跟着复核挪到了盘前任务。**这条测试不钉死是哪一个** ——
+    钉死的是"恰好一处、且不是预检"，这两点无论重训归谁都成立。
+    具体归属由 test_premarket_review.py::test_retrain_moved_to_the_premarket_task 管。
     """
     src = read(SETUP)
-    line = next((ln for ln in src.splitlines()
-                 if "--retrain" in ln and "$argLine" in ln), None)
-    assert line is not None, "找不到把 --retrain 拼进任务动作的那一行"
-    assert "$Name -eq $TaskName" in line, \
-        f"--retrain 没有限定只给日流程任务，预检也会跟着重训：{line.strip()}"
+    lines = [ln for ln in src.splitlines() if "--retrain" in ln and "$argLine" in ln]
+    assert len(lines) == 1, f"--retrain 的赋值有 {len(lines)} 处，应当只有一处：{lines}"
+    line = lines[0]
+    assert "$Name -eq $" in line, \
+        f"--retrain 没限定给某一个任务，三个任务会一起重训：{line.strip()}"
+    assert "$PreflightTaskName" not in line, \
+        f"预检不该重训 —— 它的职责是准备环境，不是跑模型：{line.strip()}"

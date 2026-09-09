@@ -144,6 +144,54 @@ def fill_field(user, control_id: int, text: str) -> None:
     edit.type_keys(_keys_for(text), set_foreground=False, pause=0.08)
 
 
+def fill_and_verify(user, control_id: int, text: str, *, label: str,
+                    attempts: int = 3) -> tuple[str, list[str]]:
+    """填一个字段并 OCR 回读确认，不符就**重填**。返回 `(最后读到的值, 历次读数)`。
+
+    ## 为什么需要重试
+
+    2026-09-09 实测：`688183.SH` 的价格 `126.80` 回读成 `16.80`（第二位丢了），
+    于是整批订单被中止 —— 而当天的复核已经花了 $0.23 和一小时。
+
+    在此之前只有**代码框**有重试，理由是"这一步失败会中止整批订单，代价太大"。
+    那个理由对价格和数量**完全成立**，只是当初没往下推：代码框有
+    「客户端回填证券名称」这个可靠的预言机，而价格/数量只有 OCR，
+    于是就没做。但没有预言机不等于不该重试 —— 恰恰相反。
+
+    ## 这个重试**不放宽判据**
+
+    重试用完仍然不符，照样让调用方中止。放宽成"差不多就提交"是把一道安全闸
+    换成一个赌注 —— 那笔 `16.80` 的买单要是发出去了，挂在跌停之外成交不了
+    是运气好；换成卖单填成 10 倍价，后果就不一样了。
+
+    ## 历次读数是用来断案的
+
+    `seen` 会记进日志。**它能分清两种此前分不清的故障**：
+
+      · 各次读数**不同**（如 `["1680", "12680"]`）→ 抖动，重试有效
+      · 各次读数**相同**（如 `["1680", "1680", "1680"]`）→ 键真的被吞了，
+        或者 OCR 在这个框上有系统性缺陷，得换手段而不是多试几次
+
+    在此之前两种都只表现为同一条 "期望 12680 实际 1680"，无从判断。
+    """
+    want = _digits(text)
+    seen: list[str] = []
+    for attempt in range(max(1, attempts)):
+        fill_field(user, control_id, text)
+        # 第一次之后多等一会儿：失败往往是客户端没处理过来，抢时间只会再错一次。
+        time.sleep(0.6 if attempt == 0 else 1.0)
+        got = ocr_digits(user, control_id)
+        seen.append(got)
+        if got == want:
+            if attempt:
+                log_event(log, "ths.order.fill_retry_ok", field=label,
+                          attempt=attempt, want=want, seen=seen)
+            return got, seen
+        log_event(log, "ths.order.fill_mismatch", field=label, attempt=attempt,
+                  want=want, got=got, seen=seen)
+    return seen[-1], seen
+
+
 def ocr_digits(user, control_id: int) -> str:
     """截图输入框再 OCR，归一成数字序列。
 
@@ -386,18 +434,25 @@ def place_order(user, *, code: str, side: str, quantity: int, price: float) -> P
     else:
         raise OrderFormError(f"填入 {six} 后客户端没有回填证券名称 —— 输入没被接收，中止")
 
-    fill_field(user, PRICE_ID, price_text)
-    fill_field(user, AMOUNT_ID, amount_text)
+    _, price_seen = fill_and_verify(user, PRICE_ID, price_text, label="price")
+    _, amount_seen = fill_and_verify(user, AMOUNT_ID, amount_text, label="quantity")
     time.sleep(0.6)
 
     # 提交前肯定性校验。不通过就**不点提交**。
+    #
+    # 上面每个字段自己已经读过一遍了，这里**再整体读一次**是有意的：
+    # 填数量时客户端可能回头改动价格框（自动算金额之类），逐字段验过不代表
+    # 此刻三个框同时是对的。这一次读才是放行的依据。
     checks = {"code": (ocr_digits(user, CODE_ID), six),
               "price": (ocr_digits(user, PRICE_ID), _digits(price_text)),
               "quantity": (ocr_digits(user, AMOUNT_ID), _digits(amount_text))}
     mismatched = {k: v for k, v in checks.items() if v[0] != v[1]}
     if mismatched:
         detail = "；".join(f"{k} 期望 {want} 实际 {got}" for k, (got, want) in mismatched.items())
-        raise OrderFormError(f"提交前回读不符，未提交：{detail}")
+        # 带上历次读数：读数各次不同 = 抖动，重试还能救；始终相同 = 键真的被
+        # 吞了或 OCR 在这个框上有系统性缺陷，再多试几次也没用，得换手段。
+        history = f"（历次读数 price={price_seen} quantity={amount_seen}）"
+        raise OrderFormError(f"提交前回读不符，未提交：{detail}{history}")
 
     log_event(log, "ths.order.submit", code=six, side=side,
               quantity=quantity, price=price_text)

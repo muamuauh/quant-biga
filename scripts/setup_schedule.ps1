@@ -86,6 +86,18 @@ param(
     [string]$PreflightTime     = '09:15',
     [string]$PreflightTaskName = 'quant_biga_preflight',
     [switch]$NoPreflightTask,
+    # 盘前复核任务。**它才是解决"复核太慢"的那一刀。**
+    #
+    # 2026-09-09 实测：TradingAgents 复核 5 只票花 58 分钟，而
+    # require_trading_session 是硬闸 —— 09:30 现场复核会跑到上午盘尾甚至收盘
+    # 之后，整天作废且 LLM 的钱已经花掉（当天 $0.23）。
+    #
+    # 08:00 起跑，给复核留足一个半小时；跑完写 data/reviews/<date>.json，
+    # 09:30 的日流程直接读，全程 2 分钟。它**不下单、不碰三把锁**。
+    [ValidatePattern('^\d{1,2}:\d{2}$')]
+    [string]$PremarketTime     = '08:00',
+    [string]$PremarketTaskName = 'quant_biga_premarket',
+    [switch]$NoPremarketTask,
     # **默认不加开机/登录触发器。** 2026-08-29 配好自动登录之后，机器 09:00
     # 开机、自动进桌面，于是这个触发器每天都会在 09:16 拉起一次必然早退的运行 ——
     # 而它会占住 MultipleInstances=IgnoreNew 的名额：2026-08-31 那次监听器
@@ -109,9 +121,10 @@ param(
     # 赶不上有意义的成交，而 daily_cycle 的 session_guard 是硬闸、会在流程跑到
     # 一半才否决 —— 那时 LLM 复核的钱已经花掉了。
     [int]$WindowMinutes = 120,
-    # 日流程每天滚动重训（写进 cn_lgb_live，由 load_production_predictions 优先读）。
+    # 每天滚动重训（写进 cn_lgb_live，由 load_production_predictions 优先读）。
     # **默认开** —— 不重训的话预测会静默冻结在模型 test 段的最后一天，
-    # 而那正是 2026-09-09 查出来的故障。`-NoRetrain` 可关掉。
+    # 而那正是 2026-09-09 查出来的故障。挂在**盘前任务**上（见 PremarketTime）。
+    # `-NoRetrain` 可关掉。
     [switch]$NoRetrain,
     # 关掉窗口闸，恢复"任何时候被唤起都跑"的老行为。
     [switch]$NoWindowGuard,
@@ -132,7 +145,7 @@ function Write-Err($m)  { Write-Host "  [ERROR] $m" -ForegroundColor Red }
 # 管。手滑传个同名参数就会把人家的任务覆盖掉，而且覆盖是静默的。
 # 两个名字都要查。兄弟仓库的任务正好也叫 qtf_daily / qtf_preflight，
 # 而 quant-trading 挂在真钱账户上 —— 手滑传个同名参数就会静默覆盖掉人家的。
-foreach ($n in @($TaskName, $PreflightTaskName)) {
+foreach ($n in @($TaskName, $PreflightTaskName, $PremarketTaskName)) {
     if ($n -match '^(qtf|qtagent)') {
         Write-Err "拒绝操作 '$n' —— qtf_* / qtagent_* 是兄弟仓库的任务，CLAUDE.md 明令禁止动。"
         exit 1
@@ -152,7 +165,7 @@ if (-not $NoPreflightTask -and $leadMinutes -le 0) {
 
 if ($Remove) {
     $removed = 0
-    foreach ($n in @($TaskName, $PreflightTaskName)) {
+    foreach ($n in @($TaskName, $PreflightTaskName, $PremarketTaskName)) {
         if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName $n -Confirm:$false
             Write-OK "已删除任务 '$n'。"
@@ -240,7 +253,11 @@ function Register-QbgTask {
     #
     # 现在 `load_production_predictions()` 优先读 live、回退静态，所以这里
     # 加上 --retrain 才真正闭环。代价约 2 分钟/天，换来预测每天都是新的。
-    if ($Retrain -and $Name -eq $TaskName) { $argLine += ' --retrain' }
+    # 重训归**盘前**任务。日流程再训一遍是白花 2 分钟 —— 盘前刚训完，
+    # 同样的数据同样的 seed，结果逐位相同。
+    # 盘前任务没跑（关机/失败）时，日流程仍会读到上一次的 cn_lgb_live，
+    # 而它够不够新由 prediction_freshness_guard 判 —— 那才是该管这件事的地方。
+    if ($Retrain -and $Name -eq $PremarketTaskName) { $argLine += ' --retrain' }
     $action  = New-ScheduledTaskAction -Execute $Shell -Argument $argLine -WorkingDirectory $ProjectRoot
 
     $triggers = @(New-ScheduledTaskTrigger -Daily -At $At)
@@ -301,7 +318,7 @@ function Register-QbgTask {
     Write-Host ("  下次运行   : {0}" -f $info.NextRunTime)
     Write-Host ("  过期窗口   : {0}" -f $(if ($NoWindowGuard) { "已关闭（任何时候被唤起都跑）" }
                                         else { "计划时间后 $WindowMinutes 分钟内有效" }))
-    if ($Name -eq $TaskName) {
+    if ($Name -eq $PremarketTaskName) {
         Write-Host ("  每日重训   : {0}" -f $(if ($Retrain) { "开（--retrain，约 +2 分钟）" }
                                             else { "**关** —— 预测会冻结在模型 test 段最后一天" }))
     }
@@ -338,6 +355,28 @@ if (-not $NoPreflightTask) {
         -Description ("quant-biga 盘前预检（$Mode 模式；每天 $PreflightTime）。" +
                       "起 Clash + 同花顺、开系统代理/TUN，并留出人工登录同花顺的时间。" +
                       "非交易日会自行跳过。退出码 1 = 有告警但可以跑。")
+}
+
+# --- 盘前复核 ---------------------------------------------------------------
+# 排在预检**之前**：复核要跑一小时，越早开始越安全。
+# run_premarket.ps1 自己会先跑一次预检 —— 复核要调 LLM 中转站，那条链路走
+# Clash 代理，而预检 09:15 才开代理。副作用是好的：同花顺 08:00 就被拉起来，
+# 人工登录从 15 分钟的窗口变成一个半小时。
+if (-not $NoPremarketTask) {
+    $premarketScript = Join-Path $ProjectRoot "run_premarket.ps1"
+    if (-not (Test-Path $premarketScript)) {
+        Write-Err "找不到 $premarketScript"
+        exit 1
+    }
+    # 2 小时上限：复核实测 58 分钟 + 重训 2 分钟，留一倍余量。
+    # 窗口闸由 run_premarket.ps1 自己默认成 90 分钟（比日流程的 120 短）——
+    # 09:30 之后才被唤起的盘前任务，跑完也赶不上当天的日流程了。
+    Register-QbgTask -Name $PremarketTaskName -Script $premarketScript -At $PremarketTime `
+        -TimeLimitHours 2 `
+        -Description ("quant-biga 盘前复核（$Mode 模式；每天 $PremarketTime）。" +
+                      "预检 + 拉数 + 滚动重训 + TradingAgents 逐票复核，" +
+                      "结论写 data/reviews/。**不下单、不碰三把锁。** " +
+                      "跑飞了日流程只是退回盘中现场复核 —— 慢，但正确。")
 }
 
 # --- 主任务 -----------------------------------------------------------------

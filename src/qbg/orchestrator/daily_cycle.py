@@ -62,6 +62,7 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
                     "run_kind": "dry_run" if dry_run else "rebalance", "hard_ok": True,
                     "submitted": False, "market_risk_on": False, "orders": [],
                     "prediction_source": None, "prediction_asof": None,
+                    "review_source": None,
                     "allowed_orders": [], "targets": {}, "scores": [], "gates": []}
     if not force and not calendar.is_trading_day(today):
         result["skipped_reason"] = "not_trading_day"
@@ -158,16 +159,37 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     risk_on = market_risk_on(list(last), settings.qbg_market_sma,
                              band=settings.qbg_market_sma_band)
     review_verdicts, review_usage = [], {}
+    review_source = None
     reviewed_scores = filtered
     if risk_on and settings.qbg_agents_enabled:
-        from qbg.agents.review import review_candidates
+        from qbg.agents.verdict_cache import load_verdicts
 
         candidate_count = min(settings.qbg_agents_candidates, len(filtered))
         candidate_scores = filtered.iloc[:candidate_count]
-        candidate_weights = {code: 1.0 / candidate_count for code in candidate_scores.index}
-        kept, verdicts, review_usage = review_candidates(candidate_weights)
-        reviewed_scores = candidate_scores.loc[[code for code in candidate_scores.index if code in kept]]
-        review_verdicts = [verdict.as_dict() for verdict in verdicts]
+        candidates = list(candidate_scores.index)
+        candidate_weights = {code: 1.0 / candidate_count for code in candidates}
+
+        # **优先用盘前跑好的结论。** 复核实测 58 分钟（5 只票 × 12 次 LLM 调用），
+        # 而 require_trading_session 是硬闸 —— 09:30 现场复核会跑到上午盘尾甚至
+        # 收盘之后，整天作废且钱已经花掉。盘前跑完、盘中只读，把「LLM 慢」和
+        # 「必须盘中下单」这两个约束解耦。
+        #
+        # 缓存**只在候选名单逐只相同时**才用（见 verdict_cache 的说明）：
+        # 名单变了还套旧结论，等于给没复核过的票安一个别人的评级。
+        cached = load_verdicts(today, candidates)
+        if cached is not None:
+            kept, review_verdicts, review_usage = cached
+            review_source = "premarket_cache"
+        else:
+            from qbg.agents.review import review_candidates
+
+            kept, verdicts, review_usage = review_candidates(candidate_weights)
+            review_verdicts = [verdict.as_dict() for verdict in verdicts]
+            review_source = "inline"
+        reviewed_scores = candidate_scores.loc[[code for code in candidates if code in kept]]
+        log_event(log, "cycle.review.source", source=review_source,
+                  candidates=len(candidates), kept=len(kept))
+    result["review_source"] = review_source
     targets = topk_equal_weight(reviewed_scores, settings.qbg_top_k, 0.95, set(current),
                                 settings.qbg_keep_rank) if risk_on else {}
     targets = renormalize_weights(targets, 0.95, float(limits["max_position_pct"]))
