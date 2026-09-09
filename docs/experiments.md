@@ -44,6 +44,7 @@
 | `04_plan_orders.py` | 模型分数 → 风控闸 → 下单清单 |
 | `05_report.py` | 中文日报 |
 | `14_backfill_store.py` | 从 JSONL 重建 `data/runs.db`（store 是派生的，删掉不影响下单） |
+| `26_premarket.py` | **盘前**：拉数 + 重训 + 逐票复核 → `data/reviews/<date>.json`。**永远不下单**（没有风控闸、没有 execution）。日流程按「候选名单逐只相同」决定用不用它 |
 | `27_notify.py` | 预览/补发日报邮件 |
 | `email_listener.py` | 入站邮件命令（重跑 / 状态 / 关机），默认关闭 |
 | `patch_tradingagents.py` | 往 vendored TradingAgents 注册 ashare vendor，幂等 |

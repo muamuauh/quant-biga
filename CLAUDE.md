@@ -248,19 +248,38 @@ python tools/probe_ths.py                    # 只读四表 + 字段对照
 
 ```
 scripts/preflight.ps1      Clash 代理/TUN + 同花顺 + qbg 环境预检（不跑流程）
+run_premarket.ps1          锁 → 预检 → 26_premarket.py（拉数+重训+复核，**不下单**）
 run_daily.ps1              锁 → 预检 → daily_cycle → 原样传出退出码
-scripts/setup_schedule.ps1 注册**两个**计划任务
+scripts/setup_schedule.ps1 注册**三个**计划任务
 ```
 
 `run_daily.bat` / `setup_schedule.bat` 只是双击用的壳。
 
-### 为什么是两个任务、为什么是 09:15 / 09:30
+### 为什么是三个任务、为什么是 08:00 / 09:15 / 09:30
 
 ```
+08:00  quant_biga_premarket   预检 → 拉数 → 滚动重训 → 逐票复核
+       ↓  结论写 data/reviews/<date>.json。**它不下单、不碰三把锁。**
 09:15  quant_biga_preflight   起 Clash + 同花顺，开系统代理/TUN
        ↓  这 15 分钟是留给**人工登录同花顺**的 —— 脚本做不到这件事
-09:30  quant_biga_daily       预检（幂等重跑）→ 拉数 → 打分 → 复核 → 下单
+09:30  quant_biga_daily       预检（幂等重跑）→ 拉数 → 打分 → 读缓存 → 下单
 ```
+
+**盘前任务是为了拆开两个打架的约束**（2026-09-09 实测）：TradingAgents 复核
+5 只票花 **58 分钟**，而 `require_trading_session` 是硬闸 —— 09:30 现场复核会
+跑到收盘之后，整天作废且 LLM 的钱已经花掉。慢活挪到 08:00，日流程只剩 2 分钟。
+
+**判据是候选名单逐只相同（按集合），不等就整份作废、退回现场复核。**
+名单变了还套旧结论，等于给一只从没复核过的票安上别人的评级。缓存缺失、
+半截写入、日期对不上，一律退回现场复核而不是抛异常打断日流程。
+
+`--retrain` 也跟着挪到了盘前 —— 盘前刚训完，日流程同数据同 seed 再训一遍
+结果逐位相同。盘前没跑时日流程读上一次的 `cn_lgb_live`，够不够新由
+`prediction_freshness_guard` 判，**那才是该管这件事的地方**。
+
+**盘前用单独的锁**（`logs/premarket.lock`）。共用一把的话复核跑超时会把 09:30
+的日流程直接挡掉，而那是当天唯一能下单的机会。窗口闸也短一档（90 vs 120）：
+09:30 之后才被唤起的盘前任务，跑完也赶不上当天的日流程。
 
 **09:30 不是随便选的。** `configs/risk_limits.yaml` 的 `require_trading_session`
 随 P9c 改成了 `true`，而它是硬闸 —— 盘前跑会被 `session_guard` 一票否决，
@@ -298,7 +317,7 @@ SendKeys 只能送到**同一个交互会话**里的 Clash；同花顺自动化�
 
 ### 两个不许动的地方
 
-- `setup_schedule.ps1` **拒绝** `qtf_*` / `qtagent_*` 开头的任务名（两个任务名
+- `setup_schedule.ps1` **拒绝** `qtf_*` / `qtagent_*` 开头的任务名（三个任务名
   都查）。那是兄弟仓库的任务（§一），而且它那两个正好也叫 `qtf_daily` /
   `qtf_preflight` —— 覆盖是静默的。
 - 计划任务的 `RunLevel` 固定 `Limited`。同花顺以普通权限跑，Python 也必须是
