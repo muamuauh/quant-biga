@@ -32,6 +32,7 @@ import pandas as pd
 from qbg.config import settings
 from qbg.data.sources.base import DailyBarSource, SourceUnavailable, empty_bars
 from qbg.utils.logging import get_logger, log_event
+from qbg.utils.net import net_timeout
 
 log = get_logger(__name__)
 
@@ -121,7 +122,12 @@ class SourceChain:
             if src is None:
                 continue
             try:
-                bars = src.fetch(code, start, end)
+                # 超时套在**链条层**而不是每个源里：源的实现各不相同
+                # （baostock 走自己的协议、akshare 走 requests），但都从这里进。
+                # 没有它的话「换下一个源」这条降级路径只挡得住"立刻报错"，
+                # 挡不住"永远不回" —— 见 utils/net.py 的模块说明。
+                with net_timeout():
+                    bars = src.fetch(code, start, end)
             except SourceUnavailable as e:
                 # 源整体不可用 → 拉黑，换下一个。
                 log_event(log, "chain.source_dead", source=name, reason=str(e)[:200])

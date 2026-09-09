@@ -38,6 +38,7 @@ from qbg.config import settings
 from qbg.data import cache, meta
 from qbg.market import codes
 from qbg.utils.logging import get_logger, log_event
+from qbg.utils.net import net_timeout
 
 log = get_logger(__name__)
 
@@ -86,7 +87,10 @@ def fetch_index_constituents(index_code: str | None = None) -> list[str]:
     try:
         import akshare as ak
 
-        df = ak.index_stock_cons_csindex(symbol=index_code)
+        # 没有超时的话，下面那个 except 分支（fail-soft 回本地 universe 文件）
+        # 永远走不到 —— 2026-09-09 实测卡死 10 分钟。见 utils/net.py。
+        with net_timeout():
+            df = ak.index_stock_cons_csindex(symbol=index_code)
     except Exception as e:  # noqa: BLE001
         log_event(log, "universe.fetch.error", index=index_code, error=str(e)[:200])
         return []
@@ -185,7 +189,8 @@ def inclusion_dates(index_code: str = "000300", root: Path | None = None,
     try:
         import akshare as ak
 
-        df = ak.index_stock_cons(symbol=index_code)
+        with net_timeout():
+            df = ak.index_stock_cons(symbol=index_code)
     except Exception as e:  # noqa: BLE001 — 网络/接口变更都不该炸掉调用方
         log_event(log, "universe.inclusion.fetch_failed", error=str(e)[:200])
         if path.exists():

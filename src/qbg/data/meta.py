@@ -30,6 +30,7 @@ import pandas as pd
 from qbg.config import settings
 from qbg.market import codes
 from qbg.utils.logging import get_logger, log_event
+from qbg.utils.net import net_timeout
 
 log = get_logger(__name__)
 
@@ -96,7 +97,8 @@ def refresh(root: Path | None = None) -> dict[str, str]:
     try:
         import akshare as ak
 
-        df = ak.stock_info_a_code_name()
+        with net_timeout():
+            df = ak.stock_info_a_code_name()
     except Exception as e:  # noqa: BLE001
         cached = load_cached(root)
         log_event(log, "meta.refresh.failed_using_cache",

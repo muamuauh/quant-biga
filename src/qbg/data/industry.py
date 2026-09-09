@@ -31,6 +31,7 @@ import pandas as pd
 from qbg.config import settings
 from qbg.market import codes
 from qbg.utils.logging import get_logger, log_event
+from qbg.utils.net import net_timeout
 
 log = get_logger(__name__)
 
@@ -75,7 +76,8 @@ def refresh(root: Path | None = None, sleep_sec: float = _SLEEP_SEC) -> dict[str
     try:
         import akshare as ak
 
-        industries = ak.sw_index_first_info()
+        with net_timeout():
+            industries = ak.sw_index_first_info()
     except Exception as e:  # noqa: BLE001
         cached = load_cached(root)
         log_event(log, "industry.refresh.failed_using_cache",
@@ -93,7 +95,8 @@ def refresh(root: Path | None = None, sleep_sec: float = _SLEEP_SEC) -> dict[str
         # `801010.SI` → `801010`
         symbol = ind_code.split(".")[0]
         try:
-            cons = ak.index_component_sw(symbol=symbol)
+            with net_timeout():
+                cons = ak.index_component_sw(symbol=symbol)
         except Exception as e:  # noqa: BLE001
             failed.append(ind_name)
             log_event(log, "industry.component.error",
