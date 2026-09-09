@@ -138,3 +138,39 @@ def test_market_risk_on_reads_both_switches():
 def test_equal_weight_index_use_inclusion_is_a_parameter():
     """生产链路只有代码表、没有面板，所以必须能让它自己建资格表。"""
     assert "use_inclusion" in inspect.signature(equal_weight_index).parameters
+
+
+# ----------------------------------------------------------------------
+# 择时关闭（QBG_MARKET_SMA=0）
+# ----------------------------------------------------------------------
+
+def test_market_risk_on_short_circuits_without_touching_the_cache():
+    """关掉择时时不该再读 299 个 parquet 去算一条不会被看的曲线。
+
+    `risk_on_series` 本来就在 window<=0 时短路成全 True，但那发生在
+    `equal_weight_index` 读完缓存**之后** —— 日流程每天白跑几十秒 I/O。
+    这里传一个会炸的股票列表来证明它根本没去读。
+    """
+    from qbg.strategy import regime
+
+    called = []
+
+    def boom(*a, **kw):
+        called.append(1)
+        raise AssertionError("关掉择时时不该读缓存")
+
+    original = regime.equal_weight_index
+    regime.equal_weight_index = boom
+    try:
+        assert regime.market_risk_on(["600519.SH"], sma_window=0) is True
+    finally:
+        regime.equal_weight_index = original
+    assert not called
+
+
+def test_timing_off_is_risk_on_regardless_of_band():
+    """关掉择时后缓冲带不该还有话语权 —— 它只在有均线可比时才有意义。"""
+    from qbg.strategy import regime
+
+    assert regime.market_risk_on([], sma_window=0, band=0.05) is True
+    assert regime.market_risk_on([], sma_window=-1, band=0.0) is True

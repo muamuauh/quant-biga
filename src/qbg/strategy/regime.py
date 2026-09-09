@@ -138,8 +138,16 @@ def equal_weight_index(codes_list: list[str], root: Path | None = None,
 def market_risk_on(codes_list: list[str], sma_window: int | None = None,
                    root: Path | None = None, band: float | None = None,
                    use_inclusion: bool | None = None) -> bool:
-    """读取缓存并报告当前市场状态。"""
+    """读取缓存并报告当前市场状态。
+
+    `window <= 0` = 择时关闭，**直接返回 True 而不读缓存**。
+    `risk_on_series` 本来就会在 window<=0 时短路成全 True，但那是在
+    `equal_weight_index` 已经把 299 个 parquet 读完之后 —— 每天白跑几十秒 I/O
+    去算一条不会被看的曲线。关掉择时的人不该为它付这个时间。
+    """
     window = settings.qbg_market_sma if sma_window is None else sma_window
+    if window <= 0:
+        return True
     width = settings.qbg_market_sma_band if band is None else band
     incl = (bool(settings.qbg_market_index_eligible) if use_inclusion is None
             else use_inclusion)
