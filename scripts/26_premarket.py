@@ -69,15 +69,32 @@ from qbg.utils.logging import get_logger, log_event  # noqa: E402
 log = get_logger("qbg.scripts.premarket")
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """单独一个函数，好让测试**只建解析器不跑流程**。
+
+    直接 `main([...])` 去试参数会真的拉数据、读同花顺、调 LLM —— 那是把
+    「测试必须离线」这条铁律推翻掉换一条断言，不划算。
+    """
     p = argparse.ArgumentParser(description="盘前：重训 + 逐票复核，写结论缓存")
     p.add_argument("--date", default=date.today().isoformat())
     p.add_argument("--skip-ingest", action="store_true")
-    p.add_argument("--no-retrain", action="store_true")
+    # `--retrain` / `--no-retrain` 两个都要认，默认开。
+    #
+    # 2026-09-10 早上炸在这里：setup_schedule.ps1 往盘前任务的动作里拼了
+    # `--retrain`（那是 run_daily.py 的写法），而这里当时只有 `--no-retrain`，
+    # argparse 直接 exit 2 —— 复核一步没跑，当天没有缓存。
+    # 只留一个否定式开关看着更"干净"，代价是任务动作没法自描述：
+    # 从任务计划程序里看那一行，看不出它到底重不重训。
+    p.add_argument("--retrain", action=argparse.BooleanOptionalAction, default=True,
+                   help="滚动重训写入 cn_lgb_live（默认开；--no-retrain 关掉）")
     p.add_argument("--dry-run", action="store_true", help="只打印候选，不调 LLM")
     p.add_argument("--equity", type=float, default=None,
                    help="覆盖总资产（可负担性过滤用）。默认走 load_portfolio 的降级链")
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
     today = args.date
 
     if not args.skip_ingest:
@@ -86,7 +103,7 @@ def main(argv=None) -> int:
         if rc != 0:
             print(f"拉数失败 rc={rc}，中止。", file=sys.stderr)
             return rc
-    if not args.no_retrain:
+    if args.retrain:
         t0 = time.time()
         train(live=True)
         print(f"滚动重训完成（{time.time() - t0:.0f}s）", flush=True)

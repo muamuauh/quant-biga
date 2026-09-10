@@ -118,6 +118,41 @@ def test_setup_registers_three_tasks_and_guards_all_names():
         "两处任务名护栏没有都覆盖盘前任务"
 
 
+def test_premarket_accepts_every_flag_setup_appends():
+    """**setup_schedule.ps1 往任务动作里拼的每一个开关，被调脚本都得认。**
+
+    2026-09-10 早上炸的就是这个：任务动作里拼了 `--retrain`（那是 run_daily 的
+    写法），而 26_premarket.py 当时只有 `--no-retrain`。argparse 直接 exit 2 ——
+    **预检全绿、复核一步没跑、当天没有缓存**，而且要等到看日志才知道。
+
+    两个脚本各自都"对"，错在接缝上。所以在接缝上钉一条。
+
+    只建解析器、不跑 `main()` —— 后者会真的拉数据、读同花顺、调 LLM。
+    """
+    import importlib.util
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    setup = (root / "scripts" / "setup_schedule.ps1").read_text(encoding="utf-8-sig")
+    flags = set(re.findall(r"\$argLine \+= ' (--[a-z-]+)'", setup))
+    assert flags, "没从 setup_schedule.ps1 里解析出任何拼进任务动作的开关"
+
+    spec = importlib.util.spec_from_file_location(
+        "premarket_mod", root / "scripts" / "26_premarket.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    parser = mod.build_parser()
+
+    for flag in flags:
+        try:
+            parser.parse_args([flag])
+        except SystemExit as exc:
+            raise AssertionError(
+                f"26_premarket.py 不认 {flag} —— 而任务动作里拼了它（exit {exc.code}）"
+            ) from exc
+
+
 def test_retrain_moved_to_the_premarket_task():
     """重训归盘前。日流程再训一遍是白花 2 分钟（同数据同 seed，结果逐位相同）。"""
     from pathlib import Path
