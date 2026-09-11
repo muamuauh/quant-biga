@@ -38,12 +38,46 @@ from qbg.strategy.predict import (  # noqa: E402
 from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
 from qbg.tuning.gates import Check, GateReport  # noqa: E402
 
+
+class _Averaged:
+    """把同一配置各相位的结果平均成一个；取数点和 BacktestResult 一致。"""
+
+    class _Strategy:
+        pass
+
+    def __init__(self, runs):
+        import numpy as _np
+
+        self.runs = runs
+        self.strategy = self._Strategy()
+        for field in ("annual_return", "sharpe", "max_drawdown"):
+            setattr(self.strategy, field,
+                    float(_np.mean([getattr(r.strategy, field) for r in runs])))
+        self.avg_turnover = float(_np.mean([r.avg_turnover for r in runs]))
+        self.rank_ic = float(_np.mean([r.rank_ic for r in runs]))
+        # 相位极差本身就是一条结论：它大，说明这个间隔的收益主要由"哪几天
+        # 交易"决定，而那是运气不是策略。
+        self.phase_spread = (max(r.strategy.annual_return for r in runs)
+                             - min(r.strategy.annual_return for r in runs))
+
+    def __getattr__(self, name):
+        return getattr(self.runs[0], name)
+
+
+def _average(runs):
+    return _Averaged(runs) if len(runs) > 1 else runs[0]
+
+
 SUBPERIODS = 4
 HIGH_COST_MULT = 1.75      # 八项闸要求 +75% 成本下仍为正
-# 每次 LLM 逐票复核的实测成本（2026-08 那几次：80 次调用、约 34 万 tokens）。
-# 只有调仓日才复核，所以这一项和调仓频率成正比 —— 而它不在回测里，
-# 得单独算出来摆在旁边。
-LLM_COST_PER_REBALANCE_USD = 0.29
+# 每次 LLM 逐票复核的实测成本。只有调仓日才复核，所以这一项和调仓频率
+# 成正比 —— 而它不在回测里，得单独算出来摆在旁边。
+#
+# 0.29 是 2026-08 的值（80 次调用、约 34 万 tokens）。**已经过期 4 倍多**：
+# 2026-09-11 同一天跑了两轮，分别是 $1.13（92 次调用、126 万 tokens）和
+# $1.40（90 次、116 万）。中转站换成了 deepseek-v4-flash / v4-pro / flash
+# 三个模型混合计费，和当初不是一个档次。取 1.25 为当前估计。
+LLM_COST_PER_REBALANCE_USD = 1.25
 TRADING_DAYS_PER_YEAR = 252
 
 
@@ -65,6 +99,10 @@ def main(argv=None) -> int:
     parser.add_argument("--candidate", type=int, required=True, help="候选调仓间隔")
     parser.add_argument("--neighbors", default="", help="高原闸用的相邻取值，逗号分隔")
     parser.add_argument("--k", type=int, default=settings.qbg_top_k)
+    parser.add_argument("--keep-rank", type=int, default=settings.qbg_keep_rank,
+                        help="迟滞。默认取生产值 —— 用 0 是在评估一个没在跑的配置")
+    parser.add_argument("--slippage", type=float, default=0.0020,
+                        help="单边额外滑点。默认 20bp，和项目的成本恒等式一致")
     args = parser.parse_args(argv)
 
     baseline_every = int(settings.qbg_rebalance_every_days)
@@ -98,8 +136,27 @@ def main(argv=None) -> int:
           f"候选 = 每 {candidate_every} 日   高原邻居 = {neighbors}\n")
 
     def run(every, profile=None):
-        return engine.run_backtest(scores, panel, k=args.k,
-                                   rebalance_every=every, fee_profile=profile)
+        """跑一个调仓间隔。**三处此前漏掉的东西，每一处都单向偏向日频。**
+
+        1. **相位平均。** `every=5` 时相位 0 用第 0/5/10… 天、相位 1 用第
+           1/6/11… 天，几乎不重叠。实测 k=3 每 5 日的相位极差是 **37 个百分点
+           年化**，每 10 日 86 个 —— 只跑相位 0，比的是"哪几天交易"的运气。
+           日频只有一个相位，从来不受影响：**偏差专打候选臂。**
+
+        2. **`keep_rank`（迟滞）。** 生产是 15，漏掉它等于评估一个没在跑的配置
+           （带上之后日频换手 0.807 -> 0.579）。
+
+        3. **`extra_slippage`。** `fee_profile` 只有佣金和印花税；项目自己的
+           成本恒等式是"买 2.6 + 卖 7.6 + **双边滑点 20**bp"。漏掉滑点 = 漏掉
+           往返成本的三分之二，**而那正是拉长调仓间隔唯一能省下来的东西**。
+           一道回答"少交易值不值"的闸，不能不算少交易省下的钱。
+        """
+        runs = [engine.run_backtest(scores, panel, k=args.k, rebalance_every=every,
+                                    rebalance_phase=phase, keep_rank=args.keep_rank,
+                                    extra_slippage=args.slippage,
+                                    fee_profile=profile, slippage_grid=())
+                for phase in range(every)]
+        return _average(runs)
 
     base_res, cand_res = run(baseline_every), run(candidate_every)
     baseline, candidate = _facts(base_res), _facts(cand_res)
