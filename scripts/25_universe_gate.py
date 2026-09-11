@@ -58,6 +58,19 @@ from qbg.tuning.gates import Check, GateReport  # noqa: E402
 
 EXT_EXPERIMENT = "cn_lgb_ext"
 EXT_PROVIDER = "cn_data_ext"
+
+# OOS 分段，和 scripts/23_oos_window.py 逐字相同。
+# (train 起, train 止, valid 止, test 止)；test 起 = valid 止 + 1 天。
+#
+# **默认 `cur` 是生产分段，测试段只有约 388 个交易日** —— 首版扩池结论就跑在
+# 这个窗口上，子区间摆动 −443%，所以那张表当时只能标"幅度不可信"。
+# `mid` 把 train/valid 各往前挪一年，测试段变成 2024-01-01 起，约 640 日，多 65%。
+# `23_oos_window.py` 实测 `mid` 最优：噪声底砍 56~70%，Rank IC 只掉 18%。
+SPLITS = {
+    "cur":  ("2020-01-01", "2023-12-31", "2024-12-31", "2026-08-10"),
+    "mid":  ("2020-01-01", "2022-12-31", "2023-12-31", "2026-08-10"),
+    "long": ("2020-01-01", "2021-12-31", "2022-12-31", "2026-08-10"),
+}
 ZZ500_FILE = ROOT / "configs" / "universe_000905.txt"
 SUBPERIODS = 4
 SLIPPAGES = (0.001, 0.002)     # 10bp 和 20bp —— 中小盘不能只看 10bp
@@ -75,16 +88,37 @@ def _annual(returns: pd.Series) -> float:
     return float((1 + returns).prod()) ** (252 / len(returns)) - 1
 
 
-def train_ext(seeds: int | None, workdir: Path) -> None:
-    """在扩展 bin 上训练。**只改 provider_uri，其余和生产逐字相同** ——
-    否则测出来的差异分不清是"池子变了"还是"顺手也改了别的"。"""
+def _next_day(day: str) -> str:
+    import datetime as dt
+
+    return (dt.date.fromisoformat(day) + dt.timedelta(days=1)).isoformat()
+
+
+def train_arm(provider: str, experiment: str, split: str, seeds: int | None,
+              workdir: Path) -> None:
+    """训练一条臂。**除了 provider_uri 和分段，其余和生产逐字相同** ——
+    否则测出来的差异分不清是"池子变了"还是"顺手也改了别的"。
+
+    **换分段时两条臂都要重训。** 只重训扩池那条，等于拿 640 日的扩池去比
+    388 日的基准，差异里混着"窗口不同"这第三个变量 —— 那正是本文件开头警告的
+    "三层变化不能混为一谈"。
+    """
     cfg = yaml.safe_load(settings.workflow_yaml.read_text(encoding="utf-8"))
-    cfg["qlib_init"]["provider_uri"] = f"./data/qlib_bin/{EXT_PROVIDER}"
-    path = workdir / "workflow_ext.yaml"
+    cfg["qlib_init"]["provider_uri"] = f"./data/qlib_bin/{provider}"
+    tr_start, tr_end, va_end, te_end = SPLITS[split]
+    dh = cfg["data_handler_config"]
+    dh["fit_start_time"] = tr_start
+    # **必须跟着 train 段走**，否则预处理器会在测试段上拟合（安静的泄漏）。
+    dh["fit_end_time"] = tr_end
+    cfg["task"]["dataset"]["kwargs"]["segments"] = {
+        "train": [tr_start, tr_end],
+        "valid": [_next_day(tr_end), va_end],
+        "test": [_next_day(va_end), te_end],
+    }
+    path = workdir / f"workflow_{experiment}.yaml"
     path.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False),
                     encoding="utf-8")
-    train_mod.train(workflow_yaml=path, experiment_name=EXT_EXPERIMENT,
-                    seed_count=seeds)
+    train_mod.train(workflow_yaml=path, experiment_name=experiment, seed_count=seeds)
 
 
 def evaluate(members, frame, k, slippage, index_code):
@@ -111,6 +145,9 @@ def main(argv=None) -> int:
     p.add_argument("--k", type=int, default=settings.qbg_top_k)
     p.add_argument("--seeds", type=int, default=None)
     p.add_argument("--reuse", action="store_true")
+    p.add_argument("--split", default="cur", choices=sorted(SPLITS),
+                   help="OOS 分段。cur = 生产（测试段约 388 日）；"
+                        "mid = 训练段前挪一年，测试段约 640 日")
     args = p.parse_args(argv)
 
     if not ZZ500_FILE.exists():
@@ -122,30 +159,44 @@ def main(argv=None) -> int:
 
     workdir = ROOT / "data" / "universe_gate"
     workdir.mkdir(parents=True, exist_ok=True)
-    ext_pred = None
-    if args.reuse:
-        try:
-            ext_pred = load_latest_predictions(EXT_EXPERIMENT)
-            print(f"复用 {EXT_EXPERIMENT}", flush=True)
-        except Exception:  # noqa: BLE001
-            ext_pred = None
-    if ext_pred is None:
-        print(f"在扩展 bin 上训练（{len(ext_members)} 只）…", flush=True)
+    suffix = "" if args.split == "cur" else f"_{args.split}"
+    # cur 的基准臂就是生产模型本身，不重训（那正是"现行部署"的定义）。
+    base_exp = f"cn_lgb{suffix}" if suffix else None
+    ext_exp = f"{EXT_EXPERIMENT}{suffix}"
+
+    def obtain(provider, experiment, label, members):
+        if args.reuse:
+            try:
+                pred = (load_latest_predictions(experiment) if experiment
+                        else load_latest_predictions())
+                print(f"复用 {experiment or 'cn_lgb（生产）'}", flush=True)
+                return pred
+            except Exception:  # noqa: BLE001
+                pass
+        if experiment is None:
+            return load_latest_predictions()
+        print(f"训练 {label}（{len(members)} 只，分段 {args.split}）…", flush=True)
         t0 = time.time()
-        train_ext(args.seeds, workdir)
-        print(f"训练完成 ({time.time() - t0:.0f}s)", flush=True)
-        ext_pred = load_latest_predictions(EXT_EXPERIMENT)
+        train_arm(provider, experiment, args.split, args.seeds, workdir)
+        print(f"  完成 ({time.time() - t0:.0f}s)", flush=True)
+        return load_latest_predictions(experiment)
+
+    base_pred = obtain("cn_data", base_exp, "沪深300 臂", hs300)
+    ext_pred = obtain(EXT_PROVIDER, ext_exp, "扩池臂", ext_members)
 
     def prep(pred):
         f = predictions_to_frame(pred)
         return neutralize_frame(f) if settings.qbg_industry_neutral else f
 
-    base_frame = prep(load_latest_predictions())
+    base_frame = prep(base_pred)
     ext_frame = prep(ext_pred)
 
     print(f"\n沪深300 {len(hs300)} 只   扩池 {len(ext_members)} 只   "
           f"k={args.k}   择时 SMA{settings.qbg_market_sma} "
           f"缓冲{settings.qbg_market_sma_band:.0%}")
+    tr_start, tr_end, va_end, te_end = SPLITS[args.split]
+    print(f"分段 {args.split}：train {tr_start}~{tr_end}  valid ~{va_end}  "
+          f"test {_next_day(va_end)}~{te_end}")
 
     # 各年真正在指数里的只数 —— 这一行比任何收益数字都重要。
     ext_pnl_probe = panel_mod.build_panel(
