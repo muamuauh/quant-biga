@@ -56,6 +56,16 @@ PRICE_TOLERANCE = 0.005
 #
 # 这个方向的误判特别危险 —— 我们以为没下成、实际下成了。上层若据此重试，
 # 就会**重复下单**。取表本身约 10 秒，3 次 × 4 秒间隔足以覆盖实测的延迟。
+# 券商余额表里"可用资金"那一列的叫法。同花顺给的是「可用金额」，但不同版本
+# 和不同券商模板的措辞不一样，所以按优先级依次试。**一个都对不上就返回 None，
+# 而 None 一律放行** —— 读不到余额不等于没钱，让下单从此停摆比偶尔被拒严重。
+AVAILABLE_CASH_KEYS = ("可用金额", "可用资金", "可用余额", "可取金额")
+
+# 买单前重读余额的重试次数。卖出成交到资金释放之间有延迟，第一次读到不够
+# 不代表真不够。
+CASH_RECHECK_ATTEMPTS = 3
+CASH_RECHECK_INTERVAL_SEC = 3.0
+
 VERIFY_ATTEMPTS = 3
 VERIFY_INTERVAL_SEC = 4.0
 
@@ -202,7 +212,7 @@ class EasytraderAdapter:
 
     def __init__(self, *, exe: str | None = None, client: str | None = None,
                  max_orders: int | None = None, connect=None, reader=None,
-                 account_reader=None):
+                 account_reader=None, balance_reader=None):
         self.exe = exe or settings.qbg_ths_exe
         self.client = client or settings.qbg_ths_client
         self.max_orders = max_orders if max_orders is not None else settings.qbg_ths_max_orders
@@ -210,6 +220,7 @@ class EasytraderAdapter:
         self._connect = connect or self._default_connect
         self._read_entrusts = reader
         self._account_reader = account_reader
+        self._read_balance = balance_reader
 
     # -- 连接 -------------------------------------------------------------
     def _default_connect(self):
@@ -244,6 +255,75 @@ class EasytraderAdapter:
             return self._read_entrusts(user)
         return list(user.today_entrusts or [])
 
+    def _available_cash(self, user) -> float | None:
+        """券商口径的**可用**资金。读不到返回 None —— 读不到不等于没钱。"""
+        if self._read_balance is not None:
+            balance = self._read_balance(user)
+        else:
+            balance = user.balance
+        for key in AVAILABLE_CASH_KEYS:
+            value = (balance or {}).get(key)
+            if value not in (None, ""):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _unaffordable_reason(self, user, order: Order) -> str | None:
+        """这笔买单**现在**付得起吗？付得起（或判断不了）返回 None。
+
+        ## 为什么要在这里判，而不是在风控闸里判
+
+        2026-09-11 实测：当天卖 688041（回款 46,382）、买三笔共 162,629，
+        而账上可用 151,941.78。`min_cash_guard` 把卖出回款算成可用，
+        151,941.78 + 46,382 > 162,629，顺利过闸。但那笔卖单限价 231.91 挂在
+        市价 228.21 **上方**，一整天没成交 —— 回款从未到账，第四笔买单被同花顺
+        **静默拒绝**（差 8,784.54），回读校验看不到它，于是整批订单被中止。
+
+        想在闸里修是走不通的：闸跑在下单**之前**，那时一笔都还没成交。
+        要它安全就只能完全不算卖出回款，而满仓换股时账上现金只有 5%，
+        那会把**每一笔**买单都砍掉 —— 卖光之后再也买不回来，比原来的毛病更糟。
+        （这个方案我写出来测过，就是这个结果。）
+
+        所以判断必须放在执行层：**卖单已经发出去了，现在去问券商真实的可用
+        资金是多少。** 这是唯一能拿到"到底成没成交"的时点。
+
+        ## 读不到余额一律放行
+
+        和窗口闸同一个道理：让下单从此停摆，比偶尔挨一次券商拒绝严重得多。
+        真被拒了还有回读校验兜着。
+        """
+        if order.side != "BUY":
+            return None
+        need = order.notional + (order.estimated_fee or 0.0)
+        # **两种重试不是一回事，不能共用一个等待。**
+        #   · 取表瞬时失败 -> 立刻再读，等待毫无意义
+        #   · 钱确实还不够 -> 等一下，卖出成交到资金释放之间有延迟
+        # 混在一起的话，取表失败会白等 CASH_RECHECK_ATTEMPTS × 间隔秒。
+        available = None
+        for attempt in range(CASH_RECHECK_ATTEMPTS):
+            try:
+                available = self._available_cash(user)
+            except Exception as exc:  # noqa: BLE001 —— 取表可能瞬时失败
+                log_event(log, "ths.cash.read_failed", attempt=attempt, error=str(exc))
+                available = None
+                continue
+            if available is None or available >= need:
+                break
+            if attempt < CASH_RECHECK_ATTEMPTS - 1:
+                time.sleep(CASH_RECHECK_INTERVAL_SEC)
+        if available is None:
+            # 读不到余额 **一律放行**。和窗口闸同一个道理：让下单从此停摆，
+            # 比偶尔挨一次券商拒绝严重得多。真被拒了还有回读校验兜着。
+            log_event(log, "ths.cash.unknown", code=order.code)
+            return None
+        if available >= need:
+            return None
+        return (f"可用资金不足，未提交：需要 {need:.2f}（{order.quantity} 股 × "
+                f"{order.price:.2f} + 费用），券商可用 {available:.2f}。"
+                f"同一批里的卖单若尚未成交，回款不会到账。")
+
     # -- 主流程 -----------------------------------------------------------
     def submit(self, orders: list[Order], asof: date | str,
                gates: list[GateResult] | None = None) -> ExecutionResult:
@@ -276,11 +356,21 @@ class EasytraderAdapter:
 
         outcomes: list[OrderOutcome] = []
         for order in ordered:
+            skip = self._unaffordable_reason(user, order)
+            if skip is not None:
+                # **跳过，不中止。** 资金不足是一个**已知**状态，和"回读不到、
+                # 不知道下没下成"完全不同 —— 后者必须停，前者继续往下试是安全的：
+                # 后面可能有更便宜的单买得起，而且我们确知这一笔没有发出去。
+                log_event(log, "ths.order.unaffordable", code=order.code,
+                          side=order.side, quantity=order.quantity,
+                          price=order.price, reason=skip)
+                outcomes.append(OrderOutcome(order, False, skip, verified=True))
+                continue
             outcome = self._submit_one(user, order, known_ids)
             outcomes.append(outcome)
             if outcome.entrust_no:
                 known_ids.add(outcome.entrust_no)
-            if not outcome.ok:
+            if not outcome.ok:  # noqa: SIM102
                 # 一笔出问题就停掉后续全部。控件漂移是**系统性**故障，
                 # 不是偶发 —— 继续下只会把同一个错误重复施加到更多订单上。
                 log_event(log, "ths.order.halt", code=order.code,

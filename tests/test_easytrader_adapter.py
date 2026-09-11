@@ -109,7 +109,8 @@ def test_live_needs_all_three_locks(monkeypatch):
 # ---------------------------------------------------------------------------
 # 提交流程
 # ---------------------------------------------------------------------------
-def _adapter(monkeypatch, *, placed=None, entrusts=None, baseline=None, max_orders=8):
+def _adapter(monkeypatch, *, placed=None, entrusts=None, baseline=None, max_orders=8,
+             balance=None):
     """`entrusts` 是**提交后**能读到的委托；`baseline` 是提交前的（默认空）。
 
     分开两者是必须的：adapter 先读基线，之后只认**新出现**的合同编号。
@@ -129,11 +130,17 @@ def _adapter(monkeypatch, *, placed=None, entrusts=None, baseline=None, max_orde
         return list(baseline or []) if reads["n"] == 1 else list(entrusts or [])
 
     monkeypatch.setattr(mod, "place_order", fake_place)
+    # 余额默认给一个大到不设限的数：绝大多数用例不是在测资金，
+    # 不给的话它们会走进"读不到余额"那条分支，测的就不是本来想测的东西了。
+    if balance is None:
+        balance = {"可用金额": 10_000_000.0}
     adapter = EasytraderAdapter(connect=lambda: object(), reader=fake_read,
                                 max_orders=max_orders,
                                 # 默认跑在 PAPER 下，所以要给一个模拟盘账户，
                                 # 否则会被账户守卫拦下（那是另一组测试的事）。
-                                account_reader=lambda _u: PAPER_ACCOUNT)
+                                account_reader=lambda _u: PAPER_ACCOUNT,
+                                balance_reader=(balance if callable(balance)
+                                                else lambda _u: balance))
     return adapter, calls
 
 
@@ -360,3 +367,90 @@ def test_submit_enforces_account_guard(monkeypatch):
                                 account_reader=lambda _u: REAL_ACCOUNT)
     with pytest.raises(LiveLockError, match="真钱"):
         adapter.submit([_order()], "2026-08-25")
+
+
+# ---------------------------------------------------------------------------
+# 买单前的资金检查（2026-09-11）
+# ---------------------------------------------------------------------------
+
+def test_buy_is_skipped_when_broker_cash_is_short(monkeypatch):
+    """**2026-09-11 那次的重放。**
+
+    当天卖 688041（回款 46,382）、买三笔共 162,629，账上可用 151,941.78。
+    `min_cash_guard` 把卖出回款算成可用，顺利过闸；但那笔卖单限价挂在市价
+    上方一整天没成交，回款从未到账，最后一笔买单被同花顺**静默拒绝** ——
+    回读校验看不到它，于是整批订单被中止。
+
+    现在改成下单前问券商真实可用资金，买不起就不发。
+    """
+    order = _order(code="688183.SH", side="BUY", qty=400, price=125.82)  # 需 50,328
+    adapter, calls = _adapter(monkeypatch, balance={"可用金额": 41_543.46})
+    result = adapter.submit([order], "2026-09-11")
+
+    assert calls == [], "钱不够却还是把单发出去了"
+    assert not result.ok
+    message = result.outcomes[0]["message"]
+    assert "可用资金不足" in message
+    assert "41543.46" in message.replace(",", "")
+
+
+def test_short_cash_skips_that_order_but_keeps_going(monkeypatch):
+    """资金不足是**已知**状态，跳过就好，不该中止整批。
+
+    和"回读不到、不知道下没下成"完全不同 —— 后者必须停（控件漂移是系统性
+    故障），前者我们确知这一笔没发出去，而且后面可能有更便宜的单买得起。
+    """
+    big = _order(code="688183.SH", side="BUY", qty=400, price=125.82)   # 需 50,328
+    small = _order(code="600000.SH", side="BUY", qty=100, price=10.0)   # 需 1,000
+    rows = [_entrust(code="600000", qty=100, price=10.0, no="777")]
+    adapter, calls = _adapter(monkeypatch, entrusts=rows, balance={"可用金额": 41_543.46})
+    result = adapter.submit([big, small], "2026-09-11")
+
+    assert [c["code"] for c in calls] == ["600000.SH"], "便宜的那笔没有继续下"
+    assert result.outcomes[0]["ok"] is False
+    assert result.outcomes[1]["ok"] is True
+
+
+def test_sell_is_never_blocked_by_cash(monkeypatch):
+    """卖出不花钱，永远不受这道检查影响。
+
+    和风控闸「只砍 BUY，SELL 永远放行」是同一条纪律 —— 现金紧的时候恰恰
+    最需要能卖出去。
+    """
+    sell = _order(code="688041.SH", side="SELL", qty=200, price=231.91)
+    rows = [_entrust(code="688041", side="卖出", qty=200, price=231.91, no="888")]
+    adapter, calls = _adapter(monkeypatch, entrusts=rows, balance={"可用金额": 0.0})
+    result = adapter.submit([sell], "2026-09-11")
+
+    assert [c["code"] for c in calls] == ["688041.SH"], "没钱把卖单也挡掉了"
+    assert result.ok
+
+
+def test_unreadable_balance_lets_the_order_through(monkeypatch):
+    """读不到余额 **一律放行**。
+
+    和窗口闸同一个道理：让下单从此停摆，比偶尔挨一次券商拒绝严重得多。
+    真被拒了还有提交后的回读校验兜着。
+    """
+    def boom(_user):
+        raise RuntimeError("取表失败")
+
+    order = _order(code="600000.SH", side="BUY", qty=100, price=10.0)
+    rows = [_entrust(code="600000", qty=100, price=10.0, no="777")]
+    adapter, calls = _adapter(monkeypatch, entrusts=rows, balance=boom)
+    result = adapter.submit([order], "2026-09-11")
+
+    assert [c["code"] for c in calls] == ["600000.SH"], "读不到余额就把单挡了"
+    assert result.ok
+
+
+def test_unknown_balance_keys_do_not_block(monkeypatch):
+    """余额表里一个认识的列都没有，也放行 —— 同上，读不到不等于没钱。"""
+    order = _order(code="600000.SH", side="BUY", qty=100, price=10.0)
+    rows = [_entrust(code="600000", qty=100, price=10.0, no="777")]
+    adapter, calls = _adapter(monkeypatch, entrusts=rows,
+                              balance={"某个没见过的列": 1.0})
+    result = adapter.submit([order], "2026-09-11")
+
+    assert [c["code"] for c in calls] == ["600000.SH"]
+    assert result.ok

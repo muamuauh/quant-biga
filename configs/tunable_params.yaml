@@ -95,8 +95,12 @@ params:
     scope: risk_limits
     tier: B
     type: float
+    # 上界 2026-09-11 从 0.005 放宽到 0.04。参考价是**昨收**，让价要覆盖隔夜
+    # 跳空：实测 0.5% 时仍有 22% 的卖单挂不上市价正确的一侧（详见
+    # risk_limits.yaml 的实测表）。基线值已是 0.02，旧上界意味着调参 agent
+    # 连当前值都提不出来 —— 白名单区间不含现值，等于这个参数被静默冻结了。
     min: 0.0005
-    max: 0.005
+    max: 0.04
 frozen:
   - qbg_mode
   - i_confirm_real
