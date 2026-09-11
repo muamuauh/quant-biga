@@ -15,13 +15,19 @@
 × 1028 万行，180 MB）。脚本会把它下到 `--work` 目录，默认是系统临时目录 ——
 **不落进 `data/`**，那是生产数据目录，一份 180 MB 的研究快照不该混进去。
 
-## 两个必须知道的数据坑
+## 三个必须知道的数据坑
 
 1. **`date_ms` 是 UTC，必须 +8 小时。** 不偏移的话每一根 K 线都会被记到
    前一天，而且不报错 —— 校准后 688041.SH 的 2026-09-10 开 232.00 收 232.37，
    和本地 BaoStock 缓存逐位一致；不偏移则整体错开一天。
 
-2. **涨停池/跌停池/炸板池的 `date` 参数是静默失效的。** 传 2026-09-10、
+2. **dump 是不复权的（`adjusted: none`），必须自己复权。** 这是我第一版踩的坑：
+   除权日只占 0.34% 的行，但那些行的日收益均值是 **−5.27%**（非除权日 +0.05%），
+   而**单日跌超 25% 的 3,398 行里 94.9% 是除权日** —— 全是假暴跌。不复权的话
+   等权全池十年是 −3.29%，复权后是 +1.58%。反转类因子会**优先挑中**刚除权的
+   票，污染最重。复权后单日跌超 25% 的行从 3,398 降到 173。
+
+3. **涨停池/跌停池/炸板池的 `date` 参数是静默失效的。** 传 2026-09-10、
    2025-09-10、2023-09-11 返回的内容**指纹完全相同**（都是当天的池子）。
    照文档写回测会得到彻头彻尾的假结果。所以这里的涨停/连板**全部从日线
    自己重算**（`close >= prev_close × (1+涨跌幅上限)`），这样反而拿到 10 年
@@ -79,19 +85,62 @@ def _api(path: str, **params) -> dict:
         return json.loads(resp.read())
 
 
+def _download(kind: str, dest: Path, label: str) -> None:
+    if dest.exists():
+        return
+    url = _api(f"/api/dump/market-dumps/{kind}/download-url")["data"]["presigned_url"]
+    print(f"下载{label} -> {dest}", flush=True)
+    urllib.request.urlretrieve(url, dest)
+
+
+def _back_adjust(df: pd.DataFrame, work: Path) -> pd.DataFrame:
+    """用除权事件流做后复权。**不做的话整个研究都是错的。**
+
+    dump 是 `adjusted: none`。除权日只占 0.34% 的行，但那些行的日收益均值是
+    −5.27%，而单日跌超 25% 的行里 **94.9% 是除权日** —— 全是假暴跌。
+    反转类因子会优先挑中刚除权的票，污染最重。
+
+    持有 1 股，除权后变成 (1 + 送股 + 配股) 股，另收现金红利、付配股款。
+    所以 1 股除权前的价值，用除权后价格为单位表示，是：
+
+        ratio = [(1+送股+配股) × 收盘 + 红利 − 配股比例 × 配股价] / 收盘
+
+    后复权 = 从除权日起，之后所有价格乘以累计 ratio。
+    """
+    events = work / "adj_factors.parquet"
+    _download("adjustment-factors", events, "除权事件流")
+    adj = pd.read_parquet(events)
+    adj["date"] = (pd.to_datetime(adj["ex_date_ms"], unit="ms")
+                   + pd.Timedelta(hours=8)).dt.normalize()
+    adj = adj[["thscode", "date", "dividend_per_share", "per_share_bonus",
+               "allotment_ratio", "allotment_price"]].fillna(0.0)
+
+    merged = df.merge(adj, on=["thscode", "date"], how="left").fillna(
+        {"dividend_per_share": 0.0, "per_share_bonus": 0.0,
+         "allotment_ratio": 0.0, "allotment_price": 0.0})
+    shares = 1.0 + merged.per_share_bonus + merged.allotment_ratio
+    cash = merged.dividend_per_share - merged.allotment_ratio * merged.allotment_price
+    ratio = np.where(merged.close_price > 0,
+                     (shares * merged.close_price + cash) / merged.close_price, 1.0)
+    merged["ratio"] = np.where(np.isfinite(ratio) & (ratio > 0), ratio, 1.0)
+    cumulative = merged.groupby("thscode", sort=False)["ratio"].cumprod()
+    for column in ("open_price", "high_price", "close_price"):
+        merged[column] = merged[column] * cumulative
+    return merged.drop(columns=["dividend_per_share", "per_share_bonus",
+                                "allotment_ratio", "allotment_price", "ratio"])
+
+
 def load_prices(work: Path) -> pd.DataFrame:
-    """全市场 10 年日线。已按北交所过滤、已修正时区、已算好涨停标记。"""
+    """全市场 10 年**后复权**日线。已按北交所过滤、修正时区、算好涨停标记。"""
     dest = work / "daily_k_10y.parquet"
-    if not dest.exists():
-        url = _api("/api/dump/market-dumps/daily-k/download-url")["data"]["presigned_url"]
-        print(f"下载全市场 10 年日线 -> {dest}（约 180 MB，几分钟）", flush=True)
-        urllib.request.urlretrieve(url, dest)
+    _download("daily-k", dest, "全市场 10 年日线（约 180 MB，几分钟）")
     df = pd.read_parquet(dest, columns=["thscode", "date_ms", "open_price", "high_price",
                                         "close_price", "volume", "turnover"])
     # **必须 +8 小时**：date_ms 是 UTC，不偏移会让每根 K 线错记到前一天。
     df["date"] = (pd.to_datetime(df["date_ms"], unit="ms")
                   + pd.Timedelta(hours=8)).dt.normalize()
-    df = df.drop(columns="date_ms")
+    df = df.drop(columns="date_ms").sort_values(["thscode", "date"])
+    df = _back_adjust(df, work)
 
     prefix = df["thscode"].str.slice(0, 3)
     df = df[~prefix.isin(EXCLUDE_PREFIX)].copy()
@@ -105,14 +154,16 @@ def load_prices(work: Path) -> pd.DataFrame:
     df["prev_close"] = by_code["close_price"].shift(1)
     df["next_open"] = by_code["open_price"].shift(-1)
     df["nn_open"] = by_code["open_price"].shift(-2)
-    # 留 1 分的容差：ST 股上限更严，会被容差放进来一些。影响方向是让样本更脏，
-    # 不是更好看 —— 所以不做 ST 过滤，结论只会偏保守。
-    df["limit_up"] = df.close_price >= df.prev_close * (1 + df.cap) - 0.01
-    df["broke"] = (df.high_price >= df.prev_close * (1 + df.cap) - 0.01) & (~df.limit_up)
-    df["limit_down"] = df.close_price <= df.prev_close * (1 - df.cap) + 0.01
+    # 判据用**比率**不用绝对分差：复权之后价格被缩放过，1 分钱的容差没有意义。
+    # 千分之一的容差兜住浮点和四舍五入。ST 股上限更严会被容差放进来一些 ——
+    # 影响方向是让样本更脏，不是更好看，所以不做 ST 过滤，结论只会偏保守。
+    tol = 0.001
+    df["limit_up"] = df.close_price / df.prev_close - 1.0 >= df.cap - tol
+    df["broke"] = ((df.high_price / df.prev_close - 1.0 >= df.cap - tol) & (~df.limit_up))
+    df["limit_down"] = df.close_price / df.prev_close - 1.0 <= -df.cap + tol
     # **买不进的样本**：次日开盘就一字涨停。不剔除它，连板策略会凭空多出
     # 一大截现实里拿不到的收益。
-    df["next_open_limit"] = df.next_open >= df.close_price * (1 + df.cap) - 0.01
+    df["next_open_limit"] = df.next_open / df.close_price - 1.0 >= df.cap - tol
     df["ret_oo"] = df.nn_open / df.next_open - 1.0
     streak = df.limit_up.astype(int)
     df["streak"] = streak.groupby(df.thscode, sort=False).transform(
@@ -213,6 +264,63 @@ def report_limit_up(df: pd.DataFrame) -> None:
         _line(f"成交额 {bucket}", sub.ret_oo, base)
 
 
+def report_factors(df: pd.DataFrame) -> None:
+    """短线因子：截面 IC 是真的，但**极端尾部符号翻转**，而 k=3 正好活在尾部。
+
+    这一节回答"能不能拿短线因子做选股、和 qlib 加权"。答案是不能，
+    原因不是"没有信号"，而是信号在**中段**为正、在**尾部**为负。
+    """
+    by_code = df.groupby("thscode", sort=False)
+    df = df.assign(
+        age=by_code.cumcount(),
+        amt20=by_code["turnover"].transform(lambda s: s.rolling(20, min_periods=15).mean()),
+    )
+    df["rev5"] = -(df.close_price / by_code["close_price"].shift(5) - 1.0)
+    df["rev20"] = -(df.close_price / by_code["close_price"].shift(20) - 1.0)
+    df["ovn"] = df.open_price / df.prev_close - 1.0          # 隔夜跳空
+    df["intra"] = -(df.close_price / df.open_price - 1.0)    # 日内反转（取负）
+    df["amp"] = (df.high_price - df.prev_close).abs() / df.prev_close
+
+    # **流动性门槛 5000 万**：单槽 3 万的单不冲击盘口。不设这个门槛，
+    # 结论会建立在一批根本买不到那么多的小票上。
+    live = df[df.ret_oo.notna() & df.next_open.gt(0) & df.age.ge(60)
+              & df.amt20.gt(5e7)].copy()
+    base = live.ret_oo.mean()
+    print(f"\n\n可交易子样本 {len(live):,} 行（20 日均成交额 > 5000 万）"
+          f"  基准 {base * 100:+.4f}%")
+
+    print("\n== 截面分位 + IC ==")
+    print(f"{'因子':<8}{'Q1':>9}{'Q5':>9}{'Q5−Q1':>9}{'IC':>9}")
+    factors = ["rev5", "rev20", "ovn", "intra", "amp"]
+    for name in factors:
+        part = live[[name, "ret_oo", "date"]].dropna()
+        part = part.assign(q=part.groupby("date")[name].transform(
+            lambda x: pd.qcut(x, 5, labels=False, duplicates="drop")))
+        means = part.groupby("q")["ret_oo"].mean()
+        # lambda 里用默认参数绑住 name：循环变量是后期绑定的，
+        # 虽然这里 apply 立刻消费不会出错，但留着就是给下一个改动埋坑。
+        ic = part.groupby("date").apply(
+            lambda x, col=name: x[col].corr(x.ret_oo, method="spearman"),
+            include_groups=False).mean()
+        print(f"{name:<8}{means[0] * 100:+8.3f}%{means[4] * 100:+8.3f}%"
+              f"{(means[4] - means[0]) * 100:+8.3f}%{ic:+9.4f}")
+
+    print("\n== **非单调性**：分位是正的，极端尾部是负的 ==")
+    print("  （本项目跑 k=3，**恰好活在尾部**，所以分位数那张表用不上）")
+    print(f"{'因子':<8}{'Q5 前20%':>11}{'前 2.5%':>11}{'top-20':>10}{'top-3':>10}")
+    for name in factors:
+        part = live[[name, "ret_oo", "date"]].dropna()
+        quintile = part.assign(q=part.groupby("date")[name].transform(
+            lambda x: pd.qcut(x, 5, labels=False, duplicates="drop")))
+        row = [quintile.loc[quintile.q == 4, "ret_oo"].mean()]
+        cut = part.groupby("date")[name].transform(lambda x: x.quantile(0.975))
+        row.append(part.loc[part[name] >= cut, "ret_oo"].mean())
+        for k in (20, 3):
+            idx = part.groupby("date")[name].nlargest(k).index.get_level_values(1)
+            row.append(part.loc[idx, "ret_oo"].mean())
+        print(f"{name:<8}" + "".join(f"{v * 100:+10.3f}%" for v in row))
+
+
 def report_dragon_tiger(df: pd.DataFrame, lhb: pd.DataFrame) -> None:
     if lhb.empty:
         print("\n龙虎榜：没有数据")
@@ -263,6 +371,7 @@ def main(argv=None) -> int:
     work.mkdir(parents=True, exist_ok=True)
     df = load_prices(work)
     report_limit_up(df)
+    report_factors(df)
 
     if not args.skip_lhb:
         days = sorted(df.date.unique())[-args.lhb_days:]
