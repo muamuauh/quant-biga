@@ -21,11 +21,28 @@
     过期的补跑"，一个管"现在能不能交易"。混在一起的话，手工在盘后跑
     `run_daily.ps1 --dry-run` 也会被拦掉，而那是个完全正当的用法。
 
-    ## 为什么只设上界，不设下界
+    ## 上界管"晚了"，下界管"这是昨天的补跑"
 
-    早于计划时间跑没有副作用：daily_cycle 在开盘前会走 `not_trading_session`
-    早退（在拉数和 LLM 复核之前，不花钱），preflight 早一点开代理、早一点拉起
-    同花顺也无害。加下界只会让 `-WithStartupTrigger` 那条可选路径失效。
+    上界（计划时间 + 窗口）拦不住隔夜补跑：`-ScheduledAt` 写进任务动作的只是
+    **时刻，没有日期**。昨天 09:30 那次错过了，今天一开机 Windows 把它补上，
+    到达时是 07:45 —— 比今天的 09:30 **早**，于是"没超窗口"，直接放行。
+    2026-09-11 实测就是这么跑的。
+
+    所以还要一个下界：**早于当天计划时刻的，只可能是隔夜补跑。**
+
+    这里推翻了本文件早先写的两条理由：
+
+    · "早跑不花钱" —— **不成立**。daily_cycle 确实在 `not_trading_session`
+      早退，但 P8 自动复盘在那之后照跑，2026-09-11 那次真的调了 DeepSeek
+      （2,212 tokens）。早退不等于免费。
+
+    · "加下界会让 -WithStartupTrigger 失效" —— **不成立**。开机/登录触发器
+      真正有用的时刻是**开机晚于计划时间**那天（10:00 开机，触发器 10:05 叫起，
+      在下界之上、窗口之内，照常放行）。开机早于计划时间时它叫起的那次本来
+      就是多余的 —— 真正的日触发器还在后头。下界只掐掉这种冗余触发。
+
+    留 $EarlyGraceMinutes 分钟的余量：调度器和时钟都有抖动，而隔夜补跑到达时
+    是开机时刻，跟计划时刻差着小时级，不会落进这几分钟里。
 
     ## 判据只在被调度器叫起来时生效
 
@@ -41,12 +58,15 @@ function Get-QbgWindowSkipReason {
         本次运行"本该"在几点开始，HH:mm。空 = 手工运行，不设限。
     .PARAMETER WindowMinutes
         计划时间之后多久内启动仍然算数。<= 0 视为不设限。
+    .PARAMETER EarlyGraceMinutes
+        允许比计划时刻早多少分钟启动。再早就判成隔夜补跑。<= 0 视为不设下界。
     .PARAMETER Now
         当前时间，测试用。
     #>
     param(
         [string]$ScheduledAt,
         [int]$WindowMinutes = 120,
+        [int]$EarlyGraceMinutes = 5,
         [datetime]$Now = (Get-Date)
     )
 
@@ -70,7 +90,17 @@ function Get-QbgWindowSkipReason {
     }
 
     $scheduled = $Now.Date.AddHours($parsed.Hour).AddMinutes($parsed.Minute)
-    $deadline  = $scheduled.AddMinutes($WindowMinutes)
+
+    # 下界：早于当天计划时刻的，只可能是隔夜补跑（或冗余的开机触发器）。
+    if ($EarlyGraceMinutes -gt 0) {
+        $earliest = $scheduled.AddMinutes(-$EarlyGraceMinutes)
+        if ($Now -lt $earliest) {
+            return ("本次启动早于计划时刻：计划 {0}，现在 {1} —— 这是上一次错过的补跑。" -f
+                $scheduled.ToString('HH:mm'), $Now.ToString('yyyy-MM-dd HH:mm:ss'))
+        }
+    }
+
+    $deadline = $scheduled.AddMinutes($WindowMinutes)
     if ($Now -le $deadline) { return $null }
 
     return ("本次启动已超出窗口：计划 {0}，窗口 {1} 分钟（截止 {2}），现在 {3}。" -f

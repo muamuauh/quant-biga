@@ -196,3 +196,81 @@ def test_each_task_carries_its_own_window():
     for name in ("$PreflightWindowMinutes", "$PremarketWindowMinutes"):
         assert name in src, f"没有给任务单独的窗口参数 {name}"
         assert f"-Window {name}" in src, f"{name} 声明了却没传给 Register-QbgTask"
+
+
+# ----------------------------------------------------------------------
+# 下界：早于计划时刻的只可能是隔夜补跑
+# ----------------------------------------------------------------------
+
+def _guard(now: str, scheduled: str, window: int = 120) -> str:
+    """真的把 window_guard.ps1 跑起来。返回 "SKIP" 或 "RUN"。
+
+    这几条钉的是**逻辑**不是措辞，读源码断言不了。离线：只起本机 PowerShell，
+    不联网、不碰券商、不调 LLM。
+
+    只回 ASCII 标记，不回中文理由 —— 计划任务用的 powershell 5.1 按控制台
+    代码页（本机 GBK）输出，拿 UTF-8 解会得到空串，测试就变成永远通过。
+    """
+    import shutil
+    import subprocess
+
+    exe = shutil.which("powershell")
+    if exe is None:
+        pytest.skip("本机没有 powershell")
+    script = (
+        f". '{GUARD.as_posix()}'; "
+        f"$r = Get-QbgWindowSkipReason -ScheduledAt '{scheduled}' "
+        f"-WindowMinutes {window} -Now ([datetime]'{now}'); "
+        "if ($r) { 'SKIP' } else { 'RUN' }"
+    )
+    out = subprocess.run([exe, "-NoProfile", "-Command", script], capture_output=True,
+                         text=True, encoding="ascii", errors="replace", timeout=60)
+    assert out.returncode == 0, out.stderr
+    verdict = (out.stdout or "").strip().splitlines()[-1:] or [""]
+    assert verdict[0] in ("SKIP", "RUN"), f"闸没给出判定：{out.stdout!r} {out.stderr!r}"
+    return verdict[0]
+
+
+def test_overnight_catch_up_is_skipped():
+    """**这是 2026-09-11 真实发生的那次。**
+
+    前一天 09:30 那次错过了（任务被临时停用），Windows 隔天一开机补上，
+    到达时是 07:45 —— 比当天的 09:30 **早**，所以上界判不出"超窗口"，放行。
+    那次撞上 session_guard 才没造成后果，但它照样花了一次 P8 复盘的 LLM 钱。
+
+    `-ScheduledAt` 写进任务动作的只是时刻、没有日期，所以"昨天的补跑"只能
+    从"早于今天的计划时刻"认出来。
+    """
+    assert _guard("2026-09-11 07:45:52", "09:30") == "SKIP", "隔夜补跑没被拦下"
+    assert _guard("2026-09-11 07:00:00", "08:00", 30) == "SKIP", "盘前的隔夜补跑没被拦下"
+
+
+def test_on_time_and_slightly_early_still_run():
+    """准点和几分钟的时钟抖动必须放行。
+
+    隔夜补跑到达时是**开机时刻**，和计划时刻差着小时级，不会落进这几分钟。
+    """
+    assert _guard("2026-09-11 09:30:05", "09:30") == "RUN"
+    assert _guard("2026-09-11 09:28:00", "09:30") == "RUN", "两分钟的抖动被误判成补跑"
+
+
+def test_late_boot_still_runs_that_is_the_whole_point():
+    """**下界不能把开机触发器掐掉。**
+
+    本文件早先写着"加下界会让 -WithStartupTrigger 失效"，那是不成立的：
+    开机触发器真正有用的时刻是**开机晚于计划时间**那天（10:00 开机、10:05
+    被叫起），那落在下界之上、窗口之内，照常放行。开机早于计划时间时它叫起
+    的那次本来就多余 —— 真正的日触发器还在后头。
+    """
+    assert _guard("2026-09-11 10:05:00", "09:30") == "RUN"
+
+
+def test_upper_bound_still_works():
+    """上界不能因为加了下界就失效。"""
+    assert _guard("2026-09-11 11:31:00", "09:30") == "SKIP", "超出 120 分钟窗口却放行"
+    assert _guard("2026-09-11 22:01:00", "09:30") == "SKIP", "晚上的补跑却放行"
+
+
+def test_manual_run_is_never_limited():
+    """手工运行不带 -ScheduledAt，永远不受窗口限制（盘后 --dry-run 是正当用法）。"""
+    assert _guard("2026-09-11 22:00:00", "") == "RUN"
