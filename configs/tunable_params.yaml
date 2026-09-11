@@ -91,16 +91,26 @@ params:
     type: float
     min: 0.0
     max: 0.10
-  order_slippage_pct:
+  # 让价拆成了两个：参考价是**昨收**时用 stale，是**当日实时价**时用 live。
+  # 两者量级差一个数量级，共用一个区间必然有一头是错的。
+  order_slippage_stale_pct:
     scope: risk_limits
     tier: B
     type: float
-    # 上界 2026-09-11 从 0.005 放宽到 0.04。参考价是**昨收**，让价要覆盖隔夜
-    # 跳空：实测 0.5% 时仍有 22% 的卖单挂不上市价正确的一侧（详见
-    # risk_limits.yaml 的实测表）。基线值已是 0.02，旧上界意味着调参 agent
-    # 连当前值都提不出来 —— 白名单区间不含现值，等于这个参数被静默冻结了。
+    # 上界 2026-09-11 从 0.005 放宽到 0.04：要覆盖隔夜跳空，实测 0.5% 时仍有
+    # 22% 的卖单挂不上市价正确的一侧（表见 risk_limits.yaml）。基线值 0.02，
+    # 旧上界意味着调参 agent 连当前值都提不出来 —— 区间不含现值，
+    # 等于这个参数被静默冻结。
     min: 0.0005
     max: 0.04
+  order_slippage_live_pct:
+    scope: risk_limits
+    tier: B
+    type: float
+    # 参考价就是此刻的价，只需覆盖几秒的波动，所以区间比 stale 窄一个数量级。
+    # 当前 0.005 是**占位值待压测**（没有分钟线，量不出开盘那几分钟的波动）。
+    min: 0.0005
+    max: 0.01
 frozen:
   - qbg_mode
   - i_confirm_real

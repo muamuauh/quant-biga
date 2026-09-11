@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime
 import pandas as pd
 
 from qbg.config import PROJECT_ROOT, settings
-from qbg.data import cache, meta
+from qbg.data import cache, fuyao, meta
 from qbg.execution.advisory import AdvisoryAdapter
 from qbg.execution.order_planner import plan_orders
 from qbg.market import calendar
@@ -193,15 +193,51 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     targets = topk_equal_weight(reviewed_scores, settings.qbg_top_k, 0.95, set(current),
                                 settings.qbg_keep_rank) if risk_on else {}
     targets = renormalize_weights(targets, 0.95, float(limits["max_position_pct"]))
-    orders = plan_orders(targets, current, last, previous, equity, names=names, is_st=st,
-                         slippage=float(limits["order_slippage_pct"]),
+    # --- 下单参考价：能拿到当日实时价就用它，拿不到退回缓存里的昨收 -------
+    #
+    # 缓存里最新一根日线是**昨天**的，拿它当 09:30 的限价参考等于忽略整个
+    # 隔夜跳空。实测 0.2% 让价下 37.7% 的卖单会挂到市价错误一侧；2026-09-11
+    # 就踩中（688041 昨收 232.37、卖单挂 231.91，当日区间 225.37~231.50）。
+    #
+    # 两个字典必须**成对**换，不能只换一个：
+    #   reference  = 算仓位和限价用的"当前价"
+    #   limit_base = 算涨跌停区间用的"上一个收盘"
+    # 用实时价当 reference 时，上一个收盘就是缓存里最新那根（昨收 = last）；
+    # 退回缓存价时，上一个收盘才是再往前一根（previous）。
+    # 只换 reference 会把涨跌停区间锚在**前天**，实测会让 1.65% 的单被夹到
+    # （正确锚定只有 0.99%），而且永远往收紧的方向错。
+    reference, limit_base = dict(last), dict(previous)
+    live_prices: dict[str, float] = {}
+    if fuyao.enabled():
+        try:
+            live_prices = fuyao.reference_prices(sorted(set(targets) | set(current)))
+        except Exception as exc:  # noqa: BLE001
+            # 这条链路是**可选增强**，不能让它有权让下单停摆。
+            log_event(log, "cycle.reference.failed", error=f"{type(exc).__name__}: {exc}")
+            live_prices = {}
+    for code, price in live_prices.items():
+        reference[code] = price
+        limit_base[code] = last.get(code, previous.get(code, price))
+
+    # 让价按**参考价的新鲜度**取，不是按偏好取：实时价只需覆盖几秒的波动，
+    # 昨收要覆盖一整个隔夜跳空。只要有一只票没拿到实时价，整批就按 stale 走
+    # —— plan_orders 收的是一个标量，而宁可宽不可窄（窄了挂不上）。
+    ordered_codes = set(targets) | set(current)
+    fresh = bool(ordered_codes) and ordered_codes.issubset(live_prices)
+    slippage = float(limits["order_slippage_live_pct" if fresh else "order_slippage_stale_pct"])
+    log_event(log, "cycle.reference.prices", source="live" if fresh else "cached_close",
+              wanted=len(ordered_codes), live=len(live_prices), slippage=slippage)
+    result["reference_source"] = "live" if fresh else "cached_close"
+
+    orders = plan_orders(targets, current, reference, limit_base, equity, names=names, is_st=st,
+                         slippage=slippage,
                          drift_band=float(limits["rebalance_drift_band"]))
     hard_ok, allowed, gate_results = run_all_gates(
         target_weights=targets, orders=orders, current_cash=cash, total_equity=equity,
         today_pnl=0, latest_data_date=max(dates) if dates else None, asof=today,
         # 预测日期。行情闸看不见它 —— 行情每天都在更新，陈旧的是预测。
         prediction_date=pred_asof,
-        prev_close=previous, market_price=last, is_st=st, suspended=suspended,
+        prev_close=limit_base, market_price=reference, is_st=st, suspended=suspended,
         sellable_qty=sellable, current_qty=current, limits=limits,
         # **这个参数以前没传。** 它默认 None，而 session_guard 对 None 返回
         # False —— 于是 require_trading_session 一改成 true，这个硬闸就在
