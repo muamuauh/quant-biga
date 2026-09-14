@@ -113,6 +113,10 @@ class BacktestResult:
     slippage_curve: dict[float, BacktestMetrics] = field(default_factory=dict)
     buy_cost_rate: float = 0.0
     sell_cost_rate: float = 0.0
+    # 移动止盈**实际执行了**的清仓次数（被跌停拦下的不算）。
+    # 这个数必须和收益一起看：quant-trading 2026-08-04 那次回测里，"不变差"的
+    # 档位全都是**零触发** —— 它们没有变好，只是什么都没做。
+    trailing_exits: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -246,6 +250,8 @@ def run_backtest(
     fee_profile: fees.FeeProfile | None = None,
     fixed_slots: bool = False,
     slippage_grid: tuple[float, ...] = (0.0, 0.001, 0.002, 0.003),
+    trail_arm: float = 0.0,
+    trail_pct: float = 0.0,
 ) -> BacktestResult:
     """跑一次 top-K 回测。
 
@@ -287,6 +293,19 @@ def run_backtest(
     blocked_total = {"suspended": 0, "limit_up_cannot_buy": 0, "limit_down_cannot_sell": 0}
     w_prev = pd.Series(0.0, index=panel.instruments)
 
+    # --- 移动止盈 ---------------------------------------------------------
+    # 和实盘 `qbg.risk.trailing` 同一套判据：浮盈峰值先达到 `trail_arm` 才"上膛"，
+    # 之后从峰值回撤 `trail_pct` 就整仓卖出。**只在非调仓日触发** —— 调仓日交给
+    # 新一轮选股决定，不去砍一只模型仍排在前 k 的票。
+    #
+    # 用"建仓以来累计净值"代替成本价：新建仓从 1.0 起算，每天乘 (1+r)。
+    # 近似之处：调仓日同一只票加减仓时，实盘的成本价会被摊薄，这里不摊薄、
+    # 继续从最初建仓算。影响只在"持有期里被加过仓"的票上。
+    trailing_on = trail_arm > 0 and trail_pct > 0
+    grow = pd.Series(0.0, index=panel.instruments)
+    peak = pd.Series(0.0, index=panel.instruments)
+    trailing_exits = 0
+
     # 最后一天没有 open[t+1]，无法形成一个完整的持有期，所以不进循环。
     for index, day in enumerate(panel.dates[:-1]):
         # 非调仓日**什么都不做**：目标就是当前（已漂移的）持仓，delta 为零。
@@ -302,6 +321,11 @@ def run_backtest(
                             or index % rebalance_every == rebalance_phase % rebalance_every)
         if not is_rebalance_day:
             target = w_prev
+            if trailing_on:
+                armed = (w_prev > 0) & (peak - 1.0 >= trail_arm)
+                fired = armed & (grow <= peak * (1.0 - trail_pct))
+                if fired.any():
+                    target = w_prev.mask(fired, 0.0)
         elif ranking_scores is None:
             target = w_target.loc[day]
         elif index == 0:
@@ -318,6 +342,9 @@ def run_backtest(
         )
         for key, val in blocked.items():
             blocked_total[key] += val
+        if trailing_on and not is_rebalance_day:
+            # 非调仓日唯一能让持仓归零的就是移动止盈；被跌停拦下的仍 > 0，不计。
+            trailing_exits += int(((w_prev > 0) & (w_new <= 0)).sum())
 
         delta = w_new - w_prev
         buy_turnover = float(delta.clip(lower=0).sum())
@@ -339,6 +366,12 @@ def run_backtest(
 
         # 权重按各自涨跌漂移到次日开盘。现金部分收益为 0。
         w_prev = w_new * (1.0 + r)
+
+        if trailing_on:
+            held_now = w_new > 0
+            entered = held_now & (grow <= 0)
+            grow = grow.mask(entered, 1.0).where(held_now, 0.0) * (1.0 + r)
+            peak = peak.mask(entered, 1.0).where(held_now, 0.0).clip(lower=grow)
 
     dates = panel.dates[:-1]
     ret_s = pd.Series(daily_returns, index=dates, name="strategy")
@@ -372,12 +405,13 @@ def run_backtest(
         slippage_curve=slippage_curve,
         buy_cost_rate=buy_rate,
         sell_cost_rate=sell_rate,
+        trailing_exits=trailing_exits,
     )
     log_event(log, "backtest.done", k=k, keep_rank=keep_rank, n_days=len(ret_s),
               sharpe=round(result.strategy.sharpe, 3),
               rank_ic=round(rank_ic, 4),
               avg_turnover=round(result.avg_turnover, 3),
-              blocked=blocked_total)
+              blocked=blocked_total, trailing_exits=trailing_exits)
     return result
 
 

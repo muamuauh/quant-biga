@@ -204,6 +204,8 @@ def main(argv=None) -> int:
         print("    等权池那个数字不是账户会看到的。这一条比上面那行更接近你的体验。")
     print("  · 关掉之后，`risk_limits.yaml` 里的 `max_daily_loss_pct`(3%) 和")
     print("    `stop_loss_pct`(8%) 就是仅剩的下行保护，而它们管的是单日/单票，")
+    print("    （⚠ 2026-09-14 更正：stop_loss_pct 从未接线，实际只有 max_daily_loss_pct，")
+    print("     而它只砍当天的 BUY、不卖任何东西）")
     print("    **管不了慢慢阴跌出来的总回撤**。这是关掉择时真正丢掉的东西。")
     print("  · 中间选项在决策表里：捆绑改动（缓冲带 + 修正口径）把择时从"
           "\"最差版本\"")

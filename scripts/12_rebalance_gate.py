@@ -24,10 +24,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import numpy as np  # noqa: E402
 
-from qbg.backtest import engine  # noqa: E402
 from qbg.backtest import panel as panel_mod  # noqa: E402
+from qbg.backtest import phases  # noqa: E402
 from qbg.config import load_universe, settings  # noqa: E402
 from qbg.execution import fees  # noqa: E402
 from qbg.strategy.predict import (  # noqa: E402
@@ -37,36 +36,6 @@ from qbg.strategy.predict import (  # noqa: E402
 )
 from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
 from qbg.tuning.gates import Check, GateReport  # noqa: E402
-
-
-class _Averaged:
-    """把同一配置各相位的结果平均成一个；取数点和 BacktestResult 一致。"""
-
-    class _Strategy:
-        pass
-
-    def __init__(self, runs):
-        import numpy as _np
-
-        self.runs = runs
-        self.strategy = self._Strategy()
-        for field in ("annual_return", "sharpe", "max_drawdown"):
-            setattr(self.strategy, field,
-                    float(_np.mean([getattr(r.strategy, field) for r in runs])))
-        self.avg_turnover = float(_np.mean([r.avg_turnover for r in runs]))
-        self.rank_ic = float(_np.mean([r.rank_ic for r in runs]))
-        # 相位极差本身就是一条结论：它大，说明这个间隔的收益主要由"哪几天
-        # 交易"决定，而那是运气不是策略。
-        self.phase_spread = (max(r.strategy.annual_return for r in runs)
-                             - min(r.strategy.annual_return for r in runs))
-
-    def __getattr__(self, name):
-        return getattr(self.runs[0], name)
-
-
-def _average(runs):
-    return _Averaged(runs) if len(runs) > 1 else runs[0]
-
 
 SUBPERIODS = 4
 HIGH_COST_MULT = 1.75      # 八项闸要求 +75% 成本下仍为正
@@ -78,25 +47,15 @@ HIGH_COST_MULT = 1.75      # 八项闸要求 +75% 成本下仍为正
 # $1.40（90 次、116 万）。中转站换成了 deepseek-v4-flash / v4-pro / flash
 # 三个模型混合计费，和当初不是一个档次。取 1.25 为当前估计。
 LLM_COST_PER_REBALANCE_USD = 1.25
-TRADING_DAYS_PER_YEAR = 252
-
-
-def _annual(returns) -> float:
-    if len(returns) == 0:
-        return 0.0
-    return float((1 + returns).prod()) ** (TRADING_DAYS_PER_YEAR / len(returns)) - 1
-
-
-def _facts(res) -> dict:
-    m = res.strategy
-    return {"annual_return": m.annual_return, "sharpe": m.sharpe,
-            "max_drawdown": m.max_drawdown, "avg_turnover": res.avg_turnover,
-            "rank_ic": res.rank_ic}
+TRADING_DAYS_PER_YEAR = 252        # 只用于 LLM 账单的"次/年"估算
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="调仓间隔的八项闸评估")
     parser.add_argument("--candidate", type=int, required=True, help="候选调仓间隔")
+    parser.add_argument("--baseline", type=int, default=None,
+                        help="基线调仓间隔。默认取现行配置 —— 配置已经改成候选值时，"
+                             "默认会变成候选比候选，所以复核历史决定要显式传")
     parser.add_argument("--neighbors", default="", help="高原闸用的相邻取值，逗号分隔")
     parser.add_argument("--k", type=int, default=settings.qbg_top_k)
     parser.add_argument("--keep-rank", type=int, default=settings.qbg_keep_rank,
@@ -105,7 +64,11 @@ def main(argv=None) -> int:
                         help="单边额外滑点。默认 20bp，和项目的成本恒等式一致")
     args = parser.parse_args(argv)
 
-    baseline_every = int(settings.qbg_rebalance_every_days)
+    baseline_every = int(args.baseline if args.baseline is not None
+                         else settings.qbg_rebalance_every_days)
+    if baseline_every == args.candidate:
+        print(f"⚠ 基线和候选都是每 {baseline_every} 日 —— 这是自己比自己，结论没有意义。"
+              "复核历史决定请传 --baseline。")
     candidate_every = args.candidate
     neighbors = ([int(x) for x in args.neighbors.split(",") if x.strip()]
                  or sorted({max(1, candidate_every - 5), candidate_every + 5}))
@@ -151,15 +114,12 @@ def main(argv=None) -> int:
            往返成本的三分之二，**而那正是拉长调仓间隔唯一能省下来的东西**。
            一道回答"少交易值不值"的闸，不能不算少交易省下的钱。
         """
-        runs = [engine.run_backtest(scores, panel, k=args.k, rebalance_every=every,
-                                    rebalance_phase=phase, keep_rank=args.keep_rank,
-                                    extra_slippage=args.slippage,
-                                    fee_profile=profile, slippage_grid=())
-                for phase in range(every)]
-        return _average(runs)
+        return phases.run_phases(scores, panel, rebalance_every=every, k=args.k,
+                                 keep_rank=args.keep_rank, extra_slippage=args.slippage,
+                                 fee_profile=profile)
 
     base_res, cand_res = run(baseline_every), run(candidate_every)
-    baseline, candidate = _facts(base_res), _facts(cand_res)
+    baseline, candidate = base_res.facts(), cand_res.facts()
 
     profile = fees.FeeProfile.load()
     high = fees.FeeProfile(
@@ -167,7 +127,7 @@ def main(argv=None) -> int:
         commission_min=profile.commission_min * HIGH_COST_MULT,
         stamp_tax_rate=profile.stamp_tax_rate * HIGH_COST_MULT,
         transfer_fee_rate=profile.transfer_fee_rate * HIGH_COST_MULT)
-    high_cost = _facts(run(candidate_every, profile=high))
+    high_cost = run(candidate_every, profile=high).facts()
 
     print(f"{'指标':<16}{f'基线(每{baseline_every}日)':>16}"
           f"{f'候选(每{candidate_every}日)':>16}{'差':>12}")
@@ -185,20 +145,27 @@ def main(argv=None) -> int:
         print(f"  {label} 每 {every:>2} 日 → 约 {per_year:5.0f} 次/年 = "
               f"${per_year * LLM_COST_PER_REBALANCE_USD:,.0f}")
 
-    chunks = np.array_split(np.arange(len(base_res.daily_returns)), SUBPERIODS)
-    excess = []
-    print(f"\n子区间超额（候选 − 基线，年化），切成 {SUBPERIODS} 段：")
-    for i, idx in enumerate(chunks, 1):
-        b, c = _annual(base_res.daily_returns.iloc[idx]), _annual(cand_res.daily_returns.iloc[idx])
-        excess.append(c - b)
-        span = base_res.daily_returns.index[idx]
-        print(f"  第{i}段 {span[0].date()}~{span[-1].date()}  "
+    for label, res, every in (("基线", base_res, baseline_every),
+                              ("候选", cand_res, candidate_every)):
+        if every > 1:
+            print(f"{label}每 {every} 日的相位极差 {res.phase_spread:+.1%} 年化"
+                  "（最好与最差相位之差；实盘只能落在其中一个上）")
+
+    # **子区间也按相位平均。** 2026-09-14 之前这里读的是 `res.daily_returns`，
+    # 而它通过 __getattr__ 落到了第 0 个相位 —— 头条指标平均了、子区间闸没有。
+    base_sub = base_res.subperiod_annual(SUBPERIODS)
+    cand_sub = cand_res.subperiod_annual(SUBPERIODS)
+    excess = [c - b for b, c in zip(base_sub, cand_sub, strict=True)]
+    print(f"\n子区间超额（候选 − 基线，相位平均后的年化），切成 {SUBPERIODS} 段：")
+    for i, ((start_day, end_day), b, c) in enumerate(
+            zip(base_res.subperiod_spans(SUBPERIODS), base_sub, cand_sub, strict=True), 1):
+        print(f"  第{i}段 {start_day.date()}~{end_day.date()}  "
               f"基线 {b:+9.2%}  候选 {c:+9.2%}  超额 {c - b:+9.2%}")
 
     neighbor_sharpes = []
     print("\n相邻取值（高原闸）：")
     for every in neighbors:
-        sharpe = run(every).strategy.sharpe
+        sharpe = run(every).sharpe
         neighbor_sharpes.append(sharpe)
         print(f"  每 {every:>2} 日 → Sharpe {sharpe:.4f}")
 

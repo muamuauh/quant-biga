@@ -18,11 +18,13 @@ from qbg.model.train import train
 from qbg.orchestrator.run_marker import (
     already_completed_today,
     is_rebalance_day,
+    load_rebalance_date,
     save_marker,
     save_rebalance_date,
 )
 from qbg.portfolio.source import load_portfolio
 from qbg.report.daily_report import generate
+from qbg.risk import trailing
 from qbg.risk.gates import load_limits, run_all_gates
 from qbg.store.etl import backfill
 from qbg.strategy.predict import (
@@ -123,11 +125,34 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     # 来源与 asof 必须进日报：降级后用的是**过期持仓**，而那样出的清单
     # 和正常清单长得一模一样，不标出来没人会发现。
     result["portfolio"] = {"source": portfolio_source, "asof": asof, "degraded": degraded}
-    if not is_rebalance_day(settings.qbg_rebalance_every_days, today,
-                            cash_fraction=cash / equity if equity else 0,
-                            cash_trigger=settings.qbg_rebalance_cash_trigger):
+
+    # --- 移动止盈：峰值每次运行都刷新（调仓日也刷），只在非调仓日强卖 ------
+    # 刷新必须在判调仓日**之前**：调仓日虽然不强卖，但峰值不刷就会过期 ——
+    # 一只调仓日创了新高的票，下一个监控日会拿一个偏低的旧峰值去算回撤。
+    trail_arm = float(settings.qbg_trail_arm_pct)
+    trail_pct = float(settings.qbg_trail_pct)
+    trailing_on = trail_arm > 0 and trail_pct > 0
+    peaks: dict[str, float] = {}
+    result["trailing"] = {"enabled": trailing_on, "arm_pct": trail_arm, "trail_pct": trail_pct,
+                          "hits": [], "orders": [], "skipped": [], "refused": None}
+    # 降级时**不刷新也不保存**：落到默认账户时持仓是空的，update_peaks 会把
+    # 整个峰值库清空；那之后恢复正常，所有持仓的峰值都得从现价重新起算。
+    if trailing_on and degraded is None and portfolio_source != "default":
+        peaks = trailing.update_peaks(positions, trailing.load_peaks())
+        if not dry_run:
+            trailing.save_peaks(peaks)
+        result["trailing"]["watch"] = trailing.watchlist(positions, peaks, trail_arm, trail_pct)
+
+    due = is_rebalance_day(settings.qbg_rebalance_every_days, today,
+                           cash_fraction=cash / equity if equity else 0,
+                           cash_trigger=settings.qbg_rebalance_cash_trigger)
+    result["rebalance"] = _rebalance_status(today, due, cash, equity)
+    if not due:
         result["skipped_reason"] = "not_rebalance_day"
         result["run_kind"] = "monitoring"
+        if trailing_on:
+            _run_trailing(result, positions, peaks, trail_arm, trail_pct, limits, today,
+                          dry_run, portfolio_source, degraded, cash, equity)
         return _finish(result, dry_run)
 
     current = {p["code"]: int(p["qty"]) for p in positions}
@@ -144,16 +169,7 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     scores = latest_date_scores(raw_pred, neutralize=bool(settings.qbg_industry_neutral))
     result["scores"] = [{"code": code, "score": float(score)} for code, score in scores.items()]
     names = meta.load_cached()
-    last, previous, st, suspended, dates = {}, {}, {}, {}, []
-    for code in set(scores.index) | set(current):
-        frame = cache.read(code)
-        if frame.empty:
-            continue
-        row = frame.iloc[-1]
-        last[code] = float(row.close)
-        previous[code] = float(frame.iloc[-2].close if len(frame) > 1 else row.close)
-        st[code], suspended[code] = bool(row.is_st), bool(row.is_suspended)
-        dates.append(pd.Timestamp(row.date))
+    last, previous, st, suspended, dates = _bars(set(scores.index) | set(current))
     filtered = affordable_scores(scores, last, equity, settings.qbg_top_k,
                                  cap=float(limits["max_position_pct"]))
     risk_on = market_risk_on(list(last), settings.qbg_market_sma,
@@ -193,41 +209,9 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     targets = topk_equal_weight(reviewed_scores, settings.qbg_top_k, 0.95, set(current),
                                 settings.qbg_keep_rank) if risk_on else {}
     targets = renormalize_weights(targets, 0.95, float(limits["max_position_pct"]))
-    # --- 下单参考价：能拿到当日实时价就用它，拿不到退回缓存里的昨收 -------
-    #
-    # 缓存里最新一根日线是**昨天**的，拿它当 09:30 的限价参考等于忽略整个
-    # 隔夜跳空。实测 0.2% 让价下 37.7% 的卖单会挂到市价错误一侧；2026-09-11
-    # 就踩中（688041 昨收 232.37、卖单挂 231.91，当日区间 225.37~231.50）。
-    #
-    # 两个字典必须**成对**换，不能只换一个：
-    #   reference  = 算仓位和限价用的"当前价"
-    #   limit_base = 算涨跌停区间用的"上一个收盘"
-    # 用实时价当 reference 时，上一个收盘就是缓存里最新那根（昨收 = last）；
-    # 退回缓存价时，上一个收盘才是再往前一根（previous）。
-    # 只换 reference 会把涨跌停区间锚在**前天**，实测会让 1.65% 的单被夹到
-    # （正确锚定只有 0.99%），而且永远往收紧的方向错。
-    reference, limit_base = dict(last), dict(previous)
-    live_prices: dict[str, float] = {}
-    if fuyao.enabled():
-        try:
-            live_prices = fuyao.reference_prices(sorted(set(targets) | set(current)))
-        except Exception as exc:  # noqa: BLE001
-            # 这条链路是**可选增强**，不能让它有权让下单停摆。
-            log_event(log, "cycle.reference.failed", error=f"{type(exc).__name__}: {exc}")
-            live_prices = {}
-    for code, price in live_prices.items():
-        reference[code] = price
-        limit_base[code] = last.get(code, previous.get(code, price))
-
-    # 让价按**参考价的新鲜度**取，不是按偏好取：实时价只需覆盖几秒的波动，
-    # 昨收要覆盖一整个隔夜跳空。只要有一只票没拿到实时价，整批就按 stale 走
-    # —— plan_orders 收的是一个标量，而宁可宽不可窄（窄了挂不上）。
-    ordered_codes = set(targets) | set(current)
-    fresh = bool(ordered_codes) and ordered_codes.issubset(live_prices)
-    slippage = float(limits["order_slippage_live_pct" if fresh else "order_slippage_stale_pct"])
-    log_event(log, "cycle.reference.prices", source="live" if fresh else "cached_close",
-              wanted=len(ordered_codes), live=len(live_prices), slippage=slippage)
-    result["reference_source"] = "live" if fresh else "cached_close"
+    reference, limit_base, slippage, reference_source = _reference_prices(
+        set(targets) | set(current), last, previous, limits)
+    result["reference_source"] = reference_source
 
     orders = plan_orders(targets, current, reference, limit_base, equity, names=names, is_st=st,
                          slippage=slippage,
@@ -271,6 +255,166 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         save_marker(list(execution.artifacts), today)
         save_rebalance_date(today)
     return _finish(result, dry_run)
+
+
+def _bars(codes) -> tuple[dict, dict, dict, dict, list]:
+    """缓存里每只票最新两根日线：昨收、前收、ST、停牌、行情日期。"""
+    last, previous, st, suspended, dates = {}, {}, {}, {}, []
+    for code in codes:
+        frame = cache.read(code)
+        if frame.empty:
+            continue
+        row = frame.iloc[-1]
+        last[code] = float(row.close)
+        previous[code] = float(frame.iloc[-2].close if len(frame) > 1 else row.close)
+        st[code], suspended[code] = bool(row.is_st), bool(row.is_suspended)
+        dates.append(pd.Timestamp(row.date))
+    return last, previous, st, suspended, dates
+
+
+def _reference_prices(codes, last: dict, previous: dict, limits: dict
+                      ) -> tuple[dict, dict, float, str]:
+    """下单参考价 + 涨跌停基准 + 让价 + 来源。调仓日和监控日（移动止盈）共用。
+
+    缓存里最新一根日线是**昨天**的，拿它当 09:30 的限价参考等于忽略整个
+    隔夜跳空。实测 0.2% 让价下 37.7% 的卖单会挂到市价错误一侧；2026-09-11
+    就踩中（688041 昨收 232.37、卖单挂 231.91，当日区间 225.37~231.50）。
+
+    两个字典必须**成对**换，不能只换一个：
+      reference  = 算仓位和限价用的"当前价"
+      limit_base = 算涨跌停区间用的"上一个收盘"
+    用实时价当 reference 时，上一个收盘就是缓存里最新那根（昨收 = last）；
+    退回缓存价时，上一个收盘才是再往前一根（previous）。
+    只换 reference 会把涨跌停区间锚在**前天**，实测会让 1.65% 的单被夹到
+    （正确锚定只有 0.99%），而且永远往收紧的方向错。
+
+    让价按**参考价的新鲜度**取，不是按偏好取：实时价只需覆盖几秒的波动，
+    昨收要覆盖一整个隔夜跳空。只要有一只票没拿到实时价，整批就按 stale 走 ——
+    宁可宽不可窄（窄了挂不上）。
+    """
+    codes = set(codes)
+    reference, limit_base = dict(last), dict(previous)
+    live_prices: dict[str, float] = {}
+    if fuyao.enabled():
+        try:
+            live_prices = fuyao.reference_prices(sorted(codes))
+        except Exception as exc:  # noqa: BLE001
+            # 这条链路是**可选增强**，不能让它有权让下单停摆。
+            log_event(log, "cycle.reference.failed", error=f"{type(exc).__name__}: {exc}")
+            live_prices = {}
+    for code, price in live_prices.items():
+        reference[code] = price
+        limit_base[code] = last.get(code, previous.get(code, price))
+    fresh = bool(codes) and codes.issubset(live_prices)
+    slippage = float(limits["order_slippage_live_pct" if fresh else "order_slippage_stale_pct"])
+    source = "live" if fresh else "cached_close"
+    log_event(log, "cycle.reference.prices", source=source,
+              wanted=len(codes), live=len(live_prices), slippage=slippage)
+    return reference, limit_base, slippage, source
+
+
+def _rebalance_status(today: str, due: bool, cash: float, equity: float) -> dict:
+    """给日报用的调仓周期状态：上次、已过几天、下次、今天是不是。
+
+    **下次调仓日是估算。** 现金占比超过 `QBG_REBALANCE_CASH_TRIGGER` 会提前调仓
+    —— 比如移动止盈卖掉两只之后。所以日报上写的"下次"是"不出意外的话"。
+    """
+    every = int(settings.qbg_rebalance_every_days)
+    last = load_rebalance_date()
+    since = calendar.trading_days_between(last, today) if last else None
+    cash_fraction = cash / equity if equity else 0.0
+    trigger = float(settings.qbg_rebalance_cash_trigger)
+    cash_over = trigger > 0 and cash_fraction >= trigger
+    ahead = [d for d in calendar.load_cached() if d > today]
+    next_day = today if due else None
+    if not due and since is not None:
+        remaining = every - since
+        if 0 < remaining <= len(ahead):
+            next_day = ahead[remaining - 1]
+    # 今天调仓**成功**之后的下一次。调仓日风控闸没过的话不会写调仓日期，
+    # 明天仍然到期 —— 所以这是个条件句，日报要照这个语气写。
+    next_after_today = ahead[every - 1] if due and every <= len(ahead) else None
+    # 调仓日是不是被现金触发的：到期了就不算"触发"，没到期却调了才算。
+    by_cash = bool(due and cash_over and (since is not None and since < every))
+    return {"every_days": every, "last": last, "days_since": since, "is_today": due,
+            "next": next_day, "next_after_today": next_after_today,
+            "cash_fraction": round(cash_fraction, 4),
+            "cash_trigger": trigger, "cash_triggered": by_cash}
+
+
+def _run_trailing(result: dict, positions: list[dict], peaks: dict, arm: float,
+                  trail: float, limits: dict, today: str, dry_run: bool,
+                  portfolio_source: str, degraded: dict | None,
+                  cash: float, equity: float) -> None:
+    """监控日的移动止盈：查触发 → 卖单 → 风控闸 → 下单。结果写进 `result["trailing"]`。
+
+    **四条不许简化的地方：**
+
+    1. **持仓降级就不强卖。** 读失败落到默认账户时持仓是空的；落到过期 CSV 时，
+       可能卖一只早就不在账上的票。止盈是"卖掉我手上的"，不知道手上有什么就不卖。
+    2. **照走整条风控闸。** 包括预测新鲜度这道硬闸 —— 止盈卖出其实不依赖预测，
+       但硬闸"失败就全盘不交易"的语义不许为某一类订单开口子（CLAUDE.md §三）。
+       盘前每天重训，正常日子不会被它拦；真被拦了日报会写出来，退出码 2 要人看。
+    3. **写当日完成标记，不写调仓日。** 前者防同一天重跑重复卖（挂单会冻结可卖量，
+       是第二道保险）；后者要是写了，会把调仓周期重置掉。
+    4. **卖单按可卖量下。** `t1_guard` 失败时卖单照样放行，超出可卖量的部分会被
+       券商 T+1 静默拒绝，所以在 `trailing.sell_orders` 里就地截断。
+    """
+    info = result["trailing"]
+    hits = trailing.triggered(positions, peaks, arm, trail)
+    info["hits"] = [hit.as_dict() for hit in hits]
+    log_event(log, "cycle.trailing.checked", held=len(positions), hits=len(hits))
+    if not hits:
+        return
+    if degraded is not None or portfolio_source == "default":
+        info["refused"] = "持仓来自降级数据源 —— 不按可能过期的持仓强卖"
+        log_event(log, "cycle.trailing.refused", reason=info["refused"])
+        return
+
+    codes = {hit.code for hit in hits}
+    last, previous, st, suspended, dates = _bars({p["code"] for p in positions})
+    reference, limit_base, slippage, source = _reference_prices(codes, last, previous, limits)
+    orders, skipped = trailing.sell_orders(hits, reference, limit_base, st, slippage)
+    info.update(orders=[o.as_dict() for o in orders], skipped=skipped,
+                reference_source=source)
+    if not orders:
+        return
+
+    raw_pred, _ = load_production_predictions()
+    current = {p["code"]: int(p["qty"]) for p in positions}
+    sellable = {p["code"]: int(p["sellable_qty"]) for p in positions}
+    remaining = {p["code"]: float(p.get("market_value", 0.0) or 0.0) / equity
+                 for p in positions if equity and p["code"] not in codes}
+    hard_ok, allowed, gate_results = run_all_gates(
+        target_weights=remaining, orders=orders, current_cash=cash, total_equity=equity,
+        today_pnl=0, latest_data_date=max(dates) if dates else None, asof=today,
+        prediction_date=prediction_asof(raw_pred),
+        prev_close=limit_base, market_price=reference, is_st=st, suspended=suspended,
+        sellable_qty=sellable, current_qty=current, limits=limits,
+        session_open=calendar.in_session())
+    info.update(hard_ok=hard_ok, allowed_orders=[o.as_dict() for o in allowed],
+                gates=[g.__dict__ for g in gate_results])
+    # 让日报的「订单意见 / 风控闸门 / 实际委托」几节照常显示这几笔。
+    result.update(hard_ok=hard_ok, orders=info["orders"],
+                  allowed_orders=info["allowed_orders"], gates=info["gates"])
+    if not hard_ok or dry_run:
+        return
+
+    execution = AdvisoryAdapter().submit(allowed, today, gate_results)
+    result["submitted"] = True
+    result["order_artifacts"] = list(execution.artifacts)
+    result["execution_mode"] = "ADVISORY"
+    if str(settings.qbg_mode).upper() != "ADVISORY":
+        refusal = broker_refusal(portfolio_source, degraded)
+        if refusal:
+            log_event(log, "cycle.broker.refused", reason=refusal)
+            result.update({"execution_mode": str(settings.qbg_mode).upper(),
+                           "broker": {"ok": False, "submitted": 0,
+                                      "message": refusal, "outcomes": []}})
+        else:
+            result.update(_submit_to_broker(allowed, today, gate_results))
+    save_marker(list(execution.artifacts), today)
+    log_event(log, "cycle.trailing.submitted", orders=len(allowed))
 
 
 def broker_refusal(portfolio_source: str, degraded: dict | None) -> str | None:

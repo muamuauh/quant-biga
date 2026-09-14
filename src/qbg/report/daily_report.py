@@ -27,7 +27,11 @@ def _status(result: dict) -> str:
         "not_trading_session": "非交易时段",
         "already_completed_today": "今日已完成",
     }
-    if skipped:
+    # 监控日**如果移动止盈动了手**，状态必须由下单结果决定，不能停在"监控日"。
+    # 否则一笔卖失败的止盈单，副标题和邮件主题都会写成风平浪静的"监控日" ——
+    # 和 2026-08-25 "报喜不报忧"是同一个毛病。
+    trailing_acted = bool((result.get("trailing") or {}).get("orders"))
+    if skipped and not (skipped == "not_rebalance_day" and trailing_acted):
         return labels.get(str(skipped), str(skipped))
     if not result.get("hard_ok", True):
         return "⚠ 硬闸中止"
@@ -97,8 +101,19 @@ def _headline(result: dict) -> str:
     review_text = review.get("summary") or review.get("error")
 
     skipped = result.get("skipped_reason")
-    if skipped == "not_rebalance_day":
+    trailing_info = result.get("trailing") or {}
+    if skipped == "not_rebalance_day" and trailing_info.get("orders"):
+        n = len(trailing_info["orders"])
+        base = (f"今日为监控日：移动止盈触发，生成 {n} 笔卖单。"
+                "不换股，也不重置调仓周期。")
+        if not result.get("hard_ok", True):
+            base = f"今日为监控日：移动止盈触发 {n} 笔，但硬风控闸未通过，**没有卖出**。"
+    elif skipped == "not_rebalance_day" and trailing_info.get("refused"):
+        base = f"今日为监控日：移动止盈触发，但未下单 —— {trailing_info['refused']}。"
+    elif skipped == "not_rebalance_day":
         base = "今日为监控日：已更新账户与持仓事实，不生成新的调仓订单。"
+        if trailing_info.get("enabled"):
+            base += "移动止盈无持仓触发。"
     elif skipped == "not_trading_session":
         # 这不是故障。自动下单要求在盘中，盘前/盘后触发就安静跳过 ——
         # 说清楚它是**预期行为**，否则每次登录都收到一封像出事了的邮件。
@@ -321,6 +336,141 @@ def _regime_section(result: dict) -> list[str]:
     return lines
 
 
+def _regime_brief(result: dict) -> str:
+    """概览表的"市场状态"。
+
+    **监控日根本不判择时**，`market_risk_on` 停在初始值 False。以前直接拿它渲染，
+    于是每个监控日都显示 risk-off —— 调仓改成 10 日之后，十天里有九天会显示一个
+    假的 risk-off。择时关闭时同理，那个词没有意义。
+    """
+    if not int(settings.qbg_market_sma or 0):
+        return "择时已关闭"
+    if result.get("skipped_reason") == "not_rebalance_day":
+        return "—（监控日不判）"
+    return "risk-on" if result.get("market_risk_on") else "risk-off"
+
+
+def _rebalance_brief(result: dict) -> str:
+    """概览表里那一格。"""
+    info = result.get("rebalance") or {}
+    if not info:
+        return "—"
+    if int(info.get("every_days") or 1) <= 1:
+        return "每日调仓"
+    if info.get("is_today"):
+        return "**调仓日**（现金触发提前）" if info.get("cash_triggered") else "**调仓日**"
+    tail = f" · 下次 {info['next']}" if info.get("next") else ""
+    return f"监控日{tail}"
+
+
+def _rebalance_section(result: dict) -> list[str]:
+    """调仓周期：今天是什么日子、上次什么时候、下次什么时候。
+
+    调仓间隔拉长到 10 日之后，**十天里有九天是监控日**。那九天日报没有订单、
+    没有目标，看起来像"系统没干活"。这一节把"为什么今天不换股、哪天会换"
+    讲清楚，免得操作者以为出了故障去手动补跑。
+    """
+    info = result.get("rebalance") or {}
+    every = int(info.get("every_days") or 0)
+    if not info or every <= 1:
+        return []
+    since = info.get("days_since")
+    cash_fraction = float(info.get("cash_fraction") or 0.0)
+    trigger = float(info.get("cash_trigger") or 0.0)
+
+    if info.get("is_today"):
+        today = "🔁 **调仓日** —— 按模型分数重新选股"
+        if info.get("cash_triggered"):
+            today += (f"（**提前调仓**：现金占比 {cash_fraction:.0%} 超过 {trigger:.0%}，"
+                      "不等周期到期）")
+    else:
+        today = "👀 **监控日** —— 不换股，只读账户、检查移动止盈"
+
+    last = info.get("last")
+    last_text = (f"{last}（已过 {since} 个交易日）" if last and since is not None
+                 else "尚无记录 —— 首次运行当天即调仓")
+    if info.get("is_today"):
+        nxt = info.get("next_after_today")
+        next_text = (f"若今天调仓成功，下一次约在 **{nxt}**（{every} 个交易日后）"
+                     if nxt else "若今天调仓成功，下一次在 10 个交易日后（交易日历不够远，算不出日期）")
+    elif info.get("next"):
+        remaining = every - int(since or 0)
+        next_text = f"**{info['next']}**（还有 {remaining} 个交易日）"
+    else:
+        next_text = "算不出（交易日历缓存不够远）"
+
+    lines = ["## 调仓周期", "", "| 项目 | 值 |", "|---|---|",
+             f"| 调仓间隔 | 每 {every} 个交易日 |",
+             f"| 今天 | {today} |",
+             f"| 上次调仓 | {last_text} |",
+             f"| 下次调仓 | {next_text} |"]
+    if trigger > 0:
+        lines.append(f"| 现金占比 | {cash_fraction:.1%}（超过 {trigger:.0%} 会提前调仓）|")
+    lines += ["", "下次调仓日是**估算**：现金占比一旦超过阈值（比如移动止盈卖掉两只之后），"
+              "会提前到第二天调仓。", ""]
+    return lines
+
+
+def _trailing_section(result: dict) -> list[str]:
+    """移动止盈：参数、每只持仓离触发多远、今天动没动手。"""
+    info = result.get("trailing") or {}
+    if not info:
+        return []
+    if not info.get("enabled"):
+        return ["## 移动止盈", "",
+                "未启用（`QBG_TRAIL_ARM_PCT` / `QBG_TRAIL_PCT` 为 0）。", ""]
+
+    arm, trail = float(info.get("arm_pct") or 0), float(info.get("trail_pct") or 0)
+    lines = ["## 移动止盈", "",
+             f"浮盈峰值达到 **+{arm:.0%}** 上膛，之后从峰值回撤 **{trail:.0%}** "
+             "整仓卖出。**只在监控日执行** —— 调仓日交给模型选股，不砍模型仍看好的票。", ""]
+
+    watch = info.get("watch") or []
+    if watch:
+        lines += ["|代码|名称|成本|峰值|现价|峰值浮盈|从峰值回撤|状态|",
+                  "|---|---|---:|---:|---:|---:|---:|---|"]
+        # 离触发最近的排最前：已触发 > 已上膛（按还差多少） > 未上膛（按还差多少）。
+        # 取绝对值 —— to_trigger 是负数（还要跌多少），直接升序会把最远的排前面。
+        def _closeness(r):
+            return (not r.get("fired"), not r.get("armed"),
+                    abs(float(r.get("to_trigger", r.get("to_arm", 0)) or 0)))
+
+        for row in sorted(watch, key=_closeness):
+            if row.get("fired"):
+                state = "🔔 **触发**"
+            elif row.get("armed"):
+                state = f"已上膛，再跌 {abs(float(row['to_trigger'])):.1%} 触发（{row['trigger_price']}）"
+            else:
+                state = f"未上膛，再涨 {float(row['to_arm']):.1%} 上膛（{row['arm_price']}）"
+            lines.append(
+                f"|{_cell(row['code'])}|{_cell(row.get('name'))}|{_number(row['cost'], 3)}|"
+                f"{_number(row['peak'], 3)}|{_number(row['last'], 3)}|"
+                f"{float(row['peak_gain']):+.1%}|{float(row['drawdown']):.1%}|{state}|")
+        lines.append("")
+    elif (result.get("portfolio") or {}).get("degraded"):
+        lines += ["> ⚠ 持仓来自降级数据源，本次**没有更新峰值**，也不会强卖。", ""]
+
+    rebalance = result.get("rebalance") or {}
+    if rebalance.get("is_today"):
+        lines += ["今天是调仓日：移动止盈**不强卖**，峰值照常更新。", ""]
+        return lines
+
+    hits = info.get("hits") or []
+    if info.get("refused"):
+        lines += [f"> ⚠ 触发 {len(hits)} 只，但**没有下单**：{info['refused']}", ""]
+    elif hits:
+        orders = info.get("orders") or []
+        lines += [f"触发 **{len(hits)}** 只，生成 **{len(orders)}** 笔卖单"
+                  "（明细见「订单意见」与「计划 vs 实际委托」）。", ""]
+        for item in info.get("skipped") or []:
+            lines.append(f"- {_cell(item.get('code'))} 未下单：{_cell(item.get('reason'))}")
+        if info.get("skipped"):
+            lines.append("")
+        lines += ["止盈卖出**不重置调仓周期**。卖出的钱闲置到下一个调仓日，"
+                  "除非现金占比超过阈值、触发提前调仓。", ""]
+    return lines
+
+
 def _broker_section(result: dict) -> list[str]:
     """计划 vs 实际委托对账（P9c）。
 
@@ -435,7 +585,8 @@ def render(result: dict) -> str:
              f"| 总资产 | ¥{_number(account.get('total_equity'))} |",
              f"| 可用资金 | ¥{_number(account.get('available_cash'))} |",
              f"| 运行类型 | {_cell(str(mode).upper())} |",
-             f"| 市场状态 | {'risk-on' if result.get('market_risk_on') else 'risk-off'} |",
+             f"| 市场状态 | {_regime_brief(result)} |",
+             f"| 调仓 | {_rebalance_brief(result)} |",
              f"| 当前持仓 | {len(positions)} 只 |",
              f"| 量化目标 | {len(targets)} 只 |",
              f"| 订单意见 | {len(allowed_orders)}/{len(orders)} 笔允许 |",
@@ -476,6 +627,8 @@ def render(result: dict) -> str:
     verdicts = result.get("agent_verdicts") or []
     # 择时段放在**这个 if 之外**：risk-off 时恰好没有 targets，
     # 放进去就正好在它最该出现的时候不出现。
+    lines += _rebalance_section(result)
+    lines += _trailing_section(result)
     lines += _regime_section(result)
     if targets or verdicts:
         lines += ["## 量化选择与 TradingAgents 复核", "",
