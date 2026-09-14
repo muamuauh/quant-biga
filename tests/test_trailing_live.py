@@ -1,4 +1,4 @@
-"""移动止盈的实盘一侧：峰值库、触发判据、卖单、日报。全离线。
+"""止损与移动止盈的实盘一侧：峰值库、触发判据、卖单、日报。全离线。
 
 引擎一侧（回测）见 test_trailing_take_profit.py。
 """
@@ -128,14 +128,14 @@ def test_peaks_refresh_before_the_rebalance_check():
 
 def test_trailing_never_resets_the_rebalance_clock():
     """止盈卖出**不是调仓**。写了调仓日期会把 10 日周期重置掉。"""
-    src = inspect.getsource(daily_cycle._run_trailing)
+    src = inspect.getsource(daily_cycle._run_forced_exits)
     assert "save_rebalance_date" not in src
     assert "save_marker" in src, "应当写当日完成标记，防同一天重跑重复卖"
 
 
 def test_trailing_goes_through_the_gates():
     """硬闸语义不许为某一类订单开口子（CLAUDE.md §三）。"""
-    src = inspect.getsource(daily_cycle._run_trailing)
+    src = inspect.getsource(daily_cycle._run_forced_exits)
     assert "run_all_gates" in src
     assert src.index("run_all_gates") < src.index("_submit_to_broker")
 
@@ -143,13 +143,22 @@ def test_trailing_goes_through_the_gates():
 def test_degraded_portfolio_does_not_touch_peaks():
     """降级时不刷新峰值：落到默认账户时持仓是空的，刷新会把整个峰值库清空。"""
     src = inspect.getsource(daily_cycle.run_daily)
+    assert 'exits_trusted = degraded is None and portfolio_source != "default"' in src
     guard = src[src.index("trailing.update_peaks") - 200: src.index("trailing.update_peaks")]
-    assert "degraded is None" in guard
+    assert "exits_trusted" in guard
 
 
 # ----------------------------------------------------------------------
 # 日报
 # ----------------------------------------------------------------------
+
+def _exits(**over):
+    base = {"stop_enabled": False, "stop_pct": 0.0, "trailing_enabled": False,
+            "arm_pct": 0.0, "trail_pct": 0.0, "trusted": True, "watch": [], "hits": [],
+            "orders": [], "skipped": [], "refused": None, "excluded_on_rebalance": []}
+    base.update(over)
+    return base
+
 
 def _monitoring_result(**over):
     base = {"date": "2026-09-15", "mode": "PAPER", "skipped_reason": "not_rebalance_day",
@@ -157,8 +166,7 @@ def _monitoring_result(**over):
             "rebalance": {"every_days": 10, "last": "2026-09-11", "days_since": 2,
                           "is_today": False, "next": "2026-09-25", "next_after_today": None,
                           "cash_fraction": 0.21, "cash_trigger": 0.5, "cash_triggered": False},
-            "trailing": {"enabled": True, "arm_pct": 0.15, "trail_pct": 0.05,
-                         "hits": [], "orders": [], "skipped": [], "refused": None, "watch": []}}
+            "exits": _exits(trailing_enabled=True, arm_pct=0.15, trail_pct=0.05)}
     base.update(over)
     return base
 
@@ -168,8 +176,8 @@ def test_failed_trailing_sell_is_not_reported_as_a_quiet_monitoring_day():
     order = {"code": "600000.SH", "side": "SELL", "quantity": 600, "price": 11.24}
     result = _monitoring_result(
         orders=[order], allowed_orders=[order], submitted=True,
-        trailing={"enabled": True, "arm_pct": 0.15, "trail_pct": 0.05, "hits": [{}],
-                  "orders": [order], "skipped": [], "refused": None, "watch": []},
+        exits=_exits(trailing_enabled=True, arm_pct=0.15, trail_pct=0.05,
+                     hits=[{"kind": "trailing"}], orders=[order]),
         broker={"ok": False, "submitted": 0, "outcomes": [{"ok": False}]})
     assert daily_report._status(result) != "监控日"
     assert "下单失败" in daily_report._status(result)
@@ -194,15 +202,14 @@ def test_report_shows_distance_to_trigger():
     watch = trailing.watchlist([_pos(cost=10, last=11.8), _pos(code="B", cost=10, last=10.5)],
                                {"600000.SH": 12.0, "B": 10.5}, 0.15, 0.05)
     text = daily_report.render(_monitoring_result(
-        trailing={"enabled": True, "arm_pct": 0.15, "trail_pct": 0.05, "hits": [],
-                  "orders": [], "skipped": [], "refused": None, "watch": watch}))
+        exits=_exits(trailing_enabled=True, arm_pct=0.15, trail_pct=0.05, watch=watch)))
     assert "已上膛，再跌" in text
     assert "未上膛，再涨" in text
 
 
 def test_disabled_trailing_is_one_line():
-    text = daily_report.render(_monitoring_result(trailing={"enabled": False}))
-    assert "未启用" in text
+    text = daily_report.render(_monitoring_result(exits=_exits()))
+    assert text.count("未启用") == 2, "止损和移动止盈各一行"
 
 
 def test_monitoring_day_does_not_show_a_fake_risk_off(monkeypatch):
@@ -225,6 +232,73 @@ def test_closest_to_trigger_is_listed_first():
         [_pos(code="FAR", cost=10, last=13.9), _pos(code="NEAR", cost=10, last=12.0)],
         {"FAR": 14.0, "NEAR": 13.0}, 0.10, 0.10)
     text = daily_report.render(_monitoring_result(
-        trailing={"enabled": True, "arm_pct": 0.10, "trail_pct": 0.10, "hits": [],
-                  "orders": [], "skipped": [], "refused": None, "watch": watch}))
+        exits=_exits(trailing_enabled=True, arm_pct=0.10, trail_pct=0.10, watch=watch)))
     assert text.index("|NEAR|") < text.index("|FAR|"), "离触发最近的应当排最前"
+
+
+# ----------------------------------------------------------------------
+# 止损
+# ----------------------------------------------------------------------
+
+def test_stop_loss_hits_at_the_line():
+    hits = trailing.stop_loss_hits([_pos(cost=10, last=9.2)], 0.08)
+    assert [(h.code, h.kind) for h in hits] == [("600000.SH", "stop_loss")]
+    assert "止损" in hits[0].reason()
+
+
+def test_stop_loss_uses_cost_not_peak():
+    """止损问"这笔买卖亏了多少"。先涨 30% 再跌回成本的票，止损不管 —— 那是止盈的事。"""
+    assert trailing.stop_loss_hits([_pos(cost=10, last=10.0)], 0.08) == []
+
+
+def test_stop_loss_off_and_small_loss():
+    assert trailing.stop_loss_hits([_pos(cost=10, last=5.0)], 0.0) == []
+    assert trailing.stop_loss_hits([_pos(cost=10, last=9.5)], 0.08) == []
+
+
+def test_forced_exits_never_sells_the_same_code_twice():
+    """同时满足止损和移动止盈（冲高后暴跌）的票只卖一次，归到止损。"""
+    positions = [_pos(cost=10, last=9.0)]
+    hits = trailing.forced_exits(positions, {"600000.SH": 14.0}, 0.08, 0.15, 0.05)
+    assert [h.kind for h in hits] == ["stop_loss"]
+
+
+def test_watchlist_shows_distance_to_stop():
+    rows = trailing.watchlist([_pos(cost=10, last=9.5)], {}, 0.0, 0.0, 0.08)
+    assert rows[0]["stop_price"] == 9.2
+    assert rows[0]["to_stop"] < 0 and not rows[0]["stopped"]
+
+
+def test_rebalance_day_excludes_stopped_codes_from_selection():
+    """调仓日也止损：从分数里剔除，**并且**从迟滞的"已持有"集合里剔除 ——
+    只剔分数不剔集合的话，迟滞会因为"还在前 keep_rank 名"把它留下。"""
+    src = inspect.getsource(daily_cycle.run_daily)
+    assert "reviewed_scores.drop(" in src
+    assert "set(current) - stopped_today" in src
+    assert src.index("stopped_today") < src.index("topk_equal_weight(")
+
+
+def test_stop_loss_is_read_from_risk_limits():
+    """止损参数在 risk_limits.yaml，此前**零引用** —— 钉住它真的被读了。"""
+    src = inspect.getsource(daily_cycle.run_daily)
+    assert 'limits.get("stop_loss_pct"' in src
+
+
+def test_report_shows_stop_exclusion_on_rebalance_day():
+    result = _monitoring_result(
+        skipped_reason=None, run_kind="rebalance",
+        rebalance={"every_days": 10, "last": "2026-09-11", "days_since": 10, "is_today": True,
+                   "next": "2026-09-25", "next_after_today": "2026-10-09",
+                   "cash_fraction": 0.05, "cash_trigger": 0.5, "cash_triggered": False},
+        exits=_exits(stop_enabled=True, stop_pct=0.08, excluded_on_rebalance=["600482.SH"],
+                     hits=[{"kind": "stop_loss", "code": "600482.SH"}]))
+    text = daily_report.render(result)
+    assert "600482.SH" in text and "已从选股里剔除" in text
+
+
+def test_stop_loss_headline_says_stop_loss():
+    order = {"code": "600000.SH", "side": "SELL", "quantity": 1000, "price": 9.15}
+    result = _monitoring_result(orders=[order], allowed_orders=[order], submitted=True,
+                                exits=_exits(stop_enabled=True, stop_pct=0.08,
+                                             hits=[{"kind": "stop_loss"}], orders=[order]))
+    assert "止损触发" in daily_report._headline(result)

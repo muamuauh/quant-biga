@@ -117,6 +117,10 @@ class BacktestResult:
     # 这个数必须和收益一起看：quant-trading 2026-08-04 那次回测里，"不变差"的
     # 档位全都是**零触发** —— 它们没有变好，只是什么都没做。
     trailing_exits: int = 0
+    # 止损实际执行了的清仓次数（被跌停拦下的不算）。
+    stop_exits: int = 0
+    # 因现金占比超过阈值而**提前**调仓的次数（不含按周期到期的）。
+    cash_rebalances: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -252,6 +256,8 @@ def run_backtest(
     slippage_grid: tuple[float, ...] = (0.0, 0.001, 0.002, 0.003),
     trail_arm: float = 0.0,
     trail_pct: float = 0.0,
+    stop_loss: float = 0.0,
+    cash_trigger: float = 0.0,
 ) -> BacktestResult:
     """跑一次 top-K 回测。
 
@@ -302,9 +308,34 @@ def run_backtest(
     # 近似之处：调仓日同一只票加减仓时，实盘的成本价会被摊薄，这里不摊薄、
     # 继续从最初建仓算。影响只在"持有期里被加过仓"的票上。
     trailing_on = trail_arm > 0 and trail_pct > 0
+
+    # --- 止损 -------------------------------------------------------------
+    # 和实盘 `qbg.risk.trailing.stop_loss_hits` 同一套判据：建仓以来亏损达到
+    # `stop_loss` 就卖。和移动止盈不同，**调仓日也生效**：模型再看好也不留 ——
+    # 调仓日把止损的票从当天选股里剔除，槽位让给下一名；监控日直接卖成现金。
+    stop_on = stop_loss > 0
     grow = pd.Series(0.0, index=panel.instruments)
     peak = pd.Series(0.0, index=panel.instruments)
-    trailing_exits = 0
+    trailing_exits = stop_exits = cash_rebalances = 0
+
+    # --- 现金触发提前调仓 ---------------------------------------------------
+    # 实盘 `QBG_REBALANCE_CASH_TRIGGER`：现金占比 ≥ 阈值时，监控日当作调仓日。
+    # 此前引擎**完全不模拟**它，所以 0.50 这个值从来没有回测依据。
+    #
+    # 两个必须处理的细节：
+    #   1. **用真实现金占比。** 引擎的权重只按收益漂移、不重新归一化，
+    #      `1 - sum(w_prev)` 在组合整体下跌时会虚高（跌 20% 就显示 24% "现金"，
+    #      其实一笔没卖）。所以单独算：上一步现金 / 上一步组合总值。
+    #   2. **首次建仓之前不触发。** 空仓时现金 100%，天然满足阈值；要是开局就触发，
+    #      所有相位都会在第 1 天调仓，相位平均直接失效。实盘没有"相位"这回事，
+    #      这是回测特有的初始化问题。
+    #
+    # 调仓（无论到期还是现金触发）都会重置周期计数 —— 和实盘 save_rebalance_date 一致。
+    # 不开现金触发时仍用取模判据，保证所有现有调用逐位不变。
+    every = max(1, int(rebalance_every))
+    last_rebalance = (rebalance_phase % every) - every
+    invested_once = False
+    cash_fraction = 1.0
 
     # 最后一天没有 open[t+1]，无法形成一个完整的持有期，所以不进循环。
     for index, day in enumerate(panel.dates[:-1]):
@@ -317,22 +348,39 @@ def run_backtest(
         # 注意这里没有实现实盘的 `rebalance_drift_band`（漂移小于 3% 就不动）：
         # 调仓日这里会走满到目标。差别只在调仓日的换手上，方向是**高估**换手，
         # 也就是对低频那一侧不利 —— 结论若仍偏向低频，那是保守的。
-        is_rebalance_day = (rebalance_every <= 1
-                            or index % rebalance_every == rebalance_phase % rebalance_every)
+        by_cash = False
+        if rebalance_every <= 1:
+            is_rebalance_day = True
+        elif cash_trigger > 0:
+            scheduled = index - last_rebalance >= every
+            by_cash = (not scheduled) and invested_once and cash_fraction >= cash_trigger
+            is_rebalance_day = scheduled or by_cash
+        else:
+            is_rebalance_day = index % rebalance_every == rebalance_phase % rebalance_every
+
+        held = w_prev > 0
+        stopped = (held & (grow <= 1.0 - stop_loss)) if stop_on else held & False
+        trail_fired = held & False
         if not is_rebalance_day:
             target = w_prev
             if trailing_on:
-                armed = (w_prev > 0) & (peak - 1.0 >= trail_arm)
-                fired = armed & (grow <= peak * (1.0 - trail_pct))
-                if fired.any():
-                    target = w_prev.mask(fired, 0.0)
+                armed = held & (peak - 1.0 >= trail_arm)
+                trail_fired = armed & (grow <= peak * (1.0 - trail_pct))
+            fired = stopped | trail_fired
+            if fired.any():
+                target = w_prev.mask(fired, 0.0)
         elif ranking_scores is None:
             target = w_target.loc[day]
+            if stopped.any():
+                target = target.mask(stopped, 0.0)   # 非迟滞路径没法当天补位，槽位留现金
         elif index == 0:
             target = pd.Series(0.0, index=panel.instruments)  # 没有前一日分数
         else:
+            row = ranking_scores.iloc[index - 1]
+            if stopped.any():
+                row = row.mask(stopped)              # 止损的票当天不许被选回来
             target = _hysteresis_target(
-                ranking_scores.iloc[index - 1], set(w_prev.index[w_prev > 0]),
+                row, set(w_prev.index[held & ~stopped]),
                 k, keep_rank, total_weight, fixed_slots)
         w_new, blocked = _step_weights(
             w_prev, target,
@@ -342,9 +390,13 @@ def run_backtest(
         )
         for key, val in blocked.items():
             blocked_total[key] += val
-        if trailing_on and not is_rebalance_day:
-            # 非调仓日唯一能让持仓归零的就是移动止盈；被跌停拦下的仍 > 0，不计。
-            trailing_exits += int(((w_prev > 0) & (w_new <= 0)).sum())
+        exited = held & (w_new <= 0)                 # 被跌停拦下的仍 > 0，不计
+        stop_exits += int((exited & stopped).sum())
+        if not is_rebalance_day:
+            trailing_exits += int((exited & trail_fired & ~stopped).sum())
+        if is_rebalance_day and rebalance_every > 1:
+            last_rebalance = index
+            cash_rebalances += int(by_cash)
 
         delta = w_new - w_prev
         buy_turnover = float(delta.clip(lower=0).sum())
@@ -364,10 +416,31 @@ def run_backtest(
         daily_returns.append(gross - cost)
         weight_rows.append(w_new.rename(day))
 
-        # 权重按各自涨跌漂移到次日开盘。现金部分收益为 0。
-        w_prev = w_new * (1.0 + r)
+        # 权重按各自涨跌漂移到次日开盘，**并按组合当日总收益重新归一化**。
+        #
+        # 2026-09-14 之前这里是 `w_prev = w_new * (1 + r)`，不除以组合收益。
+        # 日频调仓看不出来（每天都重置到目标），但只要**持有超过一天**权重就失真：
+        # 涨了之后权重和 > 1（像加了杠杆），跌了之后 < 1（像留了现金）。已知答案：
+        #
+        #     路径（持有不调）   真实     修之前
+        #     +10% +10%        +21.00%  +22.10%
+        #     -10% -10%        -19.00%  -18.10%
+        #     +10% -10%         -1.00%   -2.10%
+        #
+        # 方向取决于走势的自相关（顺势高估、反复低估），所以**不是**稳定地偏向
+        # 某一侧 —— 但所有调仓间隔 > 1 的回测数字都受影响，包括当天做出的
+        # "改成每 10 日调仓"和移动止盈两组闸。
+        #
+        # 现金不动、持仓按 r 变，组合总值按 (1 + 当日净收益) 变，所以：
+        #     新权重 = w_new × (1 + r) / (1 + gross − cost)
+        # 这样 1 − sum(w_prev) 就是真实现金占比，现金触发可以直接用它。
+        growth = 1.0 + gross - cost
+        w_prev = w_new * (1.0 + r) / (growth if growth > 1e-12 else 1.0)
+        if float(w_new.sum()) > 0:
+            invested_once = True
+        cash_fraction = max(0.0, 1.0 - float(w_prev.sum()))
 
-        if trailing_on:
+        if trailing_on or stop_on:
             held_now = w_new > 0
             entered = held_now & (grow <= 0)
             grow = grow.mask(entered, 1.0).where(held_now, 0.0) * (1.0 + r)
@@ -406,12 +479,15 @@ def run_backtest(
         buy_cost_rate=buy_rate,
         sell_cost_rate=sell_rate,
         trailing_exits=trailing_exits,
+        stop_exits=stop_exits,
+        cash_rebalances=cash_rebalances,
     )
     log_event(log, "backtest.done", k=k, keep_rank=keep_rank, n_days=len(ret_s),
               sharpe=round(result.strategy.sharpe, 3),
               rank_ic=round(rank_ic, 4),
               avg_turnover=round(result.avg_turnover, 3),
-              blocked=blocked_total, trailing_exits=trailing_exits)
+              blocked=blocked_total, trailing_exits=trailing_exits,
+              stop_exits=stop_exits, cash_rebalances=cash_rebalances)
     return result
 
 

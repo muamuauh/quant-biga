@@ -1,4 +1,14 @@
-"""移动止盈：浮盈先上膛，之后从峰值回撤就整仓卖出。
+"""止损与移动止盈：两条强制退出规则，共用峰值库、卖单和日流程里的同一条强卖链路。
+
+## 止损（`risk_limits.yaml` 的 `stop_loss_pct`）
+
+建仓以来亏损达到 `stop_loss_pct` 就卖。**调仓日也生效**：模型再看好也不留，
+调仓日把止损的票从当天选股里剔除、槽位让给下一名；监控日直接卖成现金。
+
+这个参数 2026-09-14 之前**从来没有接线**（yaml 里有、代码零引用），而文档一直写着
+"单票由 8% 止损管"。
+
+## 移动止盈
 
 ## 它管什么、不管什么
 
@@ -26,8 +36,9 @@ quant-trading 2026-08-04 在几乎相同的配置（k=3、每 10 日、行业中
 砍掉仍在跑的赢家。那边操作者看过之后为了"浮盈落袋"的纪律**知情保留**。
 
 **本项目 A股上的结论也是不开**（2026-09-14，`scripts/29_trailing_gate.py`）：
-388 日窗口上 10/10 八项全过、年化 +8.5 点，但 630 日窗口上两组候选都没过，
-10/10 年化 −3.7 点、四个子区间全部跑输。短窗口那次是运气。详见 `config.py`。
+10/10 在两个窗口上收益都为正（+11.1 / +13.7 点），但 630 日窗口上回撤变差 2.4 点、
+候选站在尖峰上，没过闸。详见 `config.py`。（当天早些时候的一版数字来自有复利 bug 的
+引擎，已替换。）
 
 ## 峰值只在每次运行时采样
 
@@ -103,13 +114,14 @@ def update_peaks(positions: list[dict], peaks: dict[str, float]) -> dict[str, fl
 
 
 @dataclass(frozen=True)
-class TrailingHit:
+class ExitHit:
     code: str
     name: str
     cost: float
     peak: float
     last: float
     sellable_qty: int
+    kind: str = "trailing"          # "stop_loss" | "trailing"
 
     @property
     def peak_gain(self) -> float:
@@ -124,14 +136,51 @@ class TrailingHit:
         return 1.0 - self.last / self.peak
 
     def reason(self) -> str:
+        if self.kind == "stop_loss":
+            return f"止损：建仓以来 {self.pnl:+.1%}"
         return (f"移动止盈：峰值浮盈 {self.peak_gain:+.1%}，现 {self.pnl:+.1%}，"
                 f"从峰值回撤 {self.drawdown:.1%}")
 
     def as_dict(self) -> dict:
-        return {"code": self.code, "name": self.name, "cost": self.cost,
+        return {"code": self.code, "name": self.name, "kind": self.kind, "cost": self.cost,
                 "peak": self.peak, "last": self.last, "sellable_qty": self.sellable_qty,
                 "peak_gain": round(self.peak_gain, 4), "pnl": round(self.pnl, 4),
                 "drawdown": round(self.drawdown, 4), "reason": self.reason()}
+
+
+# 旧名字。移动止盈最先写，测试和调用方里还在用。
+TrailingHit = ExitHit
+
+
+def stop_loss_hits(positions: list[dict], stop_pct: float) -> list[ExitHit]:
+    """哪些持仓亏损到了止损线。`stop_pct` ≤ 0 = 关闭。
+
+    按**成本价**算，不按峰值：止损问的是"这笔买卖亏了多少"，不是"从高点回吐了多少"
+    —— 后者是移动止盈的事。一只先涨 30% 再跌回成本的票，止损不管，止盈管。
+    """
+    if stop_pct <= 0:
+        return []
+    hits = []
+    for p in positions:
+        code = p.get("code")
+        cost = float(p.get("cost_price", 0.0) or 0.0)
+        last = float(p.get("last_price", 0.0) or 0.0)
+        if not code or int(p.get("qty", 0) or 0) <= 0 or cost <= 0 or last <= 0:
+            continue
+        if last / cost - 1.0 <= -stop_pct:
+            hits.append(ExitHit(code=code, name=str(p.get("name", "")), cost=cost,
+                                peak=max(cost, last), last=last, kind="stop_loss",
+                                sellable_qty=int(p.get("sellable_qty", 0) or 0)))
+    return hits
+
+
+def forced_exits(positions: list[dict], peaks: dict[str, float], stop_pct: float,
+                 arm_pct: float, trail_pct: float) -> list[ExitHit]:
+    """止损 ∪ 移动止盈，同一只票只出现一次、**止损优先**（理由写得更直接）。"""
+    stops = stop_loss_hits(positions, stop_pct)
+    stopped = {hit.code for hit in stops}
+    return stops + [hit for hit in triggered(positions, peaks, arm_pct, trail_pct)
+                    if hit.code not in stopped]
 
 
 def triggered(positions: list[dict], peaks: dict[str, float],
@@ -163,7 +212,7 @@ def triggered(positions: list[dict], peaks: dict[str, float],
 
 
 def watchlist(positions: list[dict], peaks: dict[str, float],
-              arm_pct: float, trail_pct: float) -> list[dict]:
+              arm_pct: float, trail_pct: float, stop_pct: float = 0.0) -> list[dict]:
     """每只持仓离触发还差多少。
 
     移动止盈绝大多数日子什么都不做。没有这张表，日报在那些日子里只能写
@@ -175,14 +224,22 @@ def watchlist(positions: list[dict], peaks: dict[str, float],
         code = p.get("code")
         cost = float(p.get("cost_price", 0.0) or 0.0)
         last = float(p.get("last_price", 0.0) or 0.0)
+        # 只开了止损、没开止盈时不维护峰值库，峰值退回 max(成本, 现价)。
         peak = float(peaks.get(code, 0.0) or 0.0) if code else 0.0
-        if not code or int(p.get("qty", 0) or 0) <= 0 or cost <= 0 or last <= 0 or peak <= 0:
+        peak = peak if peak > 0 else max(cost, last)
+        if not code or int(p.get("qty", 0) or 0) <= 0 or cost <= 0 or last <= 0:
             continue
         peak_gain = peak / cost - 1.0
         drawdown = 1.0 - last / peak
         row = {"code": code, "name": str(p.get("name", "")), "cost": cost, "peak": peak,
                "last": last, "peak_gain": round(peak_gain, 4), "drawdown": round(drawdown, 4),
-               "armed": peak_gain >= arm_pct}
+               "pnl": round(last / cost - 1.0, 4),
+               "armed": arm_pct > 0 and trail_pct > 0 and peak_gain >= arm_pct}
+        if stop_pct > 0:
+            stop_price = cost * (1.0 - stop_pct)
+            row["stop_price"] = round(stop_price, 3)
+            row["to_stop"] = round(stop_price / last - 1.0, 4)            # 负 = 还要再跌这么多
+            row["stopped"] = last / cost - 1.0 <= -stop_pct
         if row["armed"]:
             trigger_price = peak * (1.0 - trail_pct)
             row["trigger_price"] = round(trigger_price, 3)

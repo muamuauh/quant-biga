@@ -1,34 +1,30 @@
-"""移动止盈的八项闸：现行配置（不止盈）vs 加上 arm/trail。
+"""退出规则的八项闸：止损 / 移动止盈 / 现金触发提前调仓。
 
-## 为什么要单独过闸，而不是照搬兄弟仓库的参数
+## 基线和候选
 
-quant-trading 2026-08-04 在几乎相同的配置（k=3、每 10 日、行业中性）上回测，
-部署档 arm15/trail5 **夏普 1.65→1.55、年化 −5.6 点、回撤反而恶化**；"不变差"的
-档位全是零触发。结论是它对动量型 top-K 会砍掉仍在跑的赢家。
+基线 = 现行配置原样：`QBG_REBALANCE_EVERY_DAYS` / `QBG_TOP_K` / `QBG_KEEP_RANK`，
+20bp 滑点，**不止损、不止盈**，现金触发阈值取 `QBG_REBALANCE_CASH_TRIGGER`
+（2026-09-14 之前引擎完全不模拟现金触发，所以此前所有回测里它等于关着）。
+候选 = 同样的配置加上命令行给的规则。两边共用同一份预测、股票池、引擎。
 
-但那是美股，50 只大盘股。A股有 T+1、涨跌停（跌停开盘卖不出）、更高的散户换手，
-截面结构不一样。**所以同一个机制在这里要重新量，不能照搬结论，也不能照搬参数。**
+## 两件必须一起看的事
 
-## 这道闸比的是什么
+**相位平均**（`qbg.backtest.phases`）：每 10 日调仓的相位极差实测 77~86 个百分点。
 
-基线 = 现行配置原样（`QBG_REBALANCE_EVERY_DAYS` / `QBG_TOP_K` / `QBG_KEEP_RANK`，
-20bp 滑点，**不止盈**）。候选 = 同样的配置加上 arm/trail。两边共用同一份预测、
-同一个股票池、同一个引擎，只差止盈参数。
+**跑两个窗口**（`--experiment cn_lgb_mid`）：移动止盈在 388 日窗口上 16 组参数全部变好，
+在 630 日窗口上两组候选全翻。**只跑一个窗口的结论不能用。**
 
-**必须相位平均**（见 `qbg.backtest.phases`）：每 10 日调仓的相位极差实测 77~86 个
-百分点年化，只跑一个相位比的是运气。
+**执行次数必须和收益一起看**：每相位触发 0 次的"不变差"是什么都没做。
 
-**触发次数必须和收益一起看。** 每相位触发 0 次的"不变差"，是什么都没做，不是变好了。
+## 历史
 
-## 高原闸的邻居
-
-默认取 arm × {2/3, 3/2} 和 trail ± 2 个百分点四个点。两个参数都连续，
-候选应该站在平台上，不是一根尖峰。
+2026-09-14 首版只评估移动止盈，结论是不开（见 config.py）。同一天发现引擎在多日持仓时
+权重没有按组合收益归一化（连涨两个 10% 算成 +22.10%），修掉之后重跑。
 
 用法：
+    python scripts/29_trailing_gate.py --stop 0.08
+    python scripts/29_trailing_gate.py --stop 0.08 --cash-trigger 0.3 --experiment cn_lgb_mid
     python scripts/29_trailing_gate.py --arm 0.10 --trail 0.10
-    python scripts/29_trailing_gate.py --arm 0.10 --trail 0.10 --experiment cn_lgb_mid
-    python scripts/29_trailing_gate.py --arm 0.15 --trail 0.05 --neighbors 0.10:0.05,0.20:0.05
 """
 
 from __future__ import annotations
@@ -54,19 +50,41 @@ SUBPERIODS = 4
 HIGH_COST_MULT = 1.75
 
 
-def _neighbors(arm: float, trail: float, raw: str) -> list[tuple[float, float]]:
-    if raw.strip():
-        return [(float(a), float(t)) for a, t in
-                (item.split(":") for item in raw.split(",") if item.strip())]
-    return [(round(arm * 2 / 3, 4), trail), (round(arm * 1.5, 4), trail),
-            (arm, round(max(0.01, trail - 0.02), 4)), (arm, round(trail + 0.02, 4))]
+def _neighbors(rule: dict, base_cash: float) -> list[dict]:
+    """高原闸的邻居：每个打开了的参数往两边各挪一步。"""
+    out = []
+    if rule["stop"] > 0:
+        out += [rule | {"stop": round(max(0.01, rule["stop"] - 0.03), 4)},
+                rule | {"stop": round(rule["stop"] + 0.03, 4)}]
+    if rule["arm"] > 0 and rule["trail"] > 0:
+        out += [rule | {"arm": round(rule["arm"] * 2 / 3, 4)},
+                rule | {"arm": round(rule["arm"] * 1.5, 4)},
+                rule | {"trail": round(max(0.01, rule["trail"] - 0.02), 4)},
+                rule | {"trail": round(rule["trail"] + 0.02, 4)}]
+    if rule["cash"] != base_cash and rule["cash"] > 0:
+        out += [rule | {"cash": round(max(0.05, rule["cash"] - 0.1), 4)},
+                rule | {"cash": round(min(0.95, rule["cash"] + 0.1), 4)}]
+    return out
+
+
+def _label(rule: dict) -> str:
+    parts = []
+    if rule["stop"] > 0:
+        parts.append(f"止损 {rule['stop']:.0%}")
+    if rule["arm"] > 0 and rule["trail"] > 0:
+        parts.append(f"止盈 {rule['arm']:.0%}/{rule['trail']:.0%}")
+    parts.append(f"现金触发 {rule['cash']:.0%}" if rule["cash"] > 0 else "现金触发关")
+    return " · ".join(parts)
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="移动止盈的八项闸")
-    parser.add_argument("--arm", type=float, required=True, help="上膛线，如 0.10")
-    parser.add_argument("--trail", type=float, required=True, help="从峰值回撤，如 0.10")
-    parser.add_argument("--neighbors", default="", help="高原邻居 arm:trail,arm:trail")
+    parser = argparse.ArgumentParser(description="退出规则的八项闸")
+    parser.add_argument("--stop", type=float, default=0.0, help="止损线，如 0.08")
+    parser.add_argument("--arm", type=float, default=0.0, help="移动止盈上膛线，如 0.10")
+    parser.add_argument("--trail", type=float, default=0.0, help="移动止盈回撤，如 0.10")
+    parser.add_argument("--cash-trigger", type=float,
+                        default=settings.qbg_rebalance_cash_trigger,
+                        help="候选的现金触发阈值。默认 = 现行配置")
     parser.add_argument("--experiment", default=None,
                         help="读哪个 MLflow 实验的预测。cn_lgb_mid 的测试段比生产长 65%%")
     parser.add_argument("--k", type=int, default=settings.qbg_top_k)
@@ -87,17 +105,24 @@ def main(argv=None) -> int:
     if settings.qbg_market_sma:
         print("⚠ 择时开着，但这道闸没有叠择时信号 —— 结论只对不择时的配置有效。")
 
-    def run(arm: float, trail: float, profile=None) -> phases.PhaseResult:
+    base_cash = float(settings.qbg_rebalance_cash_trigger)
+    baseline_rule = {"stop": 0.0, "arm": 0.0, "trail": 0.0, "cash": base_cash}
+    candidate_rule = {"stop": args.stop, "arm": args.arm, "trail": args.trail,
+                      "cash": args.cash_trigger}
+
+    def run(rule: dict, profile=None) -> phases.PhaseResult:
         return phases.run_phases(scores, panel, rebalance_every=args.every, k=args.k,
                                  keep_rank=args.keep_rank, extra_slippage=args.slippage,
-                                 fee_profile=profile, trail_arm=arm, trail_pct=trail)
+                                 fee_profile=profile, trail_arm=rule["arm"],
+                                 trail_pct=rule["trail"], stop_loss=rule["stop"],
+                                 cash_trigger=rule["cash"])
 
     print(f"{args.experiment or 'cn_lgb（生产）'}  {panel.dates[0].date()} ~ "
           f"{panel.dates[-1].date()}（{len(panel.dates)} 日）  k={args.k}  "
           f"每 {args.every} 日  keep_rank={args.keep_rank}  滑点 {args.slippage * 1e4:.0f}bp")
-    print(f"基线 = 不止盈    候选 = arm {args.arm:.0%} / trail {args.trail:.0%}\n")
+    print(f"基线 = {_label(baseline_rule)}（现行配置）\n候选 = {_label(candidate_rule)}\n")
 
-    base, cand = run(0.0, 0.0), run(args.arm, args.trail)
+    base, cand = run(baseline_rule), run(candidate_rule)
     baseline, candidate = base.facts(), cand.facts()
     print(f"{'指标':<16}{'基线':>12}{'候选':>12}{'差':>12}")
     print("-" * 52)
@@ -106,8 +131,12 @@ def main(argv=None) -> int:
                      ("rank_ic", "{:+.4f}")):
         b, c = baseline[key], candidate[key]
         print(f"{key:<16}{fmt.format(b):>12}{fmt.format(c):>12}{fmt.format(c - b):>12}")
-    print(f"{'止盈触发/相位':<14}{base.trailing_exits:>12.1f}{cand.trailing_exits:>12.1f}")
-    if cand.trailing_exits < 1:
+    stop_exits = lambda res: res._mean(lambda r: r.stop_exits)  # noqa: E731
+    cash_rebs = lambda res: res._mean(lambda r: r.cash_rebalances)  # noqa: E731
+    print(f"{'止损执行/相位':<14}{stop_exits(base):>12.1f}{stop_exits(cand):>12.1f}")
+    print(f"{'止盈执行/相位':<14}{base.trailing_exits:>12.1f}{cand.trailing_exits:>12.1f}")
+    print(f"{'现金提前调仓/相位':<12}{cash_rebs(base):>12.1f}{cash_rebs(cand):>12.1f}")
+    if stop_exits(cand) + cand.trailing_exits < 1:
         print("  ⚠ 候选几乎不触发 —— 就算指标没变差，也只是什么都没做。")
     print(f"相位极差（年化） 基线 {base.phase_spread:+.1%}  候选 {cand.phase_spread:+.1%}")
 
@@ -117,7 +146,7 @@ def main(argv=None) -> int:
         commission_min=profile.commission_min * HIGH_COST_MULT,
         stamp_tax_rate=profile.stamp_tax_rate * HIGH_COST_MULT,
         transfer_fee_rate=profile.transfer_fee_rate * HIGH_COST_MULT)
-    high_cost = run(args.arm, args.trail, profile=high).facts()
+    high_cost = run(candidate_rule, profile=high).facts()
 
     base_sub, cand_sub = base.subperiod_annual(SUBPERIODS), cand.subperiod_annual(SUBPERIODS)
     excess = [c - b for b, c in zip(base_sub, cand_sub, strict=True)]
@@ -129,11 +158,10 @@ def main(argv=None) -> int:
 
     neighbor_sharpes = []
     print("\n相邻取值（高原闸）：")
-    for arm, trail in _neighbors(args.arm, args.trail, args.neighbors):
-        res = run(arm, trail)
+    for rule in _neighbors(candidate_rule, base_cash):
+        res = run(rule)
         neighbor_sharpes.append(res.sharpe)
-        print(f"  arm {arm:.1%} / trail {trail:.1%} → Sharpe {res.sharpe:.4f}"
-              f"  触发/相位 {res.trailing_exits:.1f}")
+        print(f"  {_label(rule):<32} → Sharpe {res.sharpe:.4f}")
 
     report = evaluate(baseline, candidate, subperiod_excess=excess,
                       neighbor_sharpes=neighbor_sharpes, high_cost=high_cost)
@@ -143,9 +171,9 @@ def main(argv=None) -> int:
     failed = [c.name for c in report.checks if not c.passed]
     print(f"\n结论：{'通过' if report.passed else '**未通过**'}")
     if report.passed:
-        print(f"  → 可以在 .env 设 QBG_TRAIL_ARM_PCT={args.arm} QBG_TRAIL_PCT={args.trail}")
+        print(f"  → 可以部署：{_label(candidate_rule)}")
     else:
-        print(f"  → 保持不止盈。未过：{'、'.join(failed)}")
+        print(f"  → 维持现行配置。未过：{'、'.join(failed)}")
     return 0
 
 

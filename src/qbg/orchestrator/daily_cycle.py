@@ -126,22 +126,31 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     # 和正常清单长得一模一样，不标出来没人会发现。
     result["portfolio"] = {"source": portfolio_source, "asof": asof, "degraded": degraded}
 
-    # --- 移动止盈：峰值每次运行都刷新（调仓日也刷），只在非调仓日强卖 ------
-    # 刷新必须在判调仓日**之前**：调仓日虽然不强卖，但峰值不刷就会过期 ——
-    # 一只调仓日创了新高的票，下一个监控日会拿一个偏低的旧峰值去算回撤。
+    # --- 强制退出：止损 + 移动止盈 ------------------------------------------
+    # 峰值每次运行都刷新（调仓日也刷），刷新必须在判调仓日**之前**：调仓日虽然
+    # 不强卖，但峰值不刷就会过期 —— 一只调仓日创了新高的票，下一个监控日会拿
+    # 一个偏低的旧峰值去算回撤。
     trail_arm = float(settings.qbg_trail_arm_pct)
     trail_pct = float(settings.qbg_trail_pct)
     trailing_on = trail_arm > 0 and trail_pct > 0
+    stop_pct = float(limits.get("stop_loss_pct", 0.0) or 0.0)
+    stop_on = stop_pct > 0
+    # 降级时不判止损也不刷峰值：成本价/现价可能过期，而落到默认账户时持仓是空的，
+    # update_peaks 会把整个峰值库清空。
+    exits_trusted = degraded is None and portfolio_source != "default"
     peaks: dict[str, float] = {}
-    result["trailing"] = {"enabled": trailing_on, "arm_pct": trail_arm, "trail_pct": trail_pct,
-                          "hits": [], "orders": [], "skipped": [], "refused": None}
-    # 降级时**不刷新也不保存**：落到默认账户时持仓是空的，update_peaks 会把
-    # 整个峰值库清空；那之后恢复正常，所有持仓的峰值都得从现价重新起算。
-    if trailing_on and degraded is None and portfolio_source != "default":
-        peaks = trailing.update_peaks(positions, trailing.load_peaks())
-        if not dry_run:
-            trailing.save_peaks(peaks)
-        result["trailing"]["watch"] = trailing.watchlist(positions, peaks, trail_arm, trail_pct)
+    result["exits"] = {"stop_enabled": stop_on, "stop_pct": stop_pct,
+                       "trailing_enabled": trailing_on, "arm_pct": trail_arm,
+                       "trail_pct": trail_pct, "trusted": exits_trusted,
+                       "watch": [], "hits": [], "orders": [], "skipped": [],
+                       "refused": None, "excluded_on_rebalance": []}
+    if (trailing_on or stop_on) and exits_trusted:
+        if trailing_on:
+            peaks = trailing.update_peaks(positions, trailing.load_peaks())
+            if not dry_run:
+                trailing.save_peaks(peaks)
+        result["exits"]["watch"] = trailing.watchlist(positions, peaks, trail_arm,
+                                                      trail_pct, stop_pct)
 
     due = is_rebalance_day(settings.qbg_rebalance_every_days, today,
                            cash_fraction=cash / equity if equity else 0,
@@ -150,9 +159,9 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     if not due:
         result["skipped_reason"] = "not_rebalance_day"
         result["run_kind"] = "monitoring"
-        if trailing_on:
-            _run_trailing(result, positions, peaks, trail_arm, trail_pct, limits, today,
-                          dry_run, portfolio_source, degraded, cash, equity)
+        if trailing_on or stop_on:
+            _run_forced_exits(result, positions, peaks, stop_pct, trail_arm, trail_pct,
+                              limits, today, dry_run, portfolio_source, degraded, cash, equity)
         return _finish(result, dry_run)
 
     current = {p["code"]: int(p["qty"]) for p in positions}
@@ -206,7 +215,22 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         log_event(log, "cycle.review.source", source=review_source,
                   candidates=len(candidates), kept=len(kept))
     result["review_source"] = review_source
-    targets = topk_equal_weight(reviewed_scores, settings.qbg_top_k, 0.95, set(current),
+
+    # **调仓日也止损。** 模型再看好也不留：把止损的票从当天的选股里剔除（分数和
+    # 迟滞的"已持有"集合都去掉），槽位让给下一名；它本身目标变 0，规划器照常卖出。
+    # 和回测引擎的 stop_loss 同一套语义。移动止盈调仓日不强卖（交给选股）。
+    stopped_today: set[str] = set()
+    if stop_on and exits_trusted:
+        stop_hits = trailing.stop_loss_hits(positions, stop_pct)
+        stopped_today = {hit.code for hit in stop_hits}
+        if stopped_today:
+            reviewed_scores = reviewed_scores.drop(
+                index=[code for code in stopped_today if code in reviewed_scores.index])
+            result["exits"]["hits"] = [hit.as_dict() for hit in stop_hits]
+            result["exits"]["excluded_on_rebalance"] = sorted(stopped_today)
+            log_event(log, "cycle.stop_loss.excluded", codes=sorted(stopped_today))
+    targets = topk_equal_weight(reviewed_scores, settings.qbg_top_k, 0.95,
+                                set(current) - stopped_today,
                                 settings.qbg_keep_rank) if risk_on else {}
     targets = renormalize_weights(targets, 0.95, float(limits["max_position_pct"]))
     reference, limit_base, slippage, reference_source = _reference_prices(
@@ -342,11 +366,13 @@ def _rebalance_status(today: str, due: bool, cash: float, equity: float) -> dict
             "cash_trigger": trigger, "cash_triggered": by_cash}
 
 
-def _run_trailing(result: dict, positions: list[dict], peaks: dict, arm: float,
-                  trail: float, limits: dict, today: str, dry_run: bool,
-                  portfolio_source: str, degraded: dict | None,
-                  cash: float, equity: float) -> None:
-    """监控日的移动止盈：查触发 → 卖单 → 风控闸 → 下单。结果写进 `result["trailing"]`。
+def _run_forced_exits(result: dict, positions: list[dict], peaks: dict, stop_pct: float,
+                      arm: float, trail: float, limits: dict, today: str, dry_run: bool,
+                      portfolio_source: str, degraded: dict | None,
+                      cash: float, equity: float) -> None:
+    """监控日的强制退出（止损 + 移动止盈）：查触发 → 卖单 → 风控闸 → 下单。
+
+    结果写进 `result["exits"]`。
 
     **四条不许简化的地方：**
 
@@ -360,15 +386,20 @@ def _run_trailing(result: dict, positions: list[dict], peaks: dict, arm: float,
     4. **卖单按可卖量下。** `t1_guard` 失败时卖单照样放行，超出可卖量的部分会被
        券商 T+1 静默拒绝，所以在 `trailing.sell_orders` 里就地截断。
     """
-    info = result["trailing"]
-    hits = trailing.triggered(positions, peaks, arm, trail)
-    info["hits"] = [hit.as_dict() for hit in hits]
-    log_event(log, "cycle.trailing.checked", held=len(positions), hits=len(hits))
-    if not hits:
-        return
+    info = result["exits"]
     if degraded is not None or portfolio_source == "default":
-        info["refused"] = "持仓来自降级数据源 —— 不按可能过期的持仓强卖"
-        log_event(log, "cycle.trailing.refused", reason=info["refused"])
+        # 先判降级再算触发：降级持仓的成本价/现价不可信，算出来的"触发"本身就不可信。
+        hits = trailing.forced_exits(positions, peaks, stop_pct, arm, trail)
+        if hits:
+            info["hits"] = [hit.as_dict() for hit in hits]
+            info["refused"] = "持仓来自降级数据源 —— 不按可能过期的持仓强卖"
+            log_event(log, "cycle.exits.refused", reason=info["refused"], hits=len(hits))
+        return
+    hits = trailing.forced_exits(positions, peaks, stop_pct, arm, trail)
+    info["hits"] = [hit.as_dict() for hit in hits]
+    log_event(log, "cycle.exits.checked", held=len(positions), hits=len(hits),
+              stops=sum(hit.kind == "stop_loss" for hit in hits))
+    if not hits:
         return
 
     codes = {hit.code for hit in hits}
@@ -414,7 +445,7 @@ def _run_trailing(result: dict, positions: list[dict], peaks: dict, arm: float,
         else:
             result.update(_submit_to_broker(allowed, today, gate_results))
     save_marker(list(execution.artifacts), today)
-    log_event(log, "cycle.trailing.submitted", orders=len(allowed))
+    log_event(log, "cycle.exits.submitted", orders=len(allowed))
 
 
 def broker_refusal(portfolio_source: str, degraded: dict | None) -> str | None:

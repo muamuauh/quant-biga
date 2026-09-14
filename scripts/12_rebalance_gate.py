@@ -58,6 +58,9 @@ def main(argv=None) -> int:
                              "默认会变成候选比候选，所以复核历史决定要显式传")
     parser.add_argument("--neighbors", default="", help="高原闸用的相邻取值，逗号分隔")
     parser.add_argument("--k", type=int, default=settings.qbg_top_k)
+    parser.add_argument("--experiment", default=None,
+                        help="读哪个 MLflow 实验的预测。cn_lgb_mid 的测试段比生产长 65%%。"
+                             "**评估任何参数都要跑两个窗口** —— 移动止盈就是短窗口全过、长窗口全翻")
     parser.add_argument("--keep-rank", type=int, default=settings.qbg_keep_rank,
                         help="迟滞。默认取生产值 —— 用 0 是在评估一个没在跑的配置")
     parser.add_argument("--slippage", type=float, default=0.0020,
@@ -74,7 +77,8 @@ def main(argv=None) -> int:
                  or sorted({max(1, candidate_every - 5), candidate_every + 5}))
 
     members = load_universe()
-    scores = predictions_to_frame(load_latest_predictions())
+    scores = predictions_to_frame(load_latest_predictions(args.experiment) if args.experiment
+                                  else load_latest_predictions())
     if settings.qbg_industry_neutral:
         scores = neutralize_frame(scores)
     panel = panel_mod.build_panel(members, start=str(scores.index.min().date()),

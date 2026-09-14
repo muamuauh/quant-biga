@@ -30,8 +30,8 @@ def _status(result: dict) -> str:
     # 监控日**如果移动止盈动了手**，状态必须由下单结果决定，不能停在"监控日"。
     # 否则一笔卖失败的止盈单，副标题和邮件主题都会写成风平浪静的"监控日" ——
     # 和 2026-08-25 "报喜不报忧"是同一个毛病。
-    trailing_acted = bool((result.get("trailing") or {}).get("orders"))
-    if skipped and not (skipped == "not_rebalance_day" and trailing_acted):
+    exits_acted = bool((result.get("exits") or {}).get("orders"))
+    if skipped and not (skipped == "not_rebalance_day" and exits_acted):
         return labels.get(str(skipped), str(skipped))
     if not result.get("hard_ok", True):
         return "⚠ 硬闸中止"
@@ -101,19 +101,19 @@ def _headline(result: dict) -> str:
     review_text = review.get("summary") or review.get("error")
 
     skipped = result.get("skipped_reason")
-    trailing_info = result.get("trailing") or {}
-    if skipped == "not_rebalance_day" and trailing_info.get("orders"):
-        n = len(trailing_info["orders"])
-        base = (f"今日为监控日：移动止盈触发，生成 {n} 笔卖单。"
-                "不换股，也不重置调仓周期。")
+    exits = result.get("exits") or {}
+    what = _exit_kinds(exits.get("hits") or [])
+    if skipped == "not_rebalance_day" and exits.get("orders"):
+        n = len(exits["orders"])
+        base = f"今日为监控日：{what}触发，生成 {n} 笔卖单。不换股，也不重置调仓周期。"
         if not result.get("hard_ok", True):
-            base = f"今日为监控日：移动止盈触发 {n} 笔，但硬风控闸未通过，**没有卖出**。"
-    elif skipped == "not_rebalance_day" and trailing_info.get("refused"):
-        base = f"今日为监控日：移动止盈触发，但未下单 —— {trailing_info['refused']}。"
+            base = f"今日为监控日：{what}触发 {n} 笔，但硬风控闸未通过，**没有卖出**。"
+    elif skipped == "not_rebalance_day" and exits.get("refused"):
+        base = f"今日为监控日：{what}触发，但未下单 —— {exits['refused']}。"
     elif skipped == "not_rebalance_day":
         base = "今日为监控日：已更新账户与持仓事实，不生成新的调仓订单。"
-        if trailing_info.get("enabled"):
-            base += "移动止盈无持仓触发。"
+        if exits.get("stop_enabled") or exits.get("trailing_enabled"):
+            base += "止损与移动止盈均无持仓触发。"
     elif skipped == "not_trading_session":
         # 这不是故障。自动下单要求在盘中，盘前/盘后触发就安静跳过 ——
         # 说清楚它是**预期行为**，否则每次登录都收到一封像出事了的邮件。
@@ -411,48 +411,84 @@ def _rebalance_section(result: dict) -> list[str]:
     return lines
 
 
-def _trailing_section(result: dict) -> list[str]:
-    """移动止盈：参数、每只持仓离触发多远、今天动没动手。"""
-    info = result.get("trailing") or {}
+def _exit_kinds(hits: list[dict]) -> str:
+    kinds = {h.get("kind") for h in hits}
+    if kinds == {"stop_loss"}:
+        return "止损"
+    if kinds == {"trailing"}:
+        return "移动止盈"
+    return "止损 / 移动止盈"
+
+
+def _exits_section(result: dict) -> list[str]:
+    """止损与移动止盈：参数、每只持仓离两条线各多远、今天动没动手。"""
+    info = result.get("exits") or {}
     if not info:
         return []
-    if not info.get("enabled"):
-        return ["## 移动止盈", "",
-                "未启用（`QBG_TRAIL_ARM_PCT` / `QBG_TRAIL_PCT` 为 0）。", ""]
-
+    stop_on, trail_on = bool(info.get("stop_enabled")), bool(info.get("trailing_enabled"))
+    lines = ["## 止损与移动止盈", ""]
+    stop = float(info.get("stop_pct") or 0)
     arm, trail = float(info.get("arm_pct") or 0), float(info.get("trail_pct") or 0)
-    lines = ["## 移动止盈", "",
-             f"浮盈峰值达到 **+{arm:.0%}** 上膛，之后从峰值回撤 **{trail:.0%}** "
-             "整仓卖出。**只在监控日执行** —— 调仓日交给模型选股，不砍模型仍看好的票。", ""]
+    lines.append(f"- **止损**：建仓以来亏损达到 **{stop:.0%}** 就卖；**调仓日也生效**，"
+                 "槽位当天让给下一名。" if stop_on else
+                 "- **止损**：未启用（`risk_limits.yaml` 的 `stop_loss_pct` 为 0）。")
+    lines.append(f"- **移动止盈**：浮盈峰值达到 **+{arm:.0%}** 上膛，从峰值回撤 **{trail:.0%}** "
+                 "卖出；**只在监控日执行**。" if trail_on else
+                 "- **移动止盈**：未启用（`QBG_TRAIL_ARM_PCT` / `QBG_TRAIL_PCT` 为 0）。"
+                 "八项闸结论是不开，见 `config.py`。")
+    lines.append("")
+    if not (stop_on or trail_on):
+        return lines
 
     watch = info.get("watch") or []
     if watch:
-        lines += ["|代码|名称|成本|峰值|现价|峰值浮盈|从峰值回撤|状态|",
-                  "|---|---|---:|---:|---:|---:|---:|---|"]
-        # 离触发最近的排最前：已触发 > 已上膛（按还差多少） > 未上膛（按还差多少）。
-        # 取绝对值 —— to_trigger 是负数（还要跌多少），直接升序会把最远的排前面。
+        lines += ["|代码|名称|成本|现价|浮盈|止损|移动止盈|",
+                  "|---|---|---:|---:|---:|---|---|"]
+
+        # 离任一条线最近的排最前。to_* 都是"还要再动多少"，取绝对值比较。
         def _closeness(r):
-            return (not r.get("fired"), not r.get("armed"),
-                    abs(float(r.get("to_trigger", r.get("to_arm", 0)) or 0)))
+            gaps = []
+            if stop_on and "to_stop" in r:
+                gaps.append(0.0 if r.get("stopped") else abs(float(r["to_stop"])))
+            if trail_on:
+                if r.get("fired"):
+                    gaps.append(0.0)
+                elif r.get("armed"):
+                    gaps.append(abs(float(r["to_trigger"])))
+            return min(gaps) if gaps else 9.0
 
         for row in sorted(watch, key=_closeness):
-            if row.get("fired"):
-                state = "🔔 **触发**"
-            elif row.get("armed"):
-                state = f"已上膛，再跌 {abs(float(row['to_trigger'])):.1%} 触发（{row['trigger_price']}）"
+            if not stop_on:
+                stop_state = "—"
+            elif row.get("stopped"):
+                stop_state = "🔔 **触发**"
             else:
-                state = f"未上膛，再涨 {float(row['to_arm']):.1%} 上膛（{row['arm_price']}）"
+                stop_state = f"再跌 {abs(float(row['to_stop'])):.1%}（{row['stop_price']}）"
+            if not trail_on:
+                trail_state = "—"
+            elif row.get("fired"):
+                trail_state = "🔔 **触发**"
+            elif row.get("armed"):
+                trail_state = (f"已上膛，再跌 {abs(float(row['to_trigger'])):.1%} "
+                               f"（{row['trigger_price']}）")
+            else:
+                trail_state = f"未上膛，再涨 {float(row['to_arm']):.1%}"
             lines.append(
                 f"|{_cell(row['code'])}|{_cell(row.get('name'))}|{_number(row['cost'], 3)}|"
-                f"{_number(row['peak'], 3)}|{_number(row['last'], 3)}|"
-                f"{float(row['peak_gain']):+.1%}|{float(row['drawdown']):.1%}|{state}|")
+                f"{_number(row['last'], 3)}|{float(row.get('pnl', 0)):+.1%}|"
+                f"{stop_state}|{trail_state}|")
         lines.append("")
-    elif (result.get("portfolio") or {}).get("degraded"):
-        lines += ["> ⚠ 持仓来自降级数据源，本次**没有更新峰值**，也不会强卖。", ""]
+    elif not info.get("trusted", True):
+        lines += ["> ⚠ 持仓来自降级数据源，本次**不判止损、不更新峰值、不强卖**。", ""]
 
     rebalance = result.get("rebalance") or {}
     if rebalance.get("is_today"):
-        lines += ["今天是调仓日：移动止盈**不强卖**，峰值照常更新。", ""]
+        excluded = info.get("excluded_on_rebalance") or []
+        if excluded:
+            lines += [f"今天是调仓日：**{'、'.join(excluded)}** 触发止损，已从选股里剔除、"
+                      "目标清零，槽位让给下一名。", ""]
+        if trail_on:
+            lines += ["移动止盈调仓日**不强卖**，峰值照常更新。", ""]
         return lines
 
     hits = info.get("hits") or []
@@ -460,13 +496,13 @@ def _trailing_section(result: dict) -> list[str]:
         lines += [f"> ⚠ 触发 {len(hits)} 只，但**没有下单**：{info['refused']}", ""]
     elif hits:
         orders = info.get("orders") or []
-        lines += [f"触发 **{len(hits)}** 只，生成 **{len(orders)}** 笔卖单"
+        lines += [f"{_exit_kinds(hits)}触发 **{len(hits)}** 只，生成 **{len(orders)}** 笔卖单"
                   "（明细见「订单意见」与「计划 vs 实际委托」）。", ""]
         for item in info.get("skipped") or []:
             lines.append(f"- {_cell(item.get('code'))} 未下单：{_cell(item.get('reason'))}")
         if info.get("skipped"):
             lines.append("")
-        lines += ["止盈卖出**不重置调仓周期**。卖出的钱闲置到下一个调仓日，"
+        lines += ["强制卖出**不重置调仓周期**。卖出的钱闲置到下一个调仓日，"
                   "除非现金占比超过阈值、触发提前调仓。", ""]
     return lines
 
@@ -628,7 +664,7 @@ def render(result: dict) -> str:
     # 择时段放在**这个 if 之外**：risk-off 时恰好没有 targets，
     # 放进去就正好在它最该出现的时候不出现。
     lines += _rebalance_section(result)
-    lines += _trailing_section(result)
+    lines += _exits_section(result)
     lines += _regime_section(result)
     if targets or verdicts:
         lines += ["## 量化选择与 TradingAgents 复核", "",
