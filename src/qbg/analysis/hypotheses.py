@@ -30,6 +30,24 @@ def open_hypothesis(topic: str, statement: str, discriminator: str, *, opened_da
     if not discriminator.strip():
         raise ValueError("必须给出 discriminator；无法证伪的信念不是假设")
     db = connect(path)
+    # **同一个主题只留一条未决假设。** 复盘 agent 每天独立跑一次，同一个现象会被
+    # 反复"发现"：2026-09-17 和 09-18 各开了一条"执行记录一致性"，内容一样、
+    # 都 open、观测次数都是 1 —— 看起来像两个独立证据，其实是同一件事记了两遍，
+    # 而且那件事本身还是误报。再多几天，未决列表就被同一条噪声灌满了。
+    #
+    # 命中就加一次观测、把最新一次的陈述覆盖上去，返回原来那条。
+    existing = db.execute(
+        "SELECT id,mode,opened_date,topic,statement,discriminator,status,n_observations "
+        "FROM hypotheses WHERE mode=? AND topic=? AND status='open' ORDER BY opened_date LIMIT 1",
+        (mode, topic)).fetchone()
+    if existing:
+        db.execute("UPDATE hypotheses SET n_observations=n_observations+1,statement=?,"
+                   "discriminator=? WHERE id=?",
+                   (statement.strip(), discriminator.strip(), existing[0]))
+        db.commit()
+        db.close()
+        return Hypothesis(existing[0], existing[1], existing[2], existing[3],
+                          statement.strip(), discriminator.strip())
     prefix = "HYP-" + opened_date.replace("-", "-")
     count = db.execute("SELECT COUNT(*) FROM hypotheses WHERE opened_date=?", (opened_date,)).fetchone()[0]
     item = Hypothesis(f"{prefix}-{count + 1:02d}", mode, opened_date, topic,

@@ -49,6 +49,48 @@ def _fetch_rows(db: sqlite3.Connection, sql: str, params: tuple = ()) -> list[di
     return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
 
+def _run_facts(db: sqlite3.Connection, key: tuple) -> list[dict]:
+    """当天的运行记录，**外加订单条数**。
+
+    `runs.submitted` 是个**布尔值**（"顾问清单已写盘"），不是订单条数。
+    直接把它塞给 LLM，它会读成"提交了 1 笔"：2026-09-16/17 那两天真实是
+    **0 目标 0 订单**，而 agent 连着两天报"submitted=1 但 executions 为空，
+    需人工核实"，还各开了一条同名假设。误报的根源是字段名，不是模型。
+
+    所以这里改名成 `advisory_sheet_written`，并把真实条数单列出来。
+    """
+    rows = _fetch_rows(
+        db,
+        "SELECT date,mode,started_ts,finished_ts,run_kind,skipped_reason,"
+        "market_risk_on,submitted,hard_ok,report_path "
+        "FROM runs WHERE date=? AND mode=?",
+        key,
+    )
+    counts = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(allowed),0) FROM executions WHERE date=? AND mode=?", key
+    ).fetchone()
+    for row in rows:
+        row["advisory_sheet_written"] = bool(row.pop("submitted"))
+        row["n_orders"] = int(counts[0])
+        row["n_orders_allowed"] = int(counts[1])
+        row["n_targets"] = db.execute(
+            "SELECT COUNT(*) FROM plans WHERE date=? AND mode=?", key).fetchone()[0]
+    return rows
+
+
+def _review_facts(db: sqlite3.Connection, key: tuple) -> dict:
+    """逐票复核的结论摘要。理由正文不进来（400~600 字/条，撑爆 prompt）。"""
+    rows = _fetch_rows(
+        db,
+        "SELECT code,rating,kept,error,source FROM verdicts WHERE date=? AND mode=? ORDER BY code",
+        key,
+    )
+    kept = sum(int(row["kept"]) for row in rows)
+    return {"candidates": len(rows), "kept": kept, "verdicts": rows,
+            "source": rows[0]["source"] if rows else None,
+            "blocked_all": bool(rows) and kept == 0}
+
+
 def collect_facts(review_date: str | None = None, *, mode: str = "ADVISORY",
                   path: Path | None = None) -> tuple[str, dict]:
     """从派生库收集最小充分事实；不调用 LLM，也不做因果推断。"""
@@ -82,13 +124,7 @@ def collect_facts(review_date: str | None = None, *, mode: str = "ADVISORY",
     with sqlite3.connect(db_path) as db:
         key = (when, mode.upper())
         facts.update(
-            run=_fetch_rows(
-                db,
-                "SELECT date,mode,started_ts,finished_ts,run_kind,skipped_reason,"
-                "market_risk_on,submitted,hard_ok,report_path "
-                "FROM runs WHERE date=? AND mode=?",
-                key,
-            ),
+            run=_run_facts(db, key),
             top_scores=_fetch_rows(
                 db,
                 "SELECT code,score,rank FROM scores WHERE date=? AND mode=? "
@@ -111,6 +147,9 @@ def collect_facts(review_date: str | None = None, *, mode: str = "ADVISORY",
             gates=_fetch_rows(
                 db, "SELECT name,passed,reason FROM gates WHERE date=? AND mode=? ORDER BY name", key
             ),
+            # 复核结论。**没有这一项，agent 就看不见"复核把候选全拦了"** ——
+            # 2026-09-15~17 连续三天 0/5、账户满仓现金，而它写的是"全部正常"。
+            review=_review_facts(db, key),
             open_hypotheses=_fetch_rows(
                 db,
                 "SELECT id,opened_date,topic,statement,discriminator,n_observations "

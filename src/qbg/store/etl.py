@@ -49,6 +49,14 @@ def _ingest_cycle(db: sqlite3.Connection, result: dict, run_date: str, mode: str
             run_date, mode, order["code"], order["side"], order["quantity"], order["price"],
             order.get("ref_price"), order.get("estimated_fee"),
             int((order["code"], order["side"]) in allowed), order.get("reason")))
+    # 复核结论。**rationale 不入库**：一条理由 400~600 字，进了派生库既撑大体积，
+    # 又会被复盘 agent 原样读进 prompt。要的是"拦了谁、什么评级"，不是长文。
+    db.execute("DELETE FROM verdicts WHERE date=? AND mode=?", (run_date, mode))
+    source = result.get("review_source")
+    for verdict in result.get("agent_verdicts", []):
+        db.execute("INSERT OR REPLACE INTO verdicts VALUES (?,?,?,?,?,?,?)", (
+            run_date, mode, verdict.get("code"), verdict.get("rating"),
+            int(bool(verdict.get("kept"))), verdict.get("error"), source))
     db.execute("DELETE FROM gates WHERE date=? AND mode=?", (run_date, mode))
     for gate in result.get("gates", []):
         db.execute("INSERT INTO gates VALUES (?,?,?,?,?)",
