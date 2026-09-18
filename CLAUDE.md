@@ -85,6 +85,30 @@ log_event(log, "ingest.fetch.ok", code="600519.SH", rows=1234)
 照样全绿，只是慢了几秒。这类问题最难发现的地方就在于它不报错。
 `tests/test_fuyao.py::test_the_offline_guard_actually_blocks` 钉住守卫本身。
 
+### 测试也不许写真相源
+
+同一个 conftest 还拦第二件事（2026-09-18 加）：**测试期间 `logs/qbg.jsonl`
+一个字节都不许动**。`backfill()` 逐行重放它来重建 `runs.db`，`ingest_event`
+把每条 `qbg.*` 事件写进 `events` 表，`cycle.completed` 更是直接重建
+runs/scores/plans/executions/verdicts —— 测试构造的假运行会变成真实历史。
+
+实测：加闸之前跑一次完整测试往真实日志追加 **218 行**，其中 3 行带真实格式的
+`date`。当时派生表侥幸干净，只因为没有测试产出 `cycle.completed`；**哪天有个
+测试跑完整的 `daily_cycle`，假数据就直接进 `runs`，而且没有任何报错。**
+
+两层，缺一不可：
+
+- `pytest_configure` 抢在收集之前配好 root handler 并置上 `_configured`，
+  让 `get_logger` 一律早退。**时机不能往后挪** —— 模块级的
+  `log = get_logger(__name__)` 在收集阶段就跑了，比任何 fixture 都早。
+- autouse 夹具拦 `logging.FileHandler` 指向真实路径的构造，兜住「测试自己把
+  `_configured` 重置」或「自己造 handler」。
+
+**不要改成重定向 `settings.log_dir`** —— `test_config.py::
+test_paths_are_under_project_root` 断言它在仓库内，改了那条会红。
+`tests/test_log_isolation.py` 钉住这两层（含「事件没被弄丢」：仍走标准流，
+测试失败时看得到）。
+
 ### 风控闸的两级语义不许简化
 
 `src/qbg/risk/gates.py`：
