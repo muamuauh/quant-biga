@@ -57,6 +57,8 @@ from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
 from qbg.tuning.gates import Check, GateReport  # noqa: E402
 
 EXT_EXPERIMENT = "cn_lgb_ext"
+from qbg.utils.console import make_output_safe  # noqa: E402
+
 EXT_PROVIDER = "cn_data_ext"
 
 # OOS 分段，和 scripts/23_oos_window.py 逐字相同。
@@ -141,6 +143,7 @@ def evaluate(members, frame, k, slippage, index_code):
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     p = argparse.ArgumentParser(description="扩股票池的八项闸")
     p.add_argument("--k", type=int, default=settings.qbg_top_k)
     p.add_argument("--seeds", type=int, default=None)

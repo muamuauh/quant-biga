@@ -34,6 +34,8 @@ from qbg.config import load_universe, settings  # noqa: E402
 from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
 
 _stress = __import__("07_regime_stress")
+from qbg.utils.console import make_output_safe  # noqa: E402
+
 switch_costs = _stress.switch_costs
 
 
@@ -76,6 +78,7 @@ def evaluate(start: str, capital: float, windows: list[int],
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     parser = argparse.ArgumentParser(description="择时窗口的区间反事实")
     parser.add_argument("--start", required=True, help="区间起点 YYYY-MM-DD")
     parser.add_argument("--capital", type=float, default=200_000.0)

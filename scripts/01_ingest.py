@@ -123,6 +123,7 @@ def ingest_bars(members: list[str], chain: SourceChain, args) -> dict:
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     args = parse_args(argv)
     chain = SourceChain()
 
@@ -197,3 +198,4 @@ def _print_report(meta_stats, bar_stats, filtered, qlib_result) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+from qbg.utils.console import make_output_safe  # noqa: E402

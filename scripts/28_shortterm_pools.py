@@ -68,6 +68,8 @@ import pandas as pd  # noqa: E402
 from qbg.config import settings  # noqa: E402
 
 BASE = "https://fuyao.aicubes.cn"
+from qbg.utils.console import make_output_safe  # noqa: E402
+
 # 北交所 + 老三板：开户门槛 50 万 + 2 年经验，本项目不交易。
 EXCLUDE_PREFIX = {"430", "400", "920"} | {f"8{n}" for n in range(30, 80)}
 WIDE_CAP_PREFIX = {"300", "301", "688", "689"}   # 创业板 / 科创板 ±20%
@@ -361,6 +363,7 @@ def report_dragon_tiger(df: pd.DataFrame, lhb: pd.DataFrame) -> None:
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     parser = argparse.ArgumentParser(description="短线：涨停/连板/龙虎榜")
     parser.add_argument("--work", default=None, help="放大文件的目录（默认系统临时目录）")
     parser.add_argument("--skip-lhb", action="store_true", help="不拉龙虎榜（省 240 次请求）")

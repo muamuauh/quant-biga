@@ -38,6 +38,8 @@ from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
 from qbg.tuning.gates import Check, GateReport  # noqa: E402
 
 SUBPERIODS = 4
+from qbg.utils.console import make_output_safe  # noqa: E402
+
 HIGH_COST_MULT = 1.75      # 八项闸要求 +75% 成本下仍为正
 # 每次 LLM 逐票复核的实测成本。只有调仓日才复核，所以这一项和调仓频率
 # 成正比 —— 而它不在回测里，得单独算出来摆在旁边。
@@ -51,6 +53,7 @@ TRADING_DAYS_PER_YEAR = 252        # 只用于 LLM 账单的"次/年"估算
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     parser = argparse.ArgumentParser(description="调仓间隔的八项闸评估")
     parser.add_argument("--candidate", type=int, required=True, help="候选调仓间隔")
     parser.add_argument("--baseline", type=int, default=None,
@@ -63,6 +66,17 @@ def main(argv=None) -> int:
                              "**评估任何参数都要跑两个窗口** —— 移动止盈就是短窗口全过、长窗口全翻")
     parser.add_argument("--keep-rank", type=int, default=settings.qbg_keep_rank,
                         help="迟滞。默认取生产值 —— 用 0 是在评估一个没在跑的配置")
+    # **压换手有两条路，它们不是一回事。** 拉长间隔要抽相位彩票（`every=n` 只在
+    # `index % n == phase` 那些天调仓，实测 k=3 每 10 日的相位极差 86 个百分点
+    # 年化），迟滞不用 —— 日频每天都调仓，压根没有"从哪天开始"这个自由度。
+    # 2026-09-20 在 bias20 上重跑 `15_turnover_sweep.py` 才看出来：日频+迟滞30
+    # 换手 0.116、净年化 +34.43%、相位极差 **0%**，比所有拉长间隔的格子都干净。
+    # 这道闸此前两条臂共用一个 keep_rank，所以「日频+高迟滞」那一格从没被比过。
+    parser.add_argument("--candidate-keep-rank", type=int, default=None,
+                        help="候选臂单独的迟滞。默认跟 --keep-rank 一致（即只比间隔）")
+    parser.add_argument("--neighbors-keep", default="",
+                        help="高原闸改在**迟滞**维度上量（逗号分隔）。变的是迟滞就用这个 —— "
+                             "拿间隔的邻居去证明一个迟滞候选站得稳，是答非所问")
     parser.add_argument("--slippage", type=float, default=0.0020,
                         help="单边额外滑点。默认 20bp，和项目的成本恒等式一致")
     args = parser.parse_args(argv)
@@ -73,6 +87,9 @@ def main(argv=None) -> int:
         print(f"⚠ 基线和候选都是每 {baseline_every} 日 —— 这是自己比自己，结论没有意义。"
               "复核历史决定请传 --baseline。")
     candidate_every = args.candidate
+    base_keep = args.keep_rank
+    cand_keep = args.candidate_keep_rank if args.candidate_keep_rank is not None else base_keep
+    keep_neighbors = [int(x) for x in args.neighbors_keep.split(",") if x.strip()]
     neighbors = ([int(x) for x in args.neighbors.split(",") if x.strip()]
                  or sorted({max(1, candidate_every - 5), candidate_every + 5}))
 
@@ -99,11 +116,13 @@ def main(argv=None) -> int:
 
     print(f"窗口 {panel.dates[0].date()} ~ {panel.dates[-1].date()}   "
           f"{len(panel.dates)} 个交易日   k={args.k}   择时={regime}")
-    print(f"基线 = 每 {baseline_every} 日调仓（现行配置）   "
-          f"候选 = 每 {candidate_every} 日   高原邻居 = {neighbors}\n")
+    print(f"基线 = 每 {baseline_every} 日调仓 + 迟滞 {base_keep}（现行配置）   "
+          f"候选 = 每 {candidate_every} 日 + 迟滞 {cand_keep}")
+    print(f"高原闸在{'迟滞' if keep_neighbors else '间隔'}维度上量："
+          f"{keep_neighbors or neighbors}\n")
 
-    def run(every, profile=None):
-        """跑一个调仓间隔。**三处此前漏掉的东西，每一处都单向偏向日频。**
+    def run(every, keep, profile=None):
+        """跑一个（调仓间隔, 迟滞）组合。**三处此前漏掉的东西，每一处都单向偏向日频。**
 
         1. **相位平均。** `every=5` 时相位 0 用第 0/5/10… 天、相位 1 用第
            1/6/11… 天，几乎不重叠。实测 k=3 每 5 日的相位极差是 **37 个百分点
@@ -117,12 +136,16 @@ def main(argv=None) -> int:
            成本恒等式是"买 2.6 + 卖 7.6 + **双边滑点 20**bp"。漏掉滑点 = 漏掉
            往返成本的三分之二，**而那正是拉长调仓间隔唯一能省下来的东西**。
            一道回答"少交易值不值"的闸，不能不算少交易省下的钱。
+
+        4. **两条臂的迟滞可以不同**（2026-09-20 加）。压换手有两条路，
+           此前只比过"拉长间隔"那一条 —— 见 `--candidate-keep-rank` 的注释。
         """
         return phases.run_phases(scores, panel, rebalance_every=every, k=args.k,
-                                 keep_rank=args.keep_rank, extra_slippage=args.slippage,
+                                 keep_rank=keep, extra_slippage=args.slippage,
                                  fee_profile=profile)
 
-    base_res, cand_res = run(baseline_every), run(candidate_every)
+    base_res = run(baseline_every, base_keep)
+    cand_res = run(candidate_every, cand_keep)
     baseline, candidate = base_res.facts(), cand_res.facts()
 
     profile = fees.FeeProfile.load()
@@ -131,10 +154,10 @@ def main(argv=None) -> int:
         commission_min=profile.commission_min * HIGH_COST_MULT,
         stamp_tax_rate=profile.stamp_tax_rate * HIGH_COST_MULT,
         transfer_fee_rate=profile.transfer_fee_rate * HIGH_COST_MULT)
-    high_cost = run(candidate_every, profile=high).facts()
+    high_cost = run(candidate_every, cand_keep, profile=high).facts()
 
-    print(f"{'指标':<16}{f'基线(每{baseline_every}日)':>16}"
-          f"{f'候选(每{candidate_every}日)':>16}{'差':>12}")
+    print(f"{'指标':<16}{f'基线({baseline_every}日/迟滞{base_keep})':>18}"
+          f"{f'候选({candidate_every}日/迟滞{cand_keep})':>18}{'差':>12}")
     print("-" * 62)
     for key, fmt in (("annual_return", "{:+.2%}"), ("sharpe", "{:.4f}"),
                      ("max_drawdown", "{:.2%}"), ("avg_turnover", "{:.4f}"),
@@ -168,10 +191,17 @@ def main(argv=None) -> int:
 
     neighbor_sharpes = []
     print("\n相邻取值（高原闸）：")
-    for every in neighbors:
-        sharpe = run(every).sharpe
-        neighbor_sharpes.append(sharpe)
-        print(f"  每 {every:>2} 日 → Sharpe {sharpe:.4f}")
+    if keep_neighbors:
+        # 变的是迟滞，邻居就得在迟滞上取 —— 间隔固定在候选值。
+        for keep in keep_neighbors:
+            sharpe = run(candidate_every, keep).sharpe
+            neighbor_sharpes.append(sharpe)
+            print(f"  每 {candidate_every} 日 + 迟滞 {keep:>2} → Sharpe {sharpe:.4f}")
+    else:
+        for every in neighbors:
+            sharpe = run(every, cand_keep).sharpe
+            neighbor_sharpes.append(sharpe)
+            print(f"  每 {every:>2} 日 → Sharpe {sharpe:.4f}")
 
     report = GateReport(tuple(
         _evaluate(baseline, candidate, excess, neighbor_sharpes, high_cost)))
@@ -180,8 +210,15 @@ def main(argv=None) -> int:
         print(f"  {'✅' if check.passed else '❌'} {check.name:<16} {check.detail}")
     failed = [c.name for c in report.checks if not c.passed]
     print(f"\n结论：{'通过' if not failed else '**未通过**'}")
-    print(f"  → {'可以把 QBG_REBALANCE_EVERY_DAYS 改成 ' + str(candidate_every)}"
-          if not failed else f"  → 维持每 {baseline_every} 日。未过：{'、'.join(failed)}")
+    if failed:
+        print(f"  → 维持每 {baseline_every} 日 + 迟滞 {base_keep}。未过：{'、'.join(failed)}")
+    else:
+        knobs = [f"QBG_REBALANCE_EVERY_DAYS={candidate_every}"]
+        if cand_keep != base_keep:
+            # 两个一起才是那条候选配置，只改一个等于跑一个从没被评估过的格子。
+            knobs.append(f"QBG_KEEP_RANK={cand_keep}")
+        print(f"  → 闸通过：{' 且 '.join(knobs)}"
+              + ("（**两个必须一起改**）" if len(knobs) > 1 else ""))
     return 0
 
 

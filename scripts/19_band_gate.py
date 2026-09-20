@@ -57,6 +57,8 @@ from qbg.tuning.gates import Check, GateReport  # noqa: E402
 switch_costs = import_module("07_regime_stress").switch_costs
 
 SUBPERIODS = 4
+from qbg.utils.console import make_output_safe  # noqa: E402
+
 HIGH_COST_MULT = 1.75
 SLIPPAGE_BP = 10.0          # 和 13/15/18 同一口径
 TRADING_DAYS_PER_YEAR = 252
@@ -101,6 +103,7 @@ def topk_arm(scores, pnl, level, sma, band, k) -> dict | None:
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     p = argparse.ArgumentParser(description="择时参数（缓冲带 / SMA）的八项闸")
     p.add_argument("--candidate", type=float, default=None, help="候选缓冲带，小数")
     p.add_argument("--candidate-sma", type=int, default=None, help="候选 SMA 窗口")

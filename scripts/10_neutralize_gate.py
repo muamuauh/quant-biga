@@ -41,6 +41,8 @@ from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
 from qbg.tuning.gates import Check, GateReport  # noqa: E402
 
 SUBPERIODS = 4          # 把测试段切成几块看稳定性
+from qbg.utils.console import make_output_safe  # noqa: E402
+
 HIGH_COST_MULT = 1.75   # 八项闸要求 +75% 成本下仍为正
 
 
@@ -57,6 +59,7 @@ def _annual(returns) -> float:
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     parser = argparse.ArgumentParser(description="QBG_INDUSTRY_NEUTRAL 的八项闸评估")
     parser.add_argument("--k", type=int, default=settings.qbg_top_k)
     parser.add_argument("--no-regime", action="store_true",

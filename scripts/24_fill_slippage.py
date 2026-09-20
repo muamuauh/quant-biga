@@ -80,6 +80,7 @@ def reference_opens(codes: list[str], day: str) -> dict[str, float]:
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     p = argparse.ArgumentParser(description="实测成交滑点")
     p.add_argument("--live", action="store_true", help="连同花顺读今日成交")
     p.add_argument("--date", default=date.today().isoformat(), help="参照开盘价取哪天")
@@ -145,3 +146,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+from qbg.utils.console import make_output_safe  # noqa: E402

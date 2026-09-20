@@ -52,6 +52,8 @@ from qbg.tuning.gates import Check, GateReport  # noqa: E402
 switch_costs = import_module("07_regime_stress").switch_costs
 
 SUBPERIODS = 4
+from qbg.utils.console import make_output_safe  # noqa: E402
+
 HIGH_COST_MULT = 1.75
 SLIPPAGE_BP = 10.0
 TRADING_DAYS_PER_YEAR = 252
@@ -84,6 +86,7 @@ def overlay(asset_returns, level, sma, band, slippage_bp) -> tuple[pd.Series, di
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     p = argparse.ArgumentParser(description="关掉市场择时的评估")
     p.add_argument("--k", type=int, default=settings.qbg_top_k)
     args = p.parse_args(argv)

@@ -55,6 +55,7 @@ def load_runs(log_path: Path) -> dict[str, dict]:
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     parser = argparse.ArgumentParser(description="从 JSONL 日志重渲染历史日报")
     parser.add_argument("--date", help="只重渲染这一天（YYYY-MM-DD）")
     parser.add_argument("--all", action="store_true", help="重渲染日志里的每一天")
@@ -105,3 +106,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+from qbg.utils.console import make_output_safe  # noqa: E402

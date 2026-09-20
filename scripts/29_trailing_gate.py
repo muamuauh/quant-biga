@@ -47,6 +47,8 @@ from qbg.strategy.predict import (  # noqa: E402
 from qbg.tuning.gates import evaluate  # noqa: E402
 
 SUBPERIODS = 4
+from qbg.utils.console import make_output_safe  # noqa: E402
+
 HIGH_COST_MULT = 1.75
 
 
@@ -78,6 +80,7 @@ def _label(rule: dict) -> str:
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     parser = argparse.ArgumentParser(description="退出规则的八项闸")
     parser.add_argument("--stop", type=float, default=0.0, help="止损线，如 0.08")
     parser.add_argument("--arm", type=float, default=0.0, help="移动止盈上膛线，如 0.10")

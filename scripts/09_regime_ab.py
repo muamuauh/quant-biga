@@ -38,6 +38,7 @@ from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
 
 
 def main(argv=None) -> int:
+    make_output_safe()
     parser = argparse.ArgumentParser(description="择时开/关在真实 top-K 策略上的 A/B")
     parser.add_argument("--k", type=int, default=settings.qbg_top_k)
     parser.add_argument("--windows", default="0,20,50,100,200",
@@ -91,3 +92,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+from qbg.utils.console import make_output_safe  # noqa: E402
