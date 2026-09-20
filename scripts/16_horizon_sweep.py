@@ -43,8 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import yaml  # noqa: E402
 
-from qbg.backtest import engine  # noqa: E402
 from qbg.backtest import panel as panel_mod  # noqa: E402
+from qbg.backtest import phases  # noqa: E402
 from qbg.config import load_universe, settings  # noqa: E402
 from qbg.model import train as train_mod  # noqa: E402
 from qbg.strategy.predict import (  # noqa: E402
@@ -135,22 +135,32 @@ def main(argv=None) -> int:
         # **交叉跑是必须的**：只看匹配行分不清 h 日模型赢在"标签对了"还是
         # "换手低了" —— 要拿 1 日模型也做 h 日调仓才能把两者分开。
         for every in sorted(set(every_grid) | {h, 1}):
-            res = engine.run_backtest(
-                scores, pnl, k=args.k, rebalance_every=every,
-                keep_rank=args.keep_rank, extra_slippage=HEADLINE_SLIPPAGE,
-                slippage_grid=(0.0, HEADLINE_SLIPPAGE))
+            # **每个相位都要跑，再平均。** 这个脚本曾是四个实验脚本里唯一漏掉
+            # 相位的一个：`rebalance_every=n` 只在 `index % n == phase` 那些天调仓，
+            # 只跑相位 0 等于押注"从第 0 天开始"。2026-09-20 重跑时单相位报
+            # h=3 净年化 +146.76%、夏普 2.19，看着完胜 h=1；而 docs/experiments.md
+            # 早就记着 h=3 的三个相位是 **+1.98% / +39% / +144.65%** ——
+            # 那个 146.76% 就是最高的那一相。偏误是单向的：极差越大，单相位
+            # 越容易挑出一个看着很像真的赢家。
+            res = phases.run_phases(scores, pnl, rebalance_every=every, k=args.k,
+                                    keep_rank=args.keep_rank,
+                                    extra_slippage=HEADLINE_SLIPPAGE)
+            # 零滑点那列得单跑 —— PhaseResult 不透出 slippage_curve。
+            nofric = phases.run_phases(scores, pnl, rebalance_every=every, k=args.k,
+                                       keep_rank=args.keep_rank, extra_slippage=0.0)
             rows.append({
                 "h": h, "every": every, "matched": every == h,
-                "annual": res.strategy.annual_return,
-                "annual_nofric": res.slippage_curve[0.0].annual_return,
-                "sharpe": res.strategy.sharpe,
-                "mdd": res.strategy.max_drawdown,
+                "annual": res.annual_return,
+                "annual_nofric": nofric.annual_return,
+                "sharpe": res.sharpe,
+                "mdd": res.max_drawdown,
                 "turnover": res.avg_turnover,
                 "rank_ic": res.rank_ic,
+                "spread": res.phase_spread,
             })
-            bench = bench or res.benchmark
-            print(f"  h={h:<2} 持有={every:<2} → 净年化 {res.strategy.annual_return:+8.2%}",
-                  flush=True)
+            bench = bench or res.runs[0].benchmark
+            print(f"  h={h:<2} 持有={every:<2} → 净年化 {res.annual_return:+8.2%}"
+                  f"   相位极差 {res.phase_spread:6.2%}", flush=True)
 
     _report(rows, bench, pnl, args)
     return 0
@@ -165,14 +175,14 @@ def _report(rows, bench, pnl, args) -> None:
           f"夏普 {bench.sharpe:.2f}   回撤 {bench.max_drawdown:.2%}")
 
     print(f"\n{'标签':>6}{'持有':>6}{'':>4}{'净年化':>10}{'@0bp':>10}{'夏普':>8}"
-          f"{'回撤':>10}{'换手':>8}{'RankIC':>10}")
-    print("-" * 74)
+          f"{'回撤':>10}{'换手':>8}{'RankIC':>10}{'相位极差':>11}")
+    print("-" * 85)
     for r in rows:
         mark = " ←匹配" if r["matched"] else "     "
         star = "*" if r["annual"] > bench.annual_return else " "
         print(f"{star}{r['h']:>5}日{r['every']:>5}日{mark}{r['annual']:>10.2%}"
               f"{r['annual_nofric']:>10.2%}{r['sharpe']:>8.2f}{r['mdd']:>10.2%}"
-              f"{r['turnover']:>8.3f}{r['rank_ic']:>+10.4f}")
+              f"{r['turnover']:>8.3f}{r['rank_ic']:>+10.4f}{r['spread']:>11.2%}")
 
     print("\n" + "-" * 92)
     print("怎么读")
@@ -186,6 +196,8 @@ def _report(rows, bench, pnl, args) -> None:
     print("    好处里，多少来自模型本身更准，多少只是来自少交易。")
     print("  · 若 h>1 的匹配行明显更好 → `12_rebalance_gate.py` 的「日频最优」")
     print("    结论要推翻，因为那次是拿 1 日模型去做低频调仓，信号和持有期错配。")
+    print("  · **相位极差那一列先看。** 它是最好相位和最差相位的年化之差；大到和")
+    print("    收益本身同量级时，这一行讲的主要是「从哪天开始调仓」，不是标签好坏。")
     print("  · 测试段只有约 1.5 年，且股票池是**当前**沪深300 成分（生存者偏差）。")
     print("    这里的绝对收益不可当预期，horizon 之间的相对比较才是结论。")
     print(f"\n实验模型写在 experiment `{EXPERIMENT_PREFIX}*`，**没有碰生产用的 "
