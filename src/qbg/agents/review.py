@@ -111,14 +111,19 @@ def review_candidates(candidate_weights: dict[str, float], trade_date: date | No
             rationale = state.get("final_trade_decision", "") if isinstance(state, dict) else ""
             passed = rating_rank(rating) <= cutoff
             verdicts.append(ReviewVerdict(code, rating, rationale, passed))
-            log_event(log, "agents.review.verdict", code=code, rating=rating, kept=passed)
+            # **date/mode 必须显式带上。** ETL 靠它们把结论写进 `verdicts` 表；
+            # 缺了就只能退回拿 `ts[:10]` 猜，而盘前 08:00（北京）正好是 UTC 零点
+             # 前后 —— 早跑十分钟日期就差一天。
+            log_event(log, "agents.review.verdict", code=code, rating=rating, kept=passed,
+                      date=trade_day, mode=settings.qbg_mode.upper())
             if passed:
                 kept[code] = weight
         except Exception as exc:  # noqa: BLE001
             verdicts.append(ReviewVerdict(code, "Error", "", fail_open, str(exc)))
             if fail_open:
                 kept[code] = weight
-            log_event(log, "agents.review.error", code=code, error=str(exc))
+            log_event(log, "agents.review.error", code=code, error=str(exc),
+                      kept=fail_open, date=trade_day, mode=settings.qbg_mode.upper())
     usage = tracker.summary()
     log_event(log, "agents.review.done", kept=list(kept),
               dropped=[verdict.code for verdict in verdicts if not verdict.kept],

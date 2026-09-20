@@ -774,11 +774,16 @@ def render(result: dict) -> str:
     mode = str(result.get("execution_mode") or result.get("mode") or "ADVISORY").upper()
     lines += ["## 建议与限制", "",
               "- 当前历史股票池有生存者偏差，回测收益不能视为未来预期。"]
+    # 但「模式会下单」不等于「这次下了单」。2026-09-20（周日）日流程跳过、0 笔订单，
+    # 日报照样写着"PAPER 模式已直接向券商下单" —— 上一版只看 mode 不看结果。
+    # 一份说自己下过单的空日报，比不说更坏。
     if mode == "ADVISORY":
         lines.append("- 顾问模式不接触券商；实际成交必须由次日持仓对账确认。")
-    else:
+    elif result.get("allowed_orders"):
         lines.append(f"- **{mode} 模式已直接向券商下单**；成交结果以「计划 vs 实际委托」"
                      "一节的合同编号为准，并由次日持仓复核。")
+    else:
+        lines.append(f"- {mode} 模式会直接向券商下单，但**本次没有订单**，未接触券商。")
     lines.append("")
     return "\n".join(lines)
 

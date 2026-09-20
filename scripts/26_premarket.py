@@ -54,6 +54,7 @@ import pandas as pd  # noqa: E402
 from qbg.agents.verdict_cache import save_verdicts  # noqa: E402
 from qbg.config import settings  # noqa: E402
 from qbg.data import cache as bar_cache  # noqa: E402
+from qbg.market import calendar  # noqa: E402
 from qbg.model.train import train  # noqa: E402
 from qbg.portfolio.source import load_portfolio  # noqa: E402
 from qbg.risk.gates import load_limits  # noqa: E402
@@ -88,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--retrain", action=argparse.BooleanOptionalAction, default=True,
                    help="滚动重训写入 cn_lgb_live（默认开；--no-retrain 关掉）")
     p.add_argument("--dry-run", action="store_true", help="只打印候选，不调 LLM")
+    p.add_argument("--force", action="store_true",
+                   help="非交易日也跑（手工用；周末想看候选就加这个）")
     p.add_argument("--equity", type=float, default=None,
                    help="覆盖总资产（可负担性过滤用）。默认走 load_portfolio 的降级链")
     return p
@@ -96,6 +99,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     today = args.date
+
+    # **交易日闸必须在任何副作用之前** —— 拉数、重训、复核全在后面。
+    #
+    # 2026-09-20（周日）实测：日流程正确跳过了（`daily_cycle` 第 69 行有这道闸），
+    # 但这个脚本一个都没有，于是照跑 36 分钟、123 万 tokens、**$1.69**，
+    # 复核结论写进缓存后**没有任何人读它** —— 当天日流程压根没跑到读缓存那步。
+    # 盘前任务 2026-09-10 才上线，这是它撞上的第一个周末。
+    # 按这个费率，每个周末 $3.4，国庆假期一周约 $12。
+    #
+    # 日历缓存为空时 `is_trading_day` 返回 False（见它的 docstring）。那种情况下
+    # 跳过是安全的一侧：**日流程读的是同一个日历**，它也会跳过，所以这里省下的
+    # 复核本来就不会有人用。
+    if not args.force and not calendar.is_trading_day(today):
+        print(f"{today} 不是交易日，跳过盘前复核（省约一小时和一笔 LLM 账单）。"
+              f"手工要跑加 --force。")
+        log_event(log, "premarket.skipped", reason="not_trading_day", date=today)
+        return 0
 
     if not args.skip_ingest:
         rc = subprocess.run([sys.executable, str(ROOT / "scripts" / "01_ingest.py"),
