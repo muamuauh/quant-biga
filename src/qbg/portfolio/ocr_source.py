@@ -96,6 +96,10 @@ def validate_payload(payload: dict, *, name_map: dict[str, str] | None = None,
         last = _number(raw.get("现价"), "现价", issues, code)
         value = _number(raw.get("市值"), "市值", issues, code)
         pnl = _number(raw.get("盈亏", 0), "盈亏", issues, code)
+        # 只有券商直读有这一列；OCR/CSV 没有就是 None（不知道），不是 0（平盘）。
+        raw_day = raw.get("当日盈亏")
+        day_pnl = (None if raw_day is None or str(raw_day).strip() == ""
+                   else _number(raw_day, "当日盈亏", issues, code))
         if qty <= 0 or sellable < 0 or sellable > qty:
             issues.append(ValidationIssue("股数", f"{code} 股数/可用股数不合理", code))
         if qty % rules.LOT_SIZE:
@@ -113,7 +117,7 @@ def validate_payload(payload: dict, *, name_map: dict[str, str] | None = None,
             low, high = rules.price_limits(code, previous, is_st)
             if not low <= last <= high:
                 issues.append(ValidationIssue("现价", f"{code} 现价 {last} 不在 [{low}, {high}]", code))
-        position = Position(code, name, qty, sellable, cost, last, value, pnl)
+        position = Position(code, name, qty, sellable, cost, last, value, pnl, day_pnl)
         if code in seen and seen[code] != position:
             issues.append(ValidationIssue("重复", f"{code} 在多图中出现不一致的重复行", code))
         else:

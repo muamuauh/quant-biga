@@ -308,10 +308,10 @@ def _regime_section(result: dict) -> list[str]:
     """
     from qbg.config import settings as _s
 
-    risk_on = bool(result.get("market_risk_on"))
     window = int(_s.qbg_market_sma or 0)
-    if not window:
-        return []
+    if not window or result.get("market_risk_on") is None:
+        return []   # 择时关掉了，或者今天压根没判（监控日）
+    risk_on = bool(result["market_risk_on"])
     lines = ["## 市场择时", ""]
     if risk_on:
         lines += [f"> 🟢 **risk-on**：股票池等权指数在 {window} 日均线**之上**，"
@@ -567,6 +567,15 @@ _SOURCE_LABELS = {
 }
 
 
+def _read_moment(read_ts: str) -> str:
+    """ISO 时刻 -> `2026-09-21 09:48`。解析不了就原样回显，别为了好看丢信息。"""
+    from datetime import datetime as _dt
+    try:
+        return _dt.fromisoformat(read_ts).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return read_ts
+
+
 def _portfolio_provenance(portfolio: dict) -> list[str]:
     """持仓从哪来、截止到哪天、有没有降级。
 
@@ -578,8 +587,14 @@ def _portfolio_provenance(portfolio: dict) -> list[str]:
     source = str(portfolio.get("source") or "")
     label = _SOURCE_LABELS.get(source, source or "未知")
     asof = str(portfolio.get("asof") or "").strip()
+    read_ts = str(portfolio.get("read_ts") or "").strip()
     line = f"**持仓来源**：{label}"
-    if asof:
+    if read_ts:
+        # 券商直读是**某一刻的盘中快照**，不是当天的最终状态。只标日期的话，
+        # 操作者过几分钟拿客户端一对就会以为我们算错了 —— 2026-09-21 真发生过，
+        # 差额 657 元全部来自读完之后的价格变动（生益电子一只就占 535）。
+        line += f"（**{_read_moment(read_ts)} 读取的盘中快照**，之后价格还会变）"
+    elif asof:
         line += f"（截止 {asof}）"
     lines = [line, ""]
     degraded = portfolio.get("degraded")
@@ -633,18 +648,29 @@ def render(result: dict) -> str:
     lines += _portfolio_provenance(result.get("portfolio") or {})
 
     unrealized = sum(float(position.get("pnl", 0) or 0) for position in positions)
+    # 当日盈亏只有券商直读有。**一只都没有就整列不显示** —— 与其摆一列问号，
+    # 不如别摆；但只要有一只有，就得显示，缺的那几只标 `—`。
+    day_values = [position.get("day_pnl") for position in positions]
+    has_day = any(value is not None for value in day_values)
+    day_total = sum(float(value) for value in day_values if value is not None)
     if positions:
-        lines += [
-            f"账户当前持有 **{len(positions)}** 只股票，持仓浮动盈亏合计 "
-            f"**¥{unrealized:+,.2f}**。以下均为本次流程读取的账户事实。",
-            "",
-        ]
+        summary = (f"账户当前持有 **{len(positions)}** 只股票，"
+                   f"持仓以来浮动盈亏 **¥{unrealized:+,.2f}**")
+        if has_day:
+            # 这两个数经常一正一负（今天涨了但还没回本，或反过来），
+            # 分开说清楚，别让人以为是同一个口径。
+            summary += f"，**当日盈亏 ¥{day_total:+,.2f}**"
+        lines += [summary + "。以下均为本次流程读取的账户事实。", ""]
     else:
         lines += ["当前没有可展示的持仓记录。", ""]
 
     if positions:
-        lines += ["|代码|名称|股数|可卖|成本|现价|市值|盈亏|收益率|",
-                  "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+        header = "|代码|名称|股数|可卖|成本|现价|市值|持仓盈亏|收益率|"
+        align = "|---|---|---:|---:|---:|---:|---:|---:|---:|"
+        if has_day:
+            header += "当日盈亏|"
+            align += "---:|"
+        lines += [header, align]
         for position in sorted(positions, key=lambda item: float(item.get("market_value", 0)),
                                reverse=True):
             qty = float(position.get("qty", 0) or 0)
@@ -652,12 +678,16 @@ def render(result: dict) -> str:
             pnl = float(position.get("pnl", 0) or 0)
             basis = qty * cost
             pnl_ratio = pnl / basis if basis else 0.0
-            lines.append(
+            row = (
                 f"|{_cell(position.get('code'))}|{_cell(position.get('name'))}|"
                 f"{int(qty)}|{int(position.get('sellable_qty', 0) or 0)}|"
                 f"{_number(cost, 3)}|{_number(position.get('last_price'), 3)}|"
                 f"{_number(position.get('market_value'))}|{pnl:+,.2f}|{pnl_ratio:+.2%}|"
             )
+            if has_day:
+                day = position.get("day_pnl")
+                row += ("—|" if day is None else f"{float(day):+,.2f}|")
+            lines.append(row)
         lines.append("")
 
     verdicts = result.get("agent_verdicts") or []

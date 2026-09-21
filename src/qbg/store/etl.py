@@ -8,11 +8,24 @@ from pathlib import Path
 
 from qbg.config import settings
 
+# 给已经存在的表补新列。`CREATE TABLE IF NOT EXISTS` **不会**改动已有的表，
+# 所以只改 schema.sql 对现网那份 runs.db 毫无作用 —— 而位置式 INSERT 会因为
+# 列数对不上直接报错。（重建整个库不是选项：`hypotheses`/`proposals`/`reviews`
+# 是 agent 自己写的，日志里重建不出来。）
+_ADDED_COLUMNS = (
+    ("positions", "day_pnl", "REAL"),   # 2026-09-21
+)
+
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
     db = sqlite3.connect(path or settings.db_path)
     schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
     db.executescript(schema)
+    for table, column, decl in _ADDED_COLUMNS:
+        existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}  # noqa: S608
+        if existing and column not in existing:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")  # noqa: S608
+    db.commit()
     return db
 
 
@@ -57,7 +70,9 @@ def _ingest_verdict(db: sqlite3.Connection, event: dict, run_date: str, mode: st
 def _ingest_cycle(db: sqlite3.Connection, result: dict, run_date: str, mode: str) -> None:
     db.execute("""INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (
         run_date, mode, result.get("started_ts"), result.get("finished_ts"),
-        result.get("run_kind"), result.get("skipped_reason"), int(bool(result.get("market_risk_on"))),
+        result.get("run_kind"), result.get("skipped_reason"),
+        # None（今天没判过择时）存 NULL，别塌成 0 —— 0 会被读成 risk-off。
+        None if result.get("market_risk_on") is None else int(bool(result["market_risk_on"])),
         int(bool(result.get("submitted"))), int(bool(result.get("hard_ok"))),
         result.get("report_path"), json.dumps(result, ensure_ascii=False, sort_keys=True)))
     db.execute("DELETE FROM scores WHERE date=? AND mode=?", (run_date, mode))
@@ -97,10 +112,13 @@ def _ingest_cycle(db: sqlite3.Connection, result: dict, run_date: str, mode: str
                (run_date, mode, account.get("total_equity"), account.get("available_cash")))
     db.execute("DELETE FROM positions WHERE date=? AND mode=?", (run_date, mode))
     for position in result.get("positions", []):
-        db.execute("INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?,?)", (
-            run_date, mode, position.get("code"), position.get("name"), position.get("qty"),
-            position.get("sellable_qty"), position.get("cost_price"), position.get("last_price"),
-            position.get("market_value"), position.get("pnl")))
+        db.execute(
+            "INSERT INTO positions (date,mode,code,name,qty,sellable_qty,"
+            "cost_price,last_price,market_value,pnl,day_pnl) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+                run_date, mode, position.get("code"), position.get("name"), position.get("qty"),
+                position.get("sellable_qty"), position.get("cost_price"),
+                position.get("last_price"), position.get("market_value"),
+                position.get("pnl"), position.get("day_pnl")))
 
 
 def backfill(log_path: Path | None = None, db_path: Path | None = None) -> dict:

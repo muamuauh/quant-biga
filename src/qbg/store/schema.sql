@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS equity (
 CREATE TABLE IF NOT EXISTS positions (
   date TEXT NOT NULL, mode TEXT NOT NULL, code TEXT NOT NULL, name TEXT, qty INTEGER,
   sellable_qty INTEGER, cost_price REAL, last_price REAL, market_value REAL, pnl REAL,
+  day_pnl REAL,
   PRIMARY KEY (date, mode, code)
 );
 CREATE TABLE IF NOT EXISTS events (

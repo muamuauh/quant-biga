@@ -71,6 +71,11 @@ def _run_facts(db: sqlite3.Connection, key: tuple) -> list[dict]:
     ).fetchone()
     for row in rows:
         row["advisory_sheet_written"] = bool(row.pop("submitted"))
+        # **NULL 不是 risk-off。** 监控日没判过择时，塞个 0 给 LLM 它会读成
+        # "择时判定为 risk-off"，再据此解释当天为什么没有订单 —— 那是编的。
+        timing = row.pop("market_risk_on", None)
+        row["market_timing"] = ("not_evaluated" if timing is None
+                                else "risk_on" if timing else "risk_off")
         row["n_orders"] = int(counts[0])
         row["n_orders_allowed"] = int(counts[1])
         row["n_targets"] = db.execute(

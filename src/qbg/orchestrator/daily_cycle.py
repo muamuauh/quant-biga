@@ -62,7 +62,12 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     today = today or date.today().isoformat()
     result: dict = {"date": today, "mode": settings.qbg_mode.upper(), "started_ts": _now(),
                     "run_kind": "dry_run" if dry_run else "rebalance", "hard_ok": True,
-                    "submitted": False, "market_risk_on": False, "orders": [],
+                    # **None = 今天没判过**，不是 risk-off。监控日根本不走选股那条
+                    # 路径，择时也就没被计算；以前这里是 False，于是调仓改成 10 日
+                    # 之后，十天里有九天在 `runs` 表和复盘 agent 的事实包里留下一个
+                    # 假的 risk-off。日报早就绕开了它（`_regime_brief`），但原始字段
+                    # 一直在撒谎 —— 和 `submitted` 是同一类毛病。
+                    "submitted": False, "market_risk_on": None, "orders": [],
                     "prediction_source": None, "prediction_asof": None,
                     "review_source": None,
                     "allowed_orders": [], "targets": {}, "scores": [], "gates": []}
@@ -124,7 +129,14 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     result["positions"] = positions
     # 来源与 asof 必须进日报：降级后用的是**过期持仓**，而那样出的清单
     # 和正常清单长得一模一样，不标出来没人会发现。
-    result["portfolio"] = {"source": portfolio_source, "asof": asof, "degraded": degraded}
+    # **券商直读记下读取时刻，文件来源不记。** `asof` 只有日期，而盘中 09:48 读的
+    # 一张快照标成「截止 2026-09-21」，读起来像当天的最终状态 —— 2026-09-21 操作者
+    # 正是因此以为数字算错了（实际只是生益电子在读完之后涨了 1.07，单只差 535 元）。
+    # 降级到 CSV/OCR 时数据来自文件，标「几点读的」反而更误导：那是读文件的时刻，
+    # 不是数据被采集的时刻。那种情况下 `asof` 的日期才是诚实的标签。
+    live_read = portfolio_source == "easytrader" and not degraded
+    result["portfolio"] = {"source": portfolio_source, "asof": asof, "degraded": degraded,
+                           "read_ts": _local_now() if live_read else None}
 
     # --- 强制退出：止损 + 移动止盈 ------------------------------------------
     # 峰值每次运行都刷新（调仓日也刷），刷新必须在判调仓日**之前**：调仓日虽然
@@ -279,6 +291,11 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         save_marker(list(execution.artifacts), today)
         save_rebalance_date(today)
     return _finish(result, dry_run)
+
+
+def _local_now() -> str:
+    """本机时区的读取时刻。日报是给人看的，UTC 会让人对不上自己的行情软件。"""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _bars(codes) -> tuple[dict, dict, dict, dict, list]:

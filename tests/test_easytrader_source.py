@@ -72,7 +72,25 @@ def test_payload_maps_real_column_names():
     position = payload["positions"][0]
     assert position == {"代码": "600519", "名称": "贵州茅台", "股数": 100,
                         "可用股数": 100, "成本价": 500.0, "现价": 600.0,
-                        "市值": 60000.0, "盈亏": 10000.0}
+                        "市值": 60000.0, "盈亏": 10000.0, "当日盈亏": 0.0}
+
+
+def test_day_pnl_flows_through():
+    """**当日盈亏和持仓盈亏是两个口径**，经常一正一负：今天涨了但还没回本，
+    或者反过来。2026-09-21 操作者拿客户端对账时就是这两个数打架 ——
+    当时日报只有持仓盈亏。"""
+    row = {**_row(pnl=10000.0), "当日盈亏": -108.0}
+    position = to_payload(_tables([row]))["positions"][0]
+    assert position["盈亏"] == 10000.0
+    assert position["当日盈亏"] == -108.0
+
+
+def test_a_client_without_the_column_gives_none_not_zero():
+    """老版本客户端可能没有这一列。**None 是"不知道"，0 是"今天平盘"** ——
+    后者是在替券商编一个它没说过的事实。"""
+    row = {k: v for k, v in _row().items() if k != "当日盈亏"}
+    position = to_payload(_tables([row]))["positions"][0]
+    assert position["当日盈亏"] is None
 
 
 def test_payload_uses_available_not_balance():

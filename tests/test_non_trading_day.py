@@ -187,3 +187,51 @@ def test_a_run_with_orders_still_says_so():
 def test_advisory_mode_is_untouched():
     text = _report(mode="ADVISORY")
     assert "顾问模式不接触券商" in text
+
+
+# ------------------------------------------------------------------
+# 老库补列
+# ------------------------------------------------------------------
+
+def test_an_old_db_gets_the_new_column(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` **不会**改动已有的表。只改 schema.sql 对
+    现网那份 runs.db 毫无作用，而带新列的 INSERT 会直接报错。
+    重建整个库不是选项 —— hypotheses/proposals/reviews 是 agent 自己写的，
+    日志里重建不出来。"""
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE positions (date TEXT, mode TEXT, code TEXT, name TEXT,"
+                   " qty INTEGER, sellable_qty INTEGER, cost_price REAL, last_price REAL,"
+                   " market_value REAL, pnl REAL, PRIMARY KEY (date, mode, code))")
+        db.execute("INSERT INTO positions VALUES ('2026-09-18','PAPER','600000.SH','X',"
+                   "100,100,10.0,11.0,1100.0,100.0)")
+
+    connect(path).close()
+
+    with sqlite3.connect(path) as db:
+        assert "day_pnl" in {r[1] for r in db.execute("PRAGMA table_info(positions)")}
+        assert db.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 1, "老数据不许丢"
+        assert db.execute("SELECT day_pnl FROM positions").fetchone()[0] is None
+
+
+def test_migrating_twice_is_harmless(tmp_path):
+    """每次 connect 都会跑一遍。第二次必须是空操作，不能抛 duplicate column。"""
+    path = tmp_path / "runs.db"
+    for _ in range(3):
+        connect(path).close()
+    with sqlite3.connect(path) as db:
+        columns = [r[1] for r in db.execute("PRAGMA table_info(positions)")]
+    assert columns.count("day_pnl") == 1
+
+
+def test_day_pnl_reaches_the_store(db_path):
+    position = {"code": "600547.SH", "name": "山东黄金", "qty": 1800, "sellable_qty": 1800,
+                "cost_price": 33.111, "last_price": 32.710, "market_value": 58878.0,
+                "pnl": -721.06, "day_pnl": -108.0}
+    db = connect(db_path)
+    _ingest_cycle(db, {"date": "2026-09-21", "mode": MODE, "positions": [position],
+                       "account": {}}, "2026-09-21", MODE)
+    db.commit()
+    db.close()
+    with sqlite3.connect(db_path) as db:
+        assert db.execute("SELECT pnl,day_pnl FROM positions").fetchone() == (-721.06, -108.0)
