@@ -51,6 +51,7 @@ from qbg.config import settings  # noqa: E402
 from qbg.data import cache  # noqa: E402
 from qbg.market import codes as codes_mod  # noqa: E402
 from qbg.portfolio.reconcile import fill_slippage, slippage_summary  # noqa: E402
+from qbg.utils.console import make_output_safe  # noqa: E402
 
 MIN_SAMPLE = 20
 
@@ -146,4 +147,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-from qbg.utils.console import make_output_safe  # noqa: E402

@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from qbg.config import settings  # noqa: E402
 from qbg.report.daily_report import generate, render  # noqa: E402
+from qbg.utils.console import make_output_safe  # noqa: E402
 
 TRUNCATION_MARK = "…"
 
@@ -106,4 +107,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-from qbg.utils.console import make_output_safe  # noqa: E402

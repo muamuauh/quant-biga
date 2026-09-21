@@ -35,6 +35,7 @@ from qbg.strategy.predict import (  # noqa: E402
     predictions_to_frame,
 )
 from qbg.strategy.regime import equal_weight_index, risk_on_series  # noqa: E402
+from qbg.utils.console import make_output_safe  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -92,4 +93,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-from qbg.utils.console import make_output_safe  # noqa: E402

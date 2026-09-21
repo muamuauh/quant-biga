@@ -30,6 +30,7 @@ from qbg.config import load_universe, settings  # noqa: E402
 from qbg.data import cache, industry, meta, qlib_dump, universe  # noqa: E402
 from qbg.data.sources.chain import SourceChain  # noqa: E402
 from qbg.market import calendar  # noqa: E402
+from qbg.utils.console import make_output_safe  # noqa: E402
 from qbg.utils.logging import get_logger, log_event  # noqa: E402
 
 log = get_logger("qbg.scripts.ingest")
@@ -198,4 +199,3 @@ def _print_report(meta_stats, bar_stats, filtered, qlib_result) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-from qbg.utils.console import make_output_safe  # noqa: E402
