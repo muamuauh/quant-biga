@@ -102,26 +102,43 @@ def run_row(when: str, mode: str, db_path: Path | None = None) -> dict | None:
 
 
 def equity_row(when: str, mode: str, db_path: Path | None = None) -> dict | None:
-    """净值行，并**派生**当日盈亏与持仓数。
+    """净值行，并派生**两个不同口径**的盈亏。别把它们混成一个。
 
-    `equity` 表只存 `total_equity` / `available_cash`，没有盈亏字段。当日盈亏
-    在这里算成「今日净值 − 上一有记录日的净值」，而不是去读券商的当日盈亏——
-    顾问模式下根本没有券商可读，而且这个口径和净值曲线天然自洽（曲线上相邻
-    两点之差就是它）。第一天没有前值，返回 None 而不是 0：`—` 是诚实的，
-    `+0.00` 会被误读成"今天平盘"。
+    `equity_change` = 今日净值 − 上一有记录日的净值。这个口径和净值曲线天然
+    自洽（曲线上相邻两点之差就是它），顾问模式下也算得出来。**但它不是
+    「当日盈亏」**：两次快照都在 09:32 前后取，所以它含着上一次读数到那天
+    收盘的那一段、外加隔夜跳空；上一有记录日也未必是昨天（周末、停机、
+    读不到账户的日子都会让它静默跨越好几天，所以这里一并返回 `prev_date`）。
+
+    `broker_day_pnl` = 当天各持仓 `day_pnl` 之和，也就是**券商自己报的当日
+    盈亏**（昨收 → 现在）。这才是操作者在同花顺界面上看到的那个数。
+    2026-09-23 实测三个数互不相同：净值变化 −4,688.00、券商当日盈亏 +210.00、
+    持仓盈亏 −1,879.06 —— 而邮件标题当时显示的恰好是操作者看不到的那一个，
+    还管它叫「当日盈亏」。**名字撞车比数字错更难发现。**
+
+    两个都可能是 None，而 None 必须原样传下去：第一天没有前值、顾问模式没有
+    券商、老版本客户端没有那一列 —— `—` 是诚实的，`+0.00` 会被读成"今天平盘"。
     """
     rows = _rows("SELECT * FROM equity WHERE date=? AND mode=?", (when, mode), db_path)
     if not rows:
         return None
     row = dict(rows[0])
 
-    prev = _rows("SELECT total_equity FROM equity WHERE mode=? AND date<? "
+    prev = _rows("SELECT date,total_equity FROM equity WHERE mode=? AND date<? "
                  "ORDER BY date DESC LIMIT 1", (mode, when), db_path)
+    row["prev_date"] = prev[0]["date"] if prev else None
     try:
-        row["day_pnl"] = (float(row["total_equity"]) - float(prev[0]["total_equity"])
-                          if prev and prev[0].get("total_equity") is not None else None)
+        row["equity_change"] = (float(row["total_equity"]) - float(prev[0]["total_equity"])
+                                if prev and prev[0].get("total_equity") is not None else None)
     except (TypeError, ValueError):
-        row["day_pnl"] = None
+        row["equity_change"] = None
+
+    # 券商自报的当日盈亏。一只都没有就是 None（顾问模式 / 老客户端 / OCR 来源），
+    # **不是 0** —— 0 是在替券商断言"今天平盘"。
+    day_rows = _rows("SELECT day_pnl FROM positions WHERE date=? AND mode=?",
+                     (when, mode), db_path)
+    values = [r["day_pnl"] for r in day_rows if r.get("day_pnl") is not None]
+    row["broker_day_pnl"] = float(sum(values)) if values else None
 
     n = _rows("SELECT COUNT(*) AS n FROM positions WHERE date=? AND mode=?",
               (when, mode), db_path)
@@ -331,19 +348,37 @@ def build_digest(when: str | None = None, mode: str | None = None,
 
     status = status_tag(run, finds, failure)
     subject = f"[量化-{mode}] 每日报告 {when} — {status}"
-    if equity and equity.get("day_pnl") is not None:
-        subject += f" {_money(equity.get('day_pnl'))}"
+    # **标题放券商自报的当日盈亏** —— 操作者拿手机上的同花顺一对就是这个数。
+    # 拿不到时退回净值变化，并带上对比日期：那个口径可能跨了好几天，
+    # 不写清楚就又成了一个顶着"当日"名字的跨天数字。
+    if equity and equity.get("broker_day_pnl") is not None:
+        subject += f" 当日 {_money(equity['broker_day_pnl'])}"
+    elif equity and equity.get("equity_change") is not None:
+        prev_date = equity.get("prev_date") or "上次"
+        subject += f" 净值较{prev_date} {_money(equity['equity_change'])}"
 
     report = daily_report_path(when)
 
     md: list[str] = [f"# 每日报告 · {when}", "", f"*{mode} · {status}*", ""]
 
-    # --- 当日盈亏：日报没有这一项 ---
-    # 它是**跨天**派生的（今日净值 − 上一有记录日），日报只看当天一天的事实，
-    # 拿不到这个数。所以无论日报在不在，这一行都要有。
-    if equity and equity.get("day_pnl") is not None:
-        md += [f"**当日盈亏 {_money(equity['day_pnl'])}**"
-               f"（总资产 {_amount(equity.get('total_equity'))}）", ""]
+    # --- 两个口径都写出来，各自标清楚量的是什么 ---
+    # 日报只看当天一天的事实，拿不到跨天的净值变化，所以这一段无论日报在不在都要有。
+    # **两个数经常差很远**（2026-09-23：+210.00 vs −4,688.00），
+    # 合成一个或者只写一个，都会让人对不上账。
+    if equity and equity.get("broker_day_pnl") is not None:
+        md += [f"**当日盈亏 {_money(equity['broker_day_pnl'])}**"
+               f"（券商口径：昨收 → 读取时点，和客户端上看到的一致）", ""]
+    if equity and equity.get("equity_change") is not None:
+        prev_date = equity.get("prev_date") or "上一有记录日"
+        md += [f"净值较 {prev_date} {_money(equity['equity_change'])}"
+               f"（总资产 {_amount(equity.get('total_equity'))}）",
+               "",
+               "> 两个口径不一样，差额正常：净值变化比的是**两次运行时点**"
+               "（都在 09:32 前后），中间隔着上一次读数到收盘的那一段和隔夜跳空；"
+               "而且上一有记录日未必是昨天。",
+               ""]
+    elif equity and equity.get("broker_day_pnl") is not None:
+        md += [f"（总资产 {_amount(equity.get('total_equity'))}）", ""]
 
     # --- 概览：只在日报缺失时重建 ---
     # 日报正文自己就有一份更全的概览。日报在的时候再放一份，读者会看到两个

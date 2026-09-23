@@ -61,6 +61,11 @@ def add_equity(db, when, total, cash=1000.0, mode="ADVISORY"):
             (when, mode, total, cash))
 
 
+def add_position(db, when, *, day_pnl, code="600519.SH", mode="ADVISORY"):
+    _insert(db, "INSERT INTO positions (date,mode,code,qty,pnl,day_pnl) VALUES (?,?,?,?,?,?)",
+            (when, mode, code, 100, 0.0, day_pnl))
+
+
 # ----------------------------------------------------------------------
 # 主题与状态
 # ----------------------------------------------------------------------
@@ -73,23 +78,68 @@ def test_subject_carries_mode_date_and_status(db):
     assert "2026-08-10" in subject
 
 
-def test_subject_carries_day_pnl(db):
-    """不打开邮件就知道今天赚亏多少。"""
+def test_subject_falls_back_to_equity_change_with_its_date(db):
+    """拿不到券商当日盈亏时退回净值变化，**必须带上对比日期**。
+
+    那个口径会静默跨越好几天（周末、停机、读不到账户），
+    不写清楚就又是一个顶着"当日"名字的跨天数字。
+    """
     add_equity(db, "2026-08-07", 100_000.0)
     add_equity(db, "2026-08-10", 101_234.5)
     add_run(db)
     subject, _ = digest.build_digest("2026-08-10", "ADVISORY", db_path=db)
     assert "+1,234.50" in subject
+    assert "2026-08-07" in subject, "跨了 3 天，得让人看见是跟哪天比"
+    assert "当日" not in subject, "净值变化不是当日盈亏，别用那个名字"
 
 
-def test_day_pnl_is_none_on_first_day_not_zero(db):
+def test_subject_prefers_the_broker_figure(db):
+    """**标题要放操作者能对上账的那个数。**
+
+    2026-09-23 实测：净值变化 −4,688.00、券商当日盈亏 +210.00、持仓盈亏
+    −1,879.06。当时标题显示 −4,688.00 还管它叫「当日盈亏」 —— 恰好是操作者
+    在同花顺上唯一看不到的那一个。
+    """
+    add_equity(db, "2026-09-22", 198_113.14)
+    add_equity(db, "2026-09-23", 193_425.14)
+    add_position(db, "2026-09-23", day_pnl=210.0)
+    add_run(db, when="2026-09-23")
+    subject, body = digest.build_digest("2026-09-23", "ADVISORY", db_path=db)
+    assert "+210.00" in subject
+    assert "-4,688.00" not in subject, "标题别放那个对不上账的数"
+    # 但正文两个都要有 —— 净值曲线看的是后者。
+    assert "+210.00" in body and "-4,688.00" in body
+    assert "2026-09-22" in body, "净值变化要写明跟哪天比"
+
+
+def test_the_two_measures_stay_separate(db):
+    add_equity(db, "2026-09-22", 198_113.14)
+    add_equity(db, "2026-09-23", 193_425.14)
+    add_position(db, "2026-09-23", day_pnl=210.0)
+    row = digest.equity_row("2026-09-23", "ADVISORY", db)
+    assert row["broker_day_pnl"] == 210.0
+    assert row["equity_change"] == -4688.0
+    assert row["prev_date"] == "2026-09-22"
+    assert "day_pnl" not in row, "含糊的旧名字不该留着 —— 它同时像这两个数"
+
+
+def test_no_broker_column_means_none_not_zero(db):
+    """顾问模式 / 老客户端 / OCR 来源都没有这一列。0 是在替券商断言"今天平盘"。"""
+    add_equity(db, "2026-09-22", 198_113.14)
+    add_equity(db, "2026-09-23", 193_425.14)
+    add_position(db, "2026-09-23", day_pnl=None)
+    row = digest.equity_row("2026-09-23", "ADVISORY", db)
+    assert row["broker_day_pnl"] is None
+
+
+def test_equity_change_is_none_on_first_day_not_zero(db):
     """第一天没有前值，就什么都不说。
 
     绝不能填 `+0.00` —— 那会被读成"今天平盘"，而事实是"不知道"。
     """
     add_equity(db, "2026-08-10", 100_000.0)
     row = digest.equity_row("2026-08-10", "ADVISORY", db)
-    assert row["day_pnl"] is None
+    assert row["equity_change"] is None
     subject, body = digest.build_digest("2026-08-10", "ADVISORY", db_path=db)
     assert "当日盈亏" not in body
     assert "+0.00" not in subject
@@ -301,12 +351,14 @@ def test_overview_is_rebuilt_only_when_daily_report_missing(db, tmp_path):
     assert "真正的概览在这里" in body
 
 
-def test_day_pnl_line_shows_even_when_daily_report_exists(db, tmp_path):
-    """当日盈亏是**跨天**派生的，日报只看当天一天的事实，拿不到这个数。
-    所以无论日报在不在，这一行都要有。"""
+def test_pnl_lines_show_even_when_daily_report_exists(db, tmp_path):
+    """净值变化是**跨天**派生的，日报只看当天一天的事实，拿不到这个数。
+    所以无论日报在不在，这一段都要有。"""
     add_equity(db, "2026-08-07", 100_000.0)
     add_equity(db, "2026-08-10", 101_000.0)
+    add_position(db, "2026-08-10", day_pnl=210.0)
     add_run(db)
     write_report(tmp_path, text="# 日报\n\n内容")
     _, body = digest.build_digest("2026-08-10", "ADVISORY", db_path=db)
-    assert "当日盈亏 +1,000.00" in body
+    assert "当日盈亏 +210.00" in body
+    assert "净值较 2026-08-07 +1,000.00" in body
