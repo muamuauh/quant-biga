@@ -93,8 +93,12 @@ def _bought_on(db: sqlite3.Connection, mode: str, day: str) -> bool:
 
 
 def _review_blocked(db: sqlite3.Connection, mode: str) -> list[Finding]:
-    """逐票复核把当天候选**全部**拦下 —— 那天一定不会有任何买入。"""
-    if not _has_table(db, "verdicts"):
+    """逐票复核把当天候选**全部**拦下 —— 那天一定不会有任何买入。
+
+    **影子模式下这条不成立**：全拦也照样按模型排名买，报出来就是一条
+    "当天不会有任何买入"的假告警。
+    """
+    if settings.qbg_agents_shadow or not _has_table(db, "verdicts"):
         return []
     rows = db.execute(
         "SELECT date, COUNT(*), COALESCE(SUM(kept),0) FROM verdicts WHERE mode=? "

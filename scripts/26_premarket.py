@@ -56,6 +56,7 @@ from qbg.config import settings  # noqa: E402
 from qbg.data import cache as bar_cache  # noqa: E402
 from qbg.market import calendar  # noqa: E402
 from qbg.model.train import train  # noqa: E402
+from qbg.orchestrator.run_marker import is_rebalance_day  # noqa: E402
 from qbg.portfolio.source import load_portfolio  # noqa: E402
 from qbg.risk.gates import load_limits  # noqa: E402
 from qbg.strategy.predict import (  # noqa: E402
@@ -94,6 +95,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--equity", type=float, default=None,
                    help="覆盖总资产（可负担性过滤用）。默认走 load_portfolio 的降级链")
     return p
+
+
+def _review_needed(today: str, cash_fraction: float | None) -> bool:
+    """今天的复核结论有没有人读。现金占比不知道就当"有"。"""
+    if cash_fraction is None:
+        return True
+    return is_rebalance_day(int(settings.qbg_rebalance_every_days), today,
+                            cash_fraction=cash_fraction,
+                            cash_trigger=float(settings.qbg_rebalance_cash_trigger))
 
 
 def main(argv=None) -> int:
@@ -135,10 +145,13 @@ def main(argv=None) -> int:
     # 资金量：读得到就用真实的，读不到走降级链。见模块说明 —— 估粗了最坏
     # 只是白跑一次盘前复核，不会下错单。
     equity = args.equity
+    cash_fraction = None   # None = 不知道。只有券商直读成功才算知道
     if equity is None:
         try:
             loaded = load_portfolio()
             equity = float(loaded.snapshot.total_equity)
+            if not loaded.degraded and equity > 0:
+                cash_fraction = float(loaded.snapshot.available_cash) / equity
             print(f"持仓来源 {loaded.source}   总资产 {equity:,.2f}")
         except Exception as exc:  # noqa: BLE001
             equity = 100_000.0
@@ -160,6 +173,22 @@ def main(argv=None) -> int:
     if not risk_on:
         print("risk-off —— 今天不会有持仓目标，跳过复核（省一小时和一笔 LLM 账单）")
         log_event(log, "premarket.skipped", reason="risk_off", date=today)
+        return 0
+    # **监控日不复核。** 调仓改成每 10 日之后，10 天里有 9 天日流程根本不选股，
+    # 盘前的复核结论没人读。2026-09-22/23/24 三个监控日各花了约 $1.6，一分没用上
+    # —— 往后约 90% 的复核费用都会这样。
+    #
+    # **拉数和重训照做，只省复核。** 监控日的强制退出（止损）也要过预测新鲜度
+    # 这道硬闸，重训跳了止损单就会被拦下。
+    #
+    # 判据和日流程是同一个函数，包括现金触发（现金过半提前调仓）。现金占比读不到
+    # 时**照跑**：可能是现金触发日，猜错的代价是白花一次复核；反过来猜错，
+    # 非影子模式下日流程会退回现场复核（慢但正确）。
+    if not args.force and not _review_needed(today, cash_fraction):
+        print(f"{today} 是监控日（每 {settings.qbg_rebalance_every_days} 日调仓，"
+              f"现金占比 {cash_fraction:.1%}），日流程不选股，跳过复核。")
+        log_event(log, "premarket.skipped", reason="not_rebalance_day", date=today,
+                  cash_fraction=round(cash_fraction, 4))
         return 0
     if not settings.qbg_agents_enabled:
         print("QBG_AGENTS_ENABLED=0，复核关闭，无需盘前缓存。")

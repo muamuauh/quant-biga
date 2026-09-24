@@ -195,38 +195,13 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
                                  cap=float(limits["max_position_pct"]))
     risk_on = market_risk_on(list(last), settings.qbg_market_sma,
                              band=settings.qbg_market_sma_band)
-    review_verdicts, review_usage = [], {}
-    review_source = None
+    review_verdicts, review_usage, review_source = [], {}, None
     reviewed_scores = filtered
     if risk_on and settings.qbg_agents_enabled:
-        from qbg.agents.verdict_cache import load_verdicts
-
-        candidate_count = min(settings.qbg_agents_candidates, len(filtered))
-        candidate_scores = filtered.iloc[:candidate_count]
-        candidates = list(candidate_scores.index)
-        candidate_weights = {code: 1.0 / candidate_count for code in candidates}
-
-        # **优先用盘前跑好的结论。** 复核实测 58 分钟（5 只票 × 12 次 LLM 调用），
-        # 而 require_trading_session 是硬闸 —— 09:30 现场复核会跑到上午盘尾甚至
-        # 收盘之后，整天作废且钱已经花掉。盘前跑完、盘中只读，把「LLM 慢」和
-        # 「必须盘中下单」这两个约束解耦。
-        #
-        # 缓存**只在候选名单逐只相同时**才用（见 verdict_cache 的说明）：
-        # 名单变了还套旧结论，等于给没复核过的票安一个别人的评级。
-        cached = load_verdicts(today, candidates)
-        if cached is not None:
-            kept, review_verdicts, review_usage = cached
-            review_source = "premarket_cache"
-        else:
-            from qbg.agents.review import review_candidates
-
-            kept, verdicts, review_usage = review_candidates(candidate_weights)
-            review_verdicts = [verdict.as_dict() for verdict in verdicts]
-            review_source = "inline"
-        reviewed_scores = candidate_scores.loc[[code for code in candidates if code in kept]]
-        log_event(log, "cycle.review.source", source=review_source,
-                  candidates=len(candidates), kept=len(kept))
+        reviewed_scores, review_verdicts, review_usage, review_source = _apply_review(
+            filtered, today)
     result["review_source"] = review_source
+    result["review_shadow"] = bool(settings.qbg_agents_enabled and settings.qbg_agents_shadow)
 
     # **调仓日也止损。** 模型再看好也不留：把止损的票从当天的选股里剔除（分数和
     # 迟滞的"已持有"集合都去掉），槽位让给下一名；它本身目标变 0，规划器照常卖出。
@@ -352,6 +327,52 @@ def _reference_prices(codes, last: dict, previous: dict, limits: dict
     log_event(log, "cycle.reference.prices", source=source,
               wanted=len(codes), live=len(live_prices), slippage=slippage)
     return reference, limit_base, slippage, source
+
+
+def _apply_review(filtered, today: str):
+    """逐票复核作用到选股上。返回 (选股用的分数, 复核明细, 用量, 来源)。
+
+    三条路：
+
+    - **影子模式**（`QBG_AGENTS_SHADOW=1`）：只记录，不拦截。选股用的分数原样是
+      全排名 —— 迟滞 `keep_rank` 也才能照回测的方式生效（只在 5 个候选里挑的话，
+      排第 8 的持仓根本不在集合里，会被直接卖掉）。盘前缓存在就带上它的结论
+      供对照；不在也**绝不现场复核**：那要 58 分钟，而结论反正不影响今天下什么单。
+    - **缓存命中**：用盘前跑好的结论，只在留下的候选里挑。
+    - **缓存未命中**：现场复核。缓存不是"关掉复核"的开关 —— `QBG_AGENTS_ENABLED` 才是。
+
+    **优先用盘前跑好的结论。** 复核实测 58 分钟（5 只票 × 12 次 LLM 调用），
+    而 require_trading_session 是硬闸 —— 09:30 现场复核会跑到上午盘尾甚至
+    收盘之后，整天作废且钱已经花掉。缓存**只在候选名单逐只相同时**才用
+    （见 verdict_cache 的说明）：名单变了还套旧结论，等于给没复核过的票安一个
+    别人的评级。
+    """
+    from qbg.agents.verdict_cache import load_verdicts
+
+    candidate_count = min(settings.qbg_agents_candidates, len(filtered))
+    candidate_scores = filtered.iloc[:candidate_count]
+    candidates = list(candidate_scores.index)
+    cached = load_verdicts(today, candidates)
+
+    if settings.qbg_agents_shadow:
+        kept, verdicts, usage = ({}, [], {}) if cached is None else cached
+        source = "shadow_cache" if cached is not None else "shadow_missing"
+        reviewed = filtered
+    elif cached is not None:
+        kept, verdicts, usage = cached
+        source = "premarket_cache"
+        reviewed = candidate_scores.loc[[code for code in candidates if code in kept]]
+    else:
+        from qbg.agents.review import review_candidates
+
+        weights = {code: 1.0 / candidate_count for code in candidates}
+        kept, raw, usage = review_candidates(weights)
+        verdicts = [verdict.as_dict() for verdict in raw]
+        source = "inline"
+        reviewed = candidate_scores.loc[[code for code in candidates if code in kept]]
+    log_event(log, "cycle.review.source", source=source,
+              candidates=len(candidates), kept=len(kept))
+    return reviewed, verdicts, usage, source
 
 
 def _rebalance_status(today: str, due: bool, cash: float, equity: float) -> dict:

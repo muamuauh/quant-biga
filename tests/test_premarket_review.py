@@ -86,7 +86,9 @@ def test_daily_cycle_prefers_the_cache_but_falls_back():
 
     from qbg.orchestrator import daily_cycle
 
-    src = inspect.getsource(daily_cycle.run_daily)
+    # 2026-09-24 复核逻辑从 run_daily 抽成了 `_apply_review`（为了能对影子模式做
+    # 行为测试）。三条路的**行为**见 tests/test_review_shadow.py，这里只留顺序检查。
+    src = inspect.getsource(daily_cycle._apply_review)
     assert "load_verdicts" in src, "daily_cycle 没读盘前缓存"
     assert "review_candidates" in src, "缓存未命中时没有退回现场复核的路径"
     assert src.index("load_verdicts") < src.index("review_candidates"), \

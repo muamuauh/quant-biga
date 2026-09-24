@@ -567,6 +567,13 @@ _SOURCE_LABELS = {
 }
 
 
+def _gate_word(kept, shadow: bool) -> str:
+    """影子模式下不能写"拦截" —— 那只票没被拦，照样可能被买进了。"""
+    if shadow:
+        return "会通过" if kept else "会拦截（未执行）"
+    return "通过" if kept else "拦截"
+
+
 def _read_moment(read_ts: str) -> str:
     """ISO 时刻 -> `2026-09-21 09:48`。解析不了就原样回显，别为了好看丢信息。"""
     from datetime import datetime as _dt
@@ -696,16 +703,20 @@ def render(result: dict) -> str:
     lines += _rebalance_section(result)
     lines += _exits_section(result)
     lines += _regime_section(result)
+    shadow = bool(result.get("review_shadow"))
     if targets or verdicts:
-        lines += ["## 量化选择与 TradingAgents 复核", "",
-                  "TradingAgents 复核闸只过滤量化候选，不生成主信号；调用异常按 fail-open 放行。", ""]
+        intro = ("**复核处于影子模式：只记录评级，不影响选股。** 目标持仓直接取模型排名；"
+                 "下面的「会通过 / 会拦截」是复核**本来**会怎么判，用来积累对照数据。"
+                 if shadow else
+                 "TradingAgents 复核闸只过滤量化候选，不生成主信号；调用异常按 fail-open 放行。")
+        lines += ["## 量化选择与 TradingAgents 复核", "", intro, ""]
         if targets:
             verdict_by_code = {str(item.get("code")): item for item in verdicts}
             lines += ["|代码|目标权重|复核评级|结果|", "|---|---:|---|---:|"]
             for code, weight in sorted(targets.items(), key=lambda item: float(item[1]), reverse=True):
                 verdict = verdict_by_code.get(str(code), {})
                 gate_result = (
-                    "通过" if verdict.get("kept") else "拦截"
+                    _gate_word(verdict.get("kept"), shadow)
                 ) if verdict else "未复核"
                 lines.append(
                     f"|{_cell(code)}|{float(weight):.2%}|{_cell(verdict.get('rating') or '未复核')}|"
@@ -723,12 +734,12 @@ def render(result: dict) -> str:
         for verdict in verdicts:
             lines.append(
                 f"|{_cell(verdict.get('code'))}|{_cell(verdict.get('rating'))}|"
-                f"{'通过' if verdict.get('kept') else '拦截'}|"
+                f"{_gate_word(verdict.get('kept'), shadow)}|"
             )
         lines.append("")
         for verdict in verdicts:
             code, rating = verdict.get("code"), verdict.get("rating") or "未复核"
-            gate = "通过" if verdict.get("kept") else "拦截"
+            gate = _gate_word(verdict.get("kept"), shadow)
             lines += [f"#### {_cell(code)} · {_cell(rating)} · {gate}", ""]
             if verdict.get("error"):
                 lines += [f"> ⚠️ 复核异常：{_cell(str(verdict['error']), 400)}", ""]
