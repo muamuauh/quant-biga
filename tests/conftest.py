@@ -76,6 +76,13 @@ def _offline(monkeypatch):
     # 可选增强一律按"没配"跑。真实 .env 里配了什么，测试不该知道也不该依赖。
     monkeypatch.setattr(settings, "fuyao_api_key", "", raising=False)
 
+    # **行为开关按代码默认值跑。** `settings` 读的是真实 `.env`，所以操作者每改一个
+    # 开关，整套测试的前提就跟着变了 —— 2026-09-24 在 `.env` 里打开影子模式的那一刻，
+    # 两条"复核全拦应当报警"的测试就红了：它们没做错，是开关替它们改了前提。
+    # 想测开着的行为，测试自己 monkeypatch 打开，那是显式的。
+    # 新加行为开关时一并加到这里。
+    monkeypatch.setattr(settings, "qbg_agents_shadow", 0, raising=False)
+
     real_connect = socket.socket.connect
 
     def guarded(self, address, *args, **kwargs):

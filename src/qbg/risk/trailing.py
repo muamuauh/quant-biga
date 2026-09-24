@@ -152,6 +152,43 @@ class ExitHit:
 TrailingHit = ExitHit
 
 
+def judged_on_close(positions: list[dict], closes: dict[str, float]) -> list[dict]:
+    """把持仓的 `last_price` 换成**最近一根完整日线的收盘价**，止损和止盈都拿它判。
+
+    **为什么不用券商读到的现价。** 回测里止损是按收盘价判的（`engine` 的 `grow`
+    由日收益累乘），收盘 t 触发、开盘 t+1 卖。8% 止损当初没过八项闸，保留它的
+    理由是"回撤两个窗口都少 5.1 点" —— **那个数字是在收盘价规则上量出来的。**
+    而实盘一直拿 09:32 的盘中价判，跑的是另一条没被验证过的规则。
+
+    2026-09-24 山东黄金就是例子：09-23 收盘 30.93（距成本 −6.6%，没到 8% 线
+    30.462），09-24 09:32 跳空到 30.23 → 盘中规则当场卖。按回测的规则那天不卖。
+
+    **成交价上没有吃亏的证据。** 2020 年以来 46 万个股票日里，低开 ≥3% 之后
+    开盘→收盘平均 +0.45%，但一半涨一半跌，2022~2024 基本是 0；等到次日开盘
+    平均 +0.24%（51% 更高）。所以差别不在"卖在什么价"，而在**触发得多不多**：
+    盘中价跌破、收盘又拉回来的那些天，盘中规则会卖、收盘规则不会 —— 每多触发
+    一次就多一次约 30bp 的往返。
+
+    只换**判不判**用的价。挂多少的限价照旧走 `_reference_prices` 的实时价 ——
+    拿昨收去挂限价就是 37.7% 的卖单挂到市价错误一侧的那个老坑。
+
+    缓存里没有这只票的日线时退回券商现价，并标 `judged_on="live"`：
+    止损是保护性的，缺数据时宁可按现价判，也不能整只不判。
+    """
+    out = []
+    for position in positions:
+        close = closes.get(position.get("code"))
+        judged = dict(position)
+        if close and float(close) > 0:
+            judged["live_price"] = position.get("last_price")
+            judged["last_price"] = float(close)
+            judged["judged_on"] = "close"
+        else:
+            judged["judged_on"] = "live"
+        out.append(judged)
+    return out
+
+
 def stop_loss_hits(positions: list[dict], stop_pct: float) -> list[ExitHit]:
     """哪些持仓亏损到了止损线。`stop_pct` ≤ 0 = 关闭。
 

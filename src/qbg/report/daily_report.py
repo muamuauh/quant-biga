@@ -442,7 +442,14 @@ def _exits_section(result: dict) -> list[str]:
 
     watch = info.get("watch") or []
     if watch:
-        lines += ["|代码|名称|成本|现价|浮盈|止损|移动止盈|",
+        # 按昨收判时这一列就是昨收 —— 和上面「账户与持仓」表里的现价（09:32 读的）
+        # 不是同一个数，列名必须说清楚，否则两张表对不上看着像算错了。
+        on_close = info.get("judged_on") == "close"
+        if on_close:
+            lines += [f"止损和止盈都按**昨收**判断（{info.get('close_date') or '最近一根日线'}"
+                      "收盘价），和回测是同一条规则；触发后挂单仍按实时价算限价。", ""]
+        price_col = "昨收" if on_close else "现价"
+        lines += [f"|代码|名称|成本|{price_col}|浮盈|止损|移动止盈|",
                   "|---|---|---:|---:|---:|---|---|"]
 
         # 离任一条线最近的排最前。to_* 都是"还要再动多少"，取绝对值比较。

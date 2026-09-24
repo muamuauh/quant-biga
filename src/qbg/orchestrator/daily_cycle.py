@@ -155,13 +155,24 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
                        "trailing_enabled": trailing_on, "arm_pct": trail_arm,
                        "trail_pct": trail_pct, "trusted": exits_trusted,
                        "watch": [], "hits": [], "orders": [], "skipped": [],
-                       "refused": None, "excluded_on_rebalance": []}
+                       "refused": None, "excluded_on_rebalance": [],
+                       "judged_on": None, "close_date": None}
+    # **止损 / 止盈按昨收判，不按 09:32 的盘中价**（2026-09-24 改）—— 和回测是同一条
+    # 规则：收盘 t 判、开盘 t+1 卖。理由和实测见 `trailing.judged_on_close`。
+    # 09:30 时缓存里最新一根日线正好是昨天的（今天的还没收）。
+    judged = positions
+    if (trailing_on or stop_on) and positions:
+        closes, _, _, _, close_dates = _bars({p["code"] for p in positions})
+        judged = trailing.judged_on_close(positions, closes)
+        result["exits"]["judged_on"] = "close"
+        result["exits"]["close_date"] = (max(close_dates).date().isoformat()
+                                         if close_dates else None)
     if (trailing_on or stop_on) and exits_trusted:
         if trailing_on:
-            peaks = trailing.update_peaks(positions, trailing.load_peaks())
+            peaks = trailing.update_peaks(judged, trailing.load_peaks())
             if not dry_run:
                 trailing.save_peaks(peaks)
-        result["exits"]["watch"] = trailing.watchlist(positions, peaks, trail_arm,
+        result["exits"]["watch"] = trailing.watchlist(judged, peaks, trail_arm,
                                                       trail_pct, stop_pct)
 
     due = is_rebalance_day(settings.qbg_rebalance_every_days, today,
@@ -172,7 +183,7 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
         result["skipped_reason"] = "not_rebalance_day"
         result["run_kind"] = "monitoring"
         if trailing_on or stop_on:
-            _run_forced_exits(result, positions, peaks, stop_pct, trail_arm, trail_pct,
+            _run_forced_exits(result, judged, peaks, stop_pct, trail_arm, trail_pct,
                               limits, today, dry_run, portfolio_source, degraded, cash, equity)
         return _finish(result, dry_run)
 
@@ -208,7 +219,7 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     # 和回测引擎的 stop_loss 同一套语义。移动止盈调仓日不强卖（交给选股）。
     stopped_today: set[str] = set()
     if stop_on and exits_trusted:
-        stop_hits = trailing.stop_loss_hits(positions, stop_pct)
+        stop_hits = trailing.stop_loss_hits(judged, stop_pct)
         stopped_today = {hit.code for hit in stop_hits}
         if stopped_today:
             reviewed_scores = reviewed_scores.drop(

@@ -302,3 +302,80 @@ def test_stop_loss_headline_says_stop_loss():
                                 exits=_exits(stop_enabled=True, stop_pct=0.08,
                                              hits=[{"kind": "stop_loss"}], orders=[order]))
     assert "止损触发" in daily_report._headline(result)
+
+
+# ----------------------------------------------------------------------
+# 按昨收判（2026-09-24）
+# ----------------------------------------------------------------------
+# 回测的止损是收盘 t 判、开盘 t+1 卖。8% 止损保留的理由（回撤少 5.1 点）是在这条
+# 规则上量出来的；实盘此前拿 09:32 的盘中价判，跑的是另一条没被验证的规则。
+
+GOLD = "600547.SH"
+
+
+def _gold(live):
+    """山东黄金，2026-09-18 以 33.111 建仓。8% 止损线 = 30.462。"""
+    return _pos(code=GOLD, name="山东黄金", qty=1800, sellable=1800, cost=33.111, last=live)
+
+
+def test_shandong_gold_2026_09_24_is_not_stopped_on_close():
+    """**真实那一天。** 09-23 收盘 30.93（−6.6%，没到线），09-24 09:32 跳空到
+    30.23（−8.7%）。盘中规则当场卖了；按回测的规则那天不该卖。"""
+    live = [_gold(30.23)]
+    assert trailing.stop_loss_hits(live, 0.08), "前提：按盘中价确实会触发"
+
+    judged = trailing.judged_on_close(live, {GOLD: 30.93})
+    assert trailing.stop_loss_hits(judged, 0.08) == []
+
+
+def test_a_close_below_the_line_still_stops_even_if_it_opens_higher():
+    """反方向也要成立 —— 这条改动不是"少卖"，是"按收盘判"。
+    昨收跌破线、今天开盘拉回来了，收盘规则照样卖。"""
+    judged = trailing.judged_on_close([_gold(30.60)], {GOLD: 30.40})
+    assert [h.kind for h in trailing.stop_loss_hits(judged, 0.08)] == ["stop_loss"]
+
+
+def test_judged_positions_keep_the_live_price_for_the_record():
+    judged = trailing.judged_on_close([_gold(30.23)], {GOLD: 30.93})[0]
+    assert judged["last_price"] == 30.93 and judged["live_price"] == 30.23
+    assert judged["judged_on"] == "close"
+
+
+def test_missing_close_falls_back_to_live_and_says_so():
+    """缺日线时退回现价 —— 止损是保护性的，缺数据时宁可按现价判也不能整只不判。
+    但得标出来，否则就是两条规则混着跑而没人知道。"""
+    judged = trailing.judged_on_close([_gold(30.23)], {})[0]
+    assert judged["last_price"] == 30.23 and judged["judged_on"] == "live"
+    assert trailing.stop_loss_hits([judged], 0.08), "缺数据也得能止损"
+
+
+def test_the_order_price_still_uses_the_live_reference():
+    """**只换"判不判"用的价，不换"挂多少"用的价。** 拿昨收去挂限价就是
+    37.7% 的卖单挂到市价错误一侧的那个老坑。"""
+    judged = trailing.judged_on_close([_gold(30.23)], {GOLD: 30.40})
+    hits = trailing.stop_loss_hits(judged, 0.08)
+    orders, _ = trailing.sell_orders(hits, {GOLD: 30.23}, {GOLD: 30.40}, {GOLD: False}, 0.005)
+    assert orders[0].ref_price == 30.23, "限价参考应当是实时价，不是判止损用的昨收"
+
+
+def test_daily_cycle_judges_on_close_everywhere():
+    """观察表、调仓日止损、监控日强卖 —— 三处都要用换过价的持仓。
+    漏一处就是两条规则混着跑。"""
+    src = inspect.getsource(daily_cycle.run_daily)
+    assert "judged_on_close(" in src
+    first_use = min(src.index(k) for k in ("watchlist(", "stop_loss_hits(", "_run_forced_exits("))
+    assert src.index("judged_on_close(") < first_use, "换价必须在第一次判之前"
+    for call in ("trailing.watchlist(positions", "trailing.stop_loss_hits(positions",
+                 "trailing.update_peaks(positions", "_run_forced_exits(result, positions"):
+        assert call not in src, f"{call} —— 这里还在用 09:32 的盘中价判"
+
+
+def test_report_says_it_judges_on_close():
+    """和「账户与持仓」表里 09:32 的现价不是同一个数 —— 列名得说清楚。"""
+    result = _monitoring_result(exits=_exits(
+        stop_enabled=True, stop_pct=0.08, judged_on="close", close_date="2026-09-23",
+        watch=trailing.watchlist(trailing.judged_on_close([_gold(30.23)], {GOLD: 30.93}),
+                                 {}, 0.0, 0.0, 0.08)))
+    text = daily_report.render(result)
+    assert "按**昨收**判断" in text and "2026-09-23" in text
+    assert "|代码|名称|成本|昨收|" in text
