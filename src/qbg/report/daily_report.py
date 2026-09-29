@@ -574,6 +574,49 @@ _SOURCE_LABELS = {
 }
 
 
+def _todays_actions(result: dict) -> dict[str, str]:
+    """每只票今天下了什么单、单子有没有真的到券商那里。
+
+    三种结局必须分开说，它们对"明天这只票还在不在"的含义完全不同：
+      ✓已提交 —— 券商接了单并回读校验通过（成交与否要看明天的持仓）
+      ✗提交失败 / 未提交 —— 单子没进券商，票明天还在
+      被风控拦下 —— 规划了但订单闸砍掉了（订单闸只砍 BUY，卖单不会走到这一步）
+    没有 `broker` 字段（顾问模式、dry-run）时不加后缀 —— 那种模式本来就不提交。
+    """
+    allowed = result.get("allowed_orders") or []
+    planned = result.get("orders") or []
+    broker = result.get("broker")
+    outcomes = {(o.get("code"), o.get("side")): o
+                for o in ((broker or {}).get("outcomes") or [])}
+
+    def verb(order: dict) -> str:
+        reason = str(order.get("reason") or "")
+        if order.get("side") == "BUY":
+            return "买入"
+        if reason.startswith("止损"):
+            return "止损卖出"
+        if reason.startswith("移动止盈"):
+            return "止盈卖出"
+        return "调仓卖出"
+
+    actions: dict[str, str] = {}
+    for order in allowed:
+        code, side = order.get("code"), order.get("side")
+        text = f"{verb(order)} {int(order.get('quantity') or 0)} 股"
+        if isinstance(broker, dict):
+            outcome = outcomes.get((code, side))
+            if outcome is None:
+                text += "（未提交）"
+            else:
+                text += " ✓已提交" if outcome.get("ok") else " ✗提交失败"
+        actions[code] = text
+    allowed_keys = {(o.get("code"), o.get("side")) for o in allowed}
+    for order in planned:
+        if (order.get("code"), order.get("side")) not in allowed_keys:
+            actions.setdefault(order.get("code"), f"{verb(order)}（被风控拦下）")
+    return actions
+
+
 def _gate_word(kept, shadow: bool) -> str:
     """影子模式下不能写"拦截" —— 那只票没被拦，照样可能被买进了。"""
     if shadow:
@@ -678,12 +721,25 @@ def render(result: dict) -> str:
     else:
         lines += ["当前没有可展示的持仓记录。", ""]
 
+    # **快照是下单前读的。** 2026-09-29 生益电子 −13.55% 当天已经止损、卖单也交了，
+    # 可这张表里它照样在、而且什么标记都没有 —— 操作者从上往下读到这里就来问
+    # "为什么没触发止损"。止损那一节写了，但排在后面。所以在这张表里直接标出来。
+    actions = _todays_actions(result)
+    held_actions = {p.get("code"): actions[p.get("code")] for p in positions
+                    if p.get("code") in actions}
+    if held_actions:
+        lines += ["> 这张表是**下单前**读的快照。「今日操作」一列是读完之后发生的事 —— "
+                  "要卖出的票这里还在，要到明天的快照里才消失。", ""]
+
     if positions:
         header = "|代码|名称|股数|可卖|成本|现价|市值|持仓盈亏|收益率|"
         align = "|---|---|---:|---:|---:|---:|---:|---:|---:|"
         if has_day:
             header += "当日盈亏|"
             align += "---:|"
+        if held_actions:
+            header += "今日操作|"
+            align += "---|"
         lines += [header, align]
         for position in sorted(positions, key=lambda item: float(item.get("market_value", 0)),
                                reverse=True):
@@ -701,6 +757,8 @@ def render(result: dict) -> str:
             if has_day:
                 day = position.get("day_pnl")
                 row += ("—|" if day is None else f"{float(day):+,.2f}|")
+            if held_actions:
+                row += f"{_cell(held_actions.get(position.get('code'), '—'))}|"
             lines.append(row)
         lines.append("")
 

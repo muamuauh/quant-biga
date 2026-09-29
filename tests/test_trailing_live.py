@@ -379,3 +379,83 @@ def test_report_says_it_judges_on_close():
     text = daily_report.render(result)
     assert "按**昨收**判断" in text and "2026-09-23" in text
     assert "|代码|名称|成本|昨收|" in text
+
+
+# ----------------------------------------------------------------------
+# 持仓表的「今日操作」（2026-09-29）
+# ----------------------------------------------------------------------
+# 生益电子 −13.55% 当天已经止损、卖单也交了，可持仓表里它照样在、什么标记都没有 ——
+# 快照是下单前读的。操作者从上往下读到那里就来问"为什么没触发止损"。
+
+SYE = "688183.SH"
+
+
+def _sye_result(**over):
+    pos = _pos(code=SYE, name="生益电子", qty=500, sellable=500, cost=122.579, last=105.97)
+    sell = {"code": SYE, "name": "生益电子", "side": "SELL", "quantity": 500,
+            "price": 105.47, "ref_price": 106.0, "reason": "止损：建仓以来 -13.6%"}
+    base = _monitoring_result(positions=[pos], orders=[sell], allowed_orders=[sell],
+                              broker={"submitted": 1, "ok": True, "outcomes": [
+                                  {"code": SYE, "side": "SELL", "ok": True}]},
+                              account={"total_equity": 100_000.0, "available_cash": 1.0})
+    base.update(over)
+    return base
+
+
+def _row(text, code):
+    return next(line for line in text.splitlines() if line.startswith(f"|{code}|"))
+
+
+def test_a_stopped_position_is_marked_in_the_holdings_table():
+    text = daily_report.render(_sye_result())
+    assert "止损卖出 500 股 ✓已提交" in _row(text, SYE)
+    assert "**下单前**读的快照" in text, "得说清楚为什么要卖的票还在表里"
+
+
+def test_no_orders_means_no_extra_column():
+    text = daily_report.render(_sye_result(orders=[], allowed_orders=[], broker=None))
+    assert "今日操作" not in text and "下单前" not in text
+
+
+def test_a_failed_submission_says_so():
+    """"✓已提交"和"✗提交失败"对明天这只票还在不在的含义完全相反。"""
+    broker = {"submitted": 0, "ok": False, "outcomes": [{"code": SYE, "side": "SELL", "ok": False}]}
+    assert "✗提交失败" in _row(daily_report.render(_sye_result(broker=broker)), SYE)
+
+
+def test_an_order_the_broker_never_reached_says_so():
+    """前面一笔失败会中止后面的 —— 那几笔在 outcomes 里根本没有。"""
+    broker = {"submitted": 0, "ok": False, "outcomes": []}
+    assert "（未提交）" in _row(daily_report.render(_sye_result(broker=broker)), SYE)
+
+
+def test_advisory_mode_has_no_submission_suffix():
+    """顾问模式本来就不提交，不该标"未提交"让人以为出了事。"""
+    row = _row(daily_report.render(_sye_result(broker=None)), SYE)
+    assert "止损卖出 500 股|" in row
+
+
+def test_a_gate_blocked_order_is_labelled():
+    buy = {"code": SYE, "side": "BUY", "quantity": 100, "reason": "目标权重 31.7%"}
+    text = daily_report.render(_sye_result(orders=[buy], allowed_orders=[], broker=None))
+    assert "买入（被风控拦下）" in _row(text, SYE)
+
+
+def test_trailing_sells_are_not_called_stops():
+    sell = {"code": SYE, "side": "SELL", "quantity": 500,
+            "reason": "移动止盈：峰值浮盈 +20.0%，现 +12.0%，从峰值回撤 6.7%"}
+    text = daily_report.render(_sye_result(orders=[sell], allowed_orders=[sell], broker=None))
+    assert "止盈卖出 500 股" in _row(text, SYE)
+
+
+def test_review_agent_is_told_the_snapshot_is_pre_trade(tmp_path):
+    """同一只票同时出现在持仓和当天卖单里 —— agent 当时把它报成了"执行不一致"。"""
+    from qbg.agent.review import collect_facts
+    from qbg.store.etl import connect
+
+    path = tmp_path / "runs.db"
+    connect(path).close()
+    _, facts = collect_facts("2026-09-29", mode="PAPER", path=path)
+    assert "positions_before_orders" in facts
+    assert "positions" not in facts, "含糊的旧名字不该留着"
+    assert any("下单之前" in line for line in facts["limitations"])

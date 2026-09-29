@@ -121,6 +121,8 @@ def collect_facts(review_date: str | None = None, *, mode: str = "ADVISORY",
             "没有新闻证据时禁止解释涨跌原因",
             "样本不足时禁止据此建议调参",
             "所有参数建议都必须另行通过八项回测闸",
+            "positions_before_orders 是下单之前（约 09:32）读的券商快照；当天的卖单"
+            "不会反映在里面 —— 同一只票同时出现在持仓和当天卖单里是正常的，不是执行不一致",
         ],
     }
     if not db_path.exists():
@@ -137,7 +139,11 @@ def collect_facts(review_date: str | None = None, *, mode: str = "ADVISORY",
                 key,
             ),
             equity=_fetch_rows(db, "SELECT * FROM equity WHERE date=? AND mode=?", key),
-            positions=_fetch_rows(
+            # **叫 positions_before_orders，不叫 positions。** 2026-09-29 生益电子当天
+            # 止损、卖单也交了，复盘 agent 看到它同时在持仓和卖单里，写了一句"持仓快照
+            # 仍保留 500 股卖出记录，执行与持仓一致性待确认" —— 它不知道快照是下单前读的。
+            # 和 `submitted` 那次一样：字段名没说清楚时间关系，模型就自己补了一个错的。
+            positions_before_orders=_fetch_rows(
                 db,
                 "SELECT code,name,qty,sellable_qty,cost_price,last_price,market_value,pnl "
                 "FROM positions WHERE date=? AND mode=? ORDER BY market_value DESC",
