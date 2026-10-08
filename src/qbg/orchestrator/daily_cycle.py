@@ -274,9 +274,41 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
             else:
                 result.update(_submit_to_broker(allowed, today, gate_results))
 
-        save_marker(list(execution.artifacts), today)
-        save_rebalance_date(today)
+        keep, why = _should_save_state(settings.qbg_mode, allowed, result.get("broker"))
+        if keep:
+            save_marker(list(execution.artifacts), today)
+            save_rebalance_date(today)
+        else:
+            result["state_saved"] = False
+            log_event(log, "cycle.state.not_saved", reason=why, date=today)
     return _finish(result, dry_run)
+
+
+def _should_save_state(mode: str, allowed: list, broker: dict | None) -> tuple[bool, str]:
+    """调仓日结束时要不要写「当日已完成」标记和调仓日期。
+
+    **一笔都没进券商就都不写。** 2026-10-08 国庆后第一个交易日，同花顺进程在但没窗口，
+    持仓落到 `default`（10 万假资金、空持仓）→ 100% 现金触发了提前调仓 → 3 笔买单。
+    券商那一层正确地拒了单，**可是这里照样写了两个状态**：
+
+    - 完成标记写了 → 同花顺恢复之后，正常重跑被 `already_completed_today` 挡住；
+      邮件「重跑」命令不带 `--force`，也救不回这一天。
+    - 调仓日期写成 10-08 → 10 天的调仓周期被一次**没发生**的调仓重置了。
+      09-09 价格填错、0/2 提交的那次，也是这样被重置的。
+
+    CLAUDE.md 早就写着"风控闸没过不写调仓日期"；券商拒单 / 全部提交失败是同一回事，
+    只是这条路一直没人补。
+
+    有一笔提交成功就照写：完成标记的本职是防同一天重跑**重复下单**，部分成功时
+    最需要它。顾问模式的执行就是写清单本身，照写。没有要下的单（调仓结论是"不动"）
+    也照写 —— 那是一次真实做完的调仓。
+    """
+    if str(mode).upper() == "ADVISORY" or not allowed:
+        return True, ""
+    submitted = int((broker or {}).get("submitted") or 0)
+    if submitted > 0:
+        return True, ""
+    return False, (broker or {}).get("message") or "没有任何订单进入券商"
 
 
 def _local_now() -> str:

@@ -459,3 +459,48 @@ def test_review_agent_is_told_the_snapshot_is_pre_trade(tmp_path):
     assert "positions_before_orders" in facts
     assert "positions" not in facts, "含糊的旧名字不该留着"
     assert any("下单之前" in line for line in facts["limitations"])
+
+
+# ----------------------------------------------------------------------
+# 一笔都没进券商时不写状态（2026-10-08）
+# ----------------------------------------------------------------------
+# 国庆后第一天同花顺没窗口 → 持仓落到 default → 假的 100% 现金触发调仓 → 券商拒单。
+# 可完成标记和调仓日期照样写了：恢复后正常重跑被挡住，调仓周期被一次没发生的调仓重置。
+
+_BUY = [{"code": "000977.SZ", "side": "BUY", "quantity": 400}]
+
+
+def test_a_refused_rebalance_saves_nothing():
+    keep, why = daily_cycle._should_save_state(
+        "PAPER", _BUY, {"ok": False, "submitted": 0, "message": "持仓读取失败 —— 拒绝下单"})
+    assert keep is False and "拒绝下单" in why
+
+
+def test_a_rebalance_where_every_submission_failed_saves_nothing():
+    """09-09 那次：价格填错，0/2 提交。调仓周期也被重置了。"""
+    keep, _ = daily_cycle._should_save_state("PAPER", _BUY, {"ok": False, "submitted": 0})
+    assert keep is False
+
+
+def test_a_partly_submitted_rebalance_still_saves():
+    """完成标记的本职是防同一天重跑**重复下单** —— 部分成功时最需要它。"""
+    keep, _ = daily_cycle._should_save_state("PAPER", _BUY * 2, {"ok": False, "submitted": 1})
+    assert keep is True
+
+
+def test_a_rebalance_with_nothing_to_trade_still_saves():
+    """调仓结论是"不动"也是一次真实做完的调仓。"""
+    keep, _ = daily_cycle._should_save_state("PAPER", [], {"ok": True, "submitted": 0})
+    assert keep is True
+
+
+def test_advisory_mode_always_saves():
+    """顾问模式的执行就是写清单本身。"""
+    assert daily_cycle._should_save_state("ADVISORY", _BUY, None)[0] is True
+
+
+def test_run_daily_consults_the_rule_before_writing_state():
+    src = inspect.getsource(daily_cycle.run_daily)
+    guard = src.index("_should_save_state(")
+    assert guard < src.index("save_rebalance_date(today)")
+    assert guard < src.index("save_marker(list(execution.artifacts), today)")
