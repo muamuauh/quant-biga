@@ -109,7 +109,8 @@ def validate_payload(payload: dict, *, name_map: dict[str, str] | None = None,
             issues.append(ValidationIssue("成本价", f"{code} 成本价必须 > 0", code))
         if value <= 0 or abs(value - qty * last) / value >= tolerance:
             issues.append(ValidationIssue("市值", f"{code} 市值与股数×现价偏差达到 1%", code))
-        history = price_history.get(code) if price_history is not None else _latest_limit_context(code)
+        history = (price_history.get(code) if price_history is not None
+                   else _latest_limit_context(code, asof=str(payload.get("asof") or "")))
         if history is None:
             issues.append(ValidationIssue("行情", f"{code} 无前收盘行情，无法校验涨跌停", code))
         else:
@@ -182,11 +183,34 @@ def _ocr_code_missing(value) -> bool:
     return not text or bool(re.fullmatch(r"0+(?:\.0+)?", text))
 
 
-def _latest_limit_context(code: str) -> tuple[float, bool] | None:
+def _latest_limit_context(code: str, asof: str = "") -> tuple[float, bool] | None:
+    """涨跌停校验用的**前收**：读数日期的上一个交易日的收盘价。
+
+    **前收是哪一根取决于什么时候读的，不能写死成倒数第二根。**
+
+    - OCR 截图在收盘后：缓存最后一根就是读数当天 → 前收是倒数第二根
+    - easytrader 在 09:32 读：今天的日线还没收，缓存最后一根是**昨天** →
+      前收就是最后一根本身
+
+    2026-10-08 国庆后第一天，持仓里的两只油运股开盘涨停：中远海能 22.62
+    （09-30 收 20.56，涨停价 22.62）、招商轮船 22.17（09-30 收 20.15，涨停价
+    22.17）—— 读数完全正确。可这里写死取倒数第二根，拿的是 09-29 的收盘价
+    20.27 / 19.89，于是判成"现价不在涨跌停范围"，**整份真实持仓被丢弃**，
+    一路降级到 10 万假资金：止损没查、调仓结论是假的，只靠券商层拒单兜住。
+
+    这个错一直都在，只是平时一只票两天涨跌很少超过 10%，看不出来；
+    持仓里有票当天涨停或跌停时才会炸 —— 偏偏是最需要读对持仓的日子。
+    """
     frame = cache.read(code)
+    if frame.empty:
+        return None
+    last = frame.iloc[-1]
+    is_st = bool(last["is_st"])
+    if asof and str(pd.Timestamp(last["date"]).date()) < asof:
+        return float(last["close"]), is_st
     if len(frame) < 2:
         return None
-    return float(frame.iloc[-2]["close"]), bool(frame.iloc[-1]["is_st"])
+    return float(frame.iloc[-2]["close"]), is_st
 
 
 def require_valid(payload: dict, **kwargs) -> tuple[PortfolioSnapshot, list[ValidationIssue]]:

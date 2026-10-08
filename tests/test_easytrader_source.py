@@ -56,7 +56,7 @@ def _reader(tables):
 def no_price_check(monkeypatch):
     """跳过涨跌停校验：它要读 parquet 缓存，那是 P1 的事，与本模块无关。"""
     monkeypatch.setattr("qbg.portfolio.ocr_source._latest_limit_context",
-                        lambda code: (600.0, False))
+                        lambda code, asof="": (600.0, False))
     monkeypatch.setattr("qbg.data.meta.load_cached", lambda: {"600519.SH": "贵州茅台"})
 
 
@@ -404,3 +404,42 @@ def test_column_check_uses_position_header_not_entrusts():
     assert easytrader_source._check_columns(entrust_header), "委托表列头本就不该通过持仓表的检查"
     # 正常路径：列头取自持仓表，检查通过
     assert easytrader_source._check_columns(list(easytrader_source.POSITION_COLUMNS)) == []
+
+
+# ---------------------------------------------------------------------------
+# 涨跌停校验的前收取哪一根（2026-10-08）
+# ---------------------------------------------------------------------------
+# 国庆后第一天两只油运股开盘涨停，读数完全正确，却被判成"现价不在涨跌停范围"：
+# 写死取倒数第二根，拿的是 09-29 而不是 09-30 的收盘价。整份真实持仓被丢弃，
+# 一路降级到 10 万假资金。
+
+def _bars(monkeypatch, closes):
+    import pandas as pd
+    frame = pd.DataFrame({"date": pd.to_datetime(list(closes)), "close": list(closes.values()),
+                          "is_st": False})
+    monkeypatch.setattr("qbg.portfolio.ocr_source.cache.read", lambda code: frame)
+
+
+def test_intraday_read_uses_the_last_bar_as_previous_close(monkeypatch):
+    """09:32 读：今天的日线还没收，缓存最后一根就是昨天 —— 它本身就是前收。"""
+    from qbg.portfolio.ocr_source import _latest_limit_context
+    _bars(monkeypatch, {"2026-09-29": 20.27, "2026-09-30": 20.56})
+    assert _latest_limit_context("600026.SH", asof="2026-10-08") == (20.56, False)
+
+
+def test_post_close_read_still_uses_the_bar_before(monkeypatch):
+    """OCR 截图在收盘后：缓存最后一根是读数当天，前收是倒数第二根。老逻辑不许变。"""
+    from qbg.portfolio.ocr_source import _latest_limit_context
+    _bars(monkeypatch, {"2026-09-29": 20.27, "2026-09-30": 20.56})
+    assert _latest_limit_context("600026.SH", asof="2026-09-30") == (20.27, False)
+
+
+def test_a_limit_up_holding_passes_validation(monkeypatch):
+    """**真实那一天。** 中远海能 09-30 收 20.56，10-08 涨停价 22.62。"""
+    from qbg.portfolio.ocr_source import validate_payload
+    _bars(monkeypatch, {"2026-09-29": 20.27, "2026-09-30": 20.56})
+    payload = {"asof": "2026-10-08", "总资产": 200000.0, "可用资金": 140000.0, "positions": [
+        {"代码": "600026", "名称": "中远海能", "股数": 2700, "可用股数": 2700,
+         "成本价": 20.667, "现价": 22.62, "市值": 61074.0, "盈亏": 5273.1}]}
+    _, issues = validate_payload(payload, name_map={"600026.SH": "中远海能"})
+    assert not [i for i in issues if i.fatal], [i.message for i in issues]
