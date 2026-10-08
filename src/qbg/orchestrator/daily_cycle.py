@@ -264,6 +264,7 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
 
         # P9c：非顾问模式再走券商。这里此前**写死了 AdvisoryAdapter**，
         # 和 P9a 之前写死 ManualSource 是同一类问题 —— 配置项存在但没人读。
+        refusal = None
         if str(settings.qbg_mode).upper() != "ADVISORY":
             refusal = broker_refusal(portfolio_source, degraded)
             if refusal:
@@ -274,7 +275,8 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
             else:
                 result.update(_submit_to_broker(allowed, today, gate_results))
 
-        keep, why = _should_save_state(settings.qbg_mode, allowed, result.get("broker"))
+        keep, why = _should_save_state(settings.qbg_mode, allowed, result.get("broker"),
+                                       refused=bool(refusal))
         if keep:
             save_marker(list(execution.artifacts), today)
             save_rebalance_date(today)
@@ -284,7 +286,8 @@ def run_daily(*, today: str | None = None, skip_ingest: bool = False,
     return _finish(result, dry_run)
 
 
-def _should_save_state(mode: str, allowed: list, broker: dict | None) -> tuple[bool, str]:
+def _should_save_state(mode: str, allowed: list, broker: dict | None,
+                       refused: bool = False) -> tuple[bool, str]:
     """调仓日结束时要不要写「当日已完成」标记和调仓日期。
 
     **一笔都没进券商就都不写。** 2026-10-08 国庆后第一个交易日，同花顺进程在但没窗口，
@@ -303,6 +306,10 @@ def _should_save_state(mode: str, allowed: list, broker: dict | None) -> tuple[b
     最需要它。顾问模式的执行就是写清单本身，照写。没有要下的单（调仓结论是"不动"）
     也照写 —— 那是一次真实做完的调仓。
     """
+    # **持仓是假的，调仓的任何结论都是假的** —— 包括"不用交易"。券商因为持仓读不到
+    # 而拒单时一律不写，否则同花顺恢复后正常重跑（和邮件「重跑」）还是会被挡住。
+    if refused:
+        return False, (broker or {}).get("message") or "持仓读不到，券商拒单"
     if str(mode).upper() == "ADVISORY" or not allowed:
         return True, ""
     submitted = int((broker or {}).get("submitted") or 0)

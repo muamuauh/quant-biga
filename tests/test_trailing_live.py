@@ -504,3 +504,10 @@ def test_run_daily_consults_the_rule_before_writing_state():
     guard = src.index("_should_save_state(")
     assert guard < src.index("save_rebalance_date(today)")
     assert guard < src.index("save_marker(list(execution.artifacts), today)")
+
+
+def test_a_refused_rebalance_with_nothing_to_trade_still_saves_nothing():
+    """持仓是假的，"不用交易"这个结论也是假的。"""
+    keep, _ = daily_cycle._should_save_state(
+        "PAPER", [], {"ok": False, "submitted": 0, "message": "拒绝下单"}, refused=True)
+    assert keep is False

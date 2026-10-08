@@ -514,10 +514,14 @@ if (-not $SkipThsCheck -and $pyOk -and $wantThs) {
     if (-not $canSend) {
         Add-Warn "当前会话无可用桌面/锁屏中 —— 同花顺 UI 自动化必定失败，持仓会降级到 CSV。"
     }
-    & $py (Join-Path $ProjectRoot "tools\probe_ths.py") --preflight-only 2>&1 |
+    # --alert：有阻塞项就给机主发一封邮件（一天一封，见 qbg.notify.broker_alert）。
+    # 2026-10-08 同花顺开在精简模式，这里只记了一条 [WARN]，直到 09:33 日报才有人
+    # 知道 —— 而 07:45 → 09:30 这段时间本来就是留给人工处理同花顺的。
+    # 邮件是旁路：发不出去不影响这里的退出码。
+    & $py (Join-Path $ProjectRoot "tools\probe_ths.py") --preflight-only --alert 2>&1 |
         ForEach-Object { Write-Line "    $_" }
     if ($LASTEXITCODE -ne 0) {
-        Add-Warn "同花顺预检未通过 —— 持仓会降级到 CSV。"
+        Add-Warn "同花顺预检未通过 —— 持仓会降级到 CSV。告警邮件发没发见上面「告警邮件：」那一行。"
         Add-Warn "  PAPER/LIVE 模式下会因此**拒绝下单**（daily_cycle.broker_refusal）。"
     } else {
         Write-OK "同花顺预检通过。"

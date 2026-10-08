@@ -453,12 +453,22 @@ def main(argv=None) -> int:
                         choices=["auto", "xls", "copy", "wmcopy"],
                         help="auto=本文件自带的带验证码策略（默认）；其余三个是 easytrader 原生的")
     parser.add_argument("--preflight-only", action="store_true")
+    # 只有 preflight.ps1 带这个开关：手工跑探针不该发邮件。
+    parser.add_argument("--alert", action="store_true",
+                        help="有阻塞项就给机主发一封告警（一天一封）。预检任务用")
     parser.add_argument("--force", action="store_true", help="预检不过也继续")
     parser.add_argument("--save", action="store_true",
                         help="结果写 data/portfolio/probe_ths_*.json（含真实金额，已 gitignore）")
     args = parser.parse_args(argv)
 
-    ok = print_preflight(preflight(args.exe))
+    checks = preflight(args.exe)
+    ok = print_preflight(checks)
+    if args.alert and not ok:
+        # 2026-10-08 同花顺开在精简模式，预检只记了一条 [WARN]，直到 09:33 日报才有人知道。
+        # 07:45 到 09:30 本来就是留给人工处理同花顺的，告警得在这里发。
+        from qbg.notify.broker_alert import send_once
+        sent = send_once(checks, HINTS, ADVISORY_CHECKS)
+        print(f"\n  告警邮件：{'已发出' if sent.get('sent') else sent.get('skipped') or sent.get('error')}")
     if args.preflight_only:
         return 0 if ok else 1
     if not ok and not args.force:

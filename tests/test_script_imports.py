@@ -75,6 +75,9 @@ AUTOMATED = [
     ["scripts/00_market_check.py"],           # 两个 .ps1 都用它判交易日
     ["scripts/01_ingest.py"],                 # daily_cycle 和盘前都 subprocess 调
     ["scripts/email_listener.py"],            # daily_cycle 拉起的常驻监听
+    # preflight.ps1 每天 07:45 无人值守地调用它。2026-10-08 加 --alert 时一个
+    # heredoc 转义把它改出了语法错误 —— 当时这张表里没有它，所以没拦住。
+    ["tools/probe_ths.py"],
 ]
 
 
